@@ -17,6 +17,7 @@
 __all__ = ["TextTrainer"]
 
 from collections import defaultdict
+import faulthandler
 from itertools import count
 from typing import Any, Dict
 
@@ -269,6 +270,13 @@ class TextTrainer:
         """
         memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
+        trace_first_update = (
+            self.base.state.global_step == 0 and self.base.global_rank in (0, 36)
+            and self.base.config.accelerator.cp_size == 1 and self.base.config.training.global_batch_size == 128
+        )
+        if trace_first_update:
+            faulthandler.dump_traceback_later(90, repeat=True)
+            logger.info("First CP1 training update started")
         self.base.begin_loss_step()
 
         self.on_step_begin()
@@ -293,8 +301,15 @@ class TextTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
+        if trace_first_update:
+            logger.info("First CP1 backward completed")
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
+        if trace_first_update:
+            logger.info("First CP1 optimizer update started")
         self.base.step_optimizers_and_schedulers()
+        if trace_first_update:
+            faulthandler.cancel_dump_traceback_later()
+            logger.info("First CP1 optimizer update completed")
 
         # Checkpoint and logging callbacks observe the number of completed
         # optimizer updates.

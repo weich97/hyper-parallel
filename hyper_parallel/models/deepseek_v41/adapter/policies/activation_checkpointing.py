@@ -15,6 +15,7 @@
 """Declare the DeepSeek-V4.1 recompute regions used by normal training."""
 
 from functools import partial
+import logging
 from typing import Any
 
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
@@ -42,6 +43,8 @@ _RECOMPUTED_ROLES = {
 #: activations. Higher tiers recompute more attention for less memory, lower
 #: tiers recompute less attention for less step time.
 ATTENTION_RECOMPUTE_TIER = "all"
+_CHECKPOINT_SWAP_PREFIX = 32
+logger = logging.getLogger(__name__)
 
 
 def _attention_stays_resident(module_fqn: str, module: Any, *, resident: tuple[str, ...]) -> bool:
@@ -53,6 +56,14 @@ def _attention_stays_resident(module_fqn: str, module: Any, *, resident: tuple[s
 def _configure_recompute(model: Any, *, roles: tuple[str, ...]) -> None:
     """Configure decoder shared state and complete visual-block replay."""
     configure_shared_state(model, roles)
+    layers = getattr(getattr(model, "model", None), "layers", ())
+    if len(layers) == 40 and isinstance(layers[0], CheckpointWrapper):
+        if layers[0].checkpoint_kwargs.get("swap_inputs"):
+            for layer in layers[_CHECKPOINT_SWAP_PREFIX:]:
+                if isinstance(layer, CheckpointWrapper):
+                    layer.checkpoint_kwargs["swap_inputs"] = False
+            logger.info("V4.1 checkpoint input offload enabled for decoder layers 0 through %d",
+                        _CHECKPOINT_SWAP_PREFIX - 1)
     for module in model.modules():
         if isinstance(module, DeepseekV41VisionTower):
             for block in module.blocks:

@@ -177,6 +177,7 @@ mixed_precision:
 activation_checkpoint:
   # Recompute full model regions to reduce activation memory.
   mode: full
+  swap_inputs: true
 
 activation_swap: none
 
