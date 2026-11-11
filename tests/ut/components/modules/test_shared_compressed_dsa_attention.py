@@ -201,6 +201,37 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         torch.testing.assert_close(loss, torch.tensor(0.))
         torch.testing.assert_close(query.grad, torch.zeros_like(query))
 
+    def test_reference_kl_masks_an_empty_query_chunk(self):
+        """A padded chunk contributes zero loss and preserves valid-row gradients."""
+        rng = torch.Generator().manual_seed(12)
+        query, key, weights = [torch.randn(tensor.shape, generator=rng).requires_grad_()
+                               for tensor in (self.query, self.key, self.weights)]
+        teacher_query = torch.randn((1, 1, 2, 128), generator=rng)
+        teacher_key = torch.randn(self.key.shape, generator=rng)
+        indices = self.indices.clone()
+        indices[:, 0] = -1
+        args = {"attention_scale": 128**-0.5, "loss_coeff": .001, "query_chunk_size": 1}
+        loss = attention.shared_compressed_indexer_kl_loss(
+            query, key, weights, teacher_query, teacher_key, indices, torch.zeros(1), **args,
+        )
+        loss.backward()
+
+        ref_query = query[:, 1:].detach().requires_grad_()
+        ref_key = key.detach().requires_grad_()
+        ref_weights = weights[:, 1:].detach().requires_grad_()
+        reference = attention.shared_compressed_indexer_kl_loss(
+            ref_query, ref_key, ref_weights, teacher_query[:, :, 1:], teacher_key, indices[:, 1:],
+            torch.zeros(1), **args,
+        ) / 2
+        reference.backward()
+
+        torch.testing.assert_close(loss, reference)
+        torch.testing.assert_close(query.grad[:, 0], torch.zeros_like(query.grad[:, 0]))
+        torch.testing.assert_close(weights.grad[:, 0], torch.zeros_like(weights.grad[:, 0]))
+        torch.testing.assert_close(query.grad[:, 1:], ref_query.grad)
+        torch.testing.assert_close(key.grad, ref_key.grad)
+        torch.testing.assert_close(weights.grad[:, 1:], ref_weights.grad)
+
 
 def _selected_attention(query, key_value, indices, sinks, scale):
     """Enumerate visible keys without constructing the production dense mask."""

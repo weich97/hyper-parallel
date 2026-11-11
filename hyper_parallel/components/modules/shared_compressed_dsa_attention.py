@@ -1000,8 +1000,6 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 selected = topk_indices[:, start:end]
                 valid = selected >= 0
                 valid_rows = valid.any(dim=-1)
-                if not torch.any(valid_rows):
-                    continue
                 safe_indices = selected.clamp_min(0).long()
 
                 query_chunk = index_query[:, start:end].float()
@@ -1037,7 +1035,9 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 log_prediction = index_scores.log_softmax(dim=-1)
                 target_log = target.clamp_min(torch.finfo(torch.float32).tiny).log()
                 row_loss = (target * (target_log - log_prediction)).sum(dim=-1)
-                total_loss.add_(row_loss[valid_rows].sum() * (loss_coeff / denominator))
+                # Empty rows contribute zero without a host scalar read or a
+                # data-dependent allocation on the collective stream.
+                total_loss.add_(row_loss.masked_fill(~valid_rows, 0.0).sum() * (loss_coeff / denominator))
 
                 grad_scores = log_prediction.exp() * target.sum(-1, keepdim=True) - target
                 grad_scores.mul_(loss_coeff / denominator)
@@ -1114,7 +1114,7 @@ def shared_compressed_indexer_kl_loss(
         raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}")
     if not loss_coeff:
         return index_query.sum(dtype=torch.float32) * 0.0
-    if index_key.shape[1] == 0:
+    if index_key.shape[1] == 0 or topk_indices.shape[-1] == 0:
         # Keep zero gradients connected even when no document contains a complete block.
         return (index_query[..., :0].sum(dtype=torch.float32) + index_key.sum(dtype=torch.float32)
                 + merge_weight[..., :0].sum(dtype=torch.float32)) * 0.0
