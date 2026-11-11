@@ -1379,10 +1379,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             self, "_selection_region", checkpoint_exclude_wrapper(self._select_tokens)
         )
         object.__setattr__(self, "_input_region", checkpoint_exclude_wrapper(self._launch_selection))
-        # This output goes straight into an exclusion region; retain IDs, not expanded worker Q.
-        object.__setattr__(self, "_prepare_region", checkpoint_exclude_wrapper(
-            self._prepare_dispatched, save_output=False,
-        ))
+        object.__setattr__(self, "_prepare_region", checkpoint_exclude_wrapper(self._prepare_dispatched))
         object.__setattr__(self, "_result_region", checkpoint_exclude_wrapper(self._select_dispatched))
         object.__setattr__(self, "_wait_region", checkpoint_exclude_wrapper(self._finish_selection))
 
