@@ -41,7 +41,7 @@ _RECOMPUTED_ROLES = {
 #: recompute, their producers stay outside the region and keep their
 #: activations. Higher tiers recompute more attention for less memory, lower
 #: tiers recompute less attention for less step time.
-ATTENTION_RECOMPUTE_TIER = "reuse"
+ATTENTION_RECOMPUTE_TIER = "all"
 
 
 def _attention_stays_resident(module_fqn: str, module: Any, *, resident: tuple[str, ...]) -> bool:
