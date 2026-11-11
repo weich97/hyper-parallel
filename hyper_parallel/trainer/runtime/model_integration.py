@@ -244,7 +244,7 @@ class TrainerModelIntegrationSession:
     @property
     def runtime_enabled(self) -> bool:
         """Whether step-level precision and execution probes are enabled."""
-        return self.mode == "runtime"
+        return self.mode in ("runtime", "runtime_scalars")
 
     def _validate_final_model(self) -> None:
         """Run final-tree validation and record the structured report."""
@@ -322,7 +322,7 @@ class TrainerModelIntegrationSession:
             )
         if findings:
             ModelIntegrationReport(findings=findings).raise_for_errors()
-        if not self.runtime_enabled:
+        if self.mode != "runtime":
             return
         self.parameter_probes = ParameterProbeRecorder(
             self.model,
@@ -571,10 +571,16 @@ class TrainerModelIntegrationSession:
             return
         events = shared_state_spec.finish_trace(self._shared_trace_token)
         self._shared_trace_token = None
+        producer_keys = shared_state_spec.producer_keys
+        consumer_keys = shared_state_spec.consumer_keys
+        key_applies = shared_state_spec.key_applies
+        if key_applies is not None:
+            producer_keys = tuple(key for key in producer_keys if key_applies(self.model, key))
+            consumer_keys = tuple(key for key in consumer_keys if key_applies(self.model, key))
         analysis = _analyze_shared_state_events(
             events,
-            shared_state_spec.producer_keys,
-            shared_state_spec.consumer_keys,
+            producer_keys,
+            consumer_keys,
         )
         if self.global_rank == 0:
             self.evidence_store.write_json(

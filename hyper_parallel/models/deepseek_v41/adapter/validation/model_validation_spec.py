@@ -28,6 +28,7 @@ from hyper_parallel.components.modules.engram import EngramModule
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedDSAAttention,
 )
+from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper
 from hyper_parallel.models.deepseek_v41.adapter.validation.shared_state_trace import (
     begin_shared_state_trace,
     finish_shared_state_trace,
@@ -48,7 +49,11 @@ from hyper_parallel.models.validation_spec import (
 
 def _validate_engram_scratch_state(model: Any, context: Any) -> dict[str, Any] | None:
     """Require official q/k initialization on the final replaced scratch model."""
-    if getattr(getattr(model, "config", None), "v41_model_mode", "full") != "validation_crop":
+    config = getattr(model, "config", None)
+    if getattr(config, "v41_model_mode", "full") != "validation_crop":
+        return None
+    layer_ids = getattr(config, "v41_engram_layer_ids", None)
+    if layer_ids is not None and not layer_ids:
         return None
     trainer_config = context.get("trainer_config", {}) if isinstance(context, dict) else {}
     model_target = trainer_config.get("model", {}) if isinstance(trainer_config, dict) else {}
@@ -74,27 +79,25 @@ def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] 
     """Require executable V4.1 attention and Engram modules in the base model."""
     backbone = getattr(model, "model", None)
     layers = getattr(backbone, "layers", ())
-    invalid_attention = [
-        f"model.layers.{layer_index}.self_attn"
-        for layer_index, layer in enumerate(layers)
-        if not isinstance(
-            getattr(layer, "self_attn", None),
-            (DeepseekV41Attention, SharedCompressedDSAAttention),
-        )
-    ]
+    invalid_attention = []
+    for layer_index, layer in enumerate(layers):
+        attention = getattr(layer, "self_attn", None)
+        if isinstance(attention, CheckpointExcludeWrapper):
+            # The recompute policy preserves resident attention in this wrapper.
+            attention = attention._wrapped_module  # pylint: disable=protected-access
+        if not isinstance(attention, (DeepseekV41Attention, SharedCompressedDSAAttention)):
+            invalid_attention.append(f"model.layers.{layer_index}.self_attn")
     engram_layer_ids = tuple(
         int(layer_id)
         for layer_id in getattr(getattr(model, "config", None), "v41_engram_layer_ids", ())
     )
-    invalid_engram = [
-        f"model.layers.{layer_id}.engram"
-        for layer_id in engram_layer_ids
-        if layer_id >= len(layers)
-        or not isinstance(
-            getattr(layers[layer_id], "engram", None),
-            (DeepseekV41Engram, EngramModule),
-        )
-    ]
+    invalid_engram = []
+    required_parameters = {"q_weight", "k_weight", "wkv.weight"}
+    for layer_id in engram_layer_ids:
+        engram = getattr(layers[layer_id], "engram", None) if 0 <= layer_id < len(layers) else None
+        if (not isinstance(engram, (DeepseekV41Engram, EngramModule))
+                or not required_parameters.issubset(name for name, _ in engram.named_parameters())):
+            invalid_engram.append(f"model.layers.{layer_id}.engram")
     if invalid_attention or invalid_engram:
         return {
             "invalid_attention_modules": invalid_attention,
@@ -168,6 +171,17 @@ def _run_native_module_parity(context: Any) -> dict[str, Any]:
     return result
 
 
+def _shared_state_key_applies(model: Any, key: str) -> bool:
+    """Require candidate-pool events only when the configured model uses them."""
+    if key != "candidate_blocks":
+        return True
+    config = getattr(model, "config", None)
+    return (
+        getattr(config, "v41_candidate_source_layer_id", -1) >= 0
+        and getattr(config, "v41_candidate_topk_blocks", 0) > 0
+    )
+
+
 def get_validation_spec() -> ModelValidationSpec:
     """Return V4.1 parity, parameter-probe, state, and data contracts."""
     return ModelValidationSpec(
@@ -181,9 +195,10 @@ def get_validation_spec() -> ModelValidationSpec:
             ),
         ),
         parameter_probes=(
-            ParameterProbeSpec("model.layers.*.engram.q_weight"),
-            ParameterProbeSpec("model.layers.*.engram.k_weight"),
-            ParameterProbeSpec("model.layers.*.engram.wkv.weight"),
+            # The canonical module-tree invariant requires these on every declared Engram layer.
+            ParameterProbeSpec("model.layers.*.engram.q_weight", required=False),
+            ParameterProbeSpec("model.layers.*.engram.k_weight", required=False),
+            ParameterProbeSpec("model.layers.*.engram.wkv.weight", required=False),
             ParameterProbeSpec("model.layers.*.self_attn.sinks"),
             ParameterProbeSpec("model.layers.*.mlp.gate.weight"),
             ParameterProbeSpec("model.layers.*.mlp.gate.bias"),
@@ -206,6 +221,7 @@ def get_validation_spec() -> ModelValidationSpec:
             consumer_keys=("compressed_kv", "index_key", "topk_indices", "candidate_blocks"),
             begin_trace=begin_shared_state_trace,
             finish_trace=finish_shared_state_trace,
+            key_applies=_shared_state_key_applies,
         ),
         data=DataValidationSpec(
             required_forward_fields=("input_ids", "labels"),

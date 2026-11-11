@@ -31,7 +31,11 @@ try:
 except ImportError as exc:
     raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
+from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
+    SharedCompressedDSAAttention,
+    SharedCompressedPackedSequence,
+)
+from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
     deepseek_v41_megamoe_compute_fn,
@@ -40,8 +44,14 @@ from hyper_parallel.distributed.context_parallel.compressed_document import docu
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
+    _validate_canonical_module_tree,
+    _validate_engram_scratch_state,
+    get_validation_spec,
+)
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
+    DeepseekV41Attention,
     DeepseekV41Compressor,
     DeepseekV41Model,
     bind_shared_expert_forward,
@@ -89,6 +99,44 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
     return functional.linear(  # pylint: disable=not-callable
         intermediate, module.down_proj.weight, module.down_proj.bias,
     )
+
+
+class TestV41ModuleTreeValidation(unittest.TestCase):
+    """Check the structure gate with the model's recompute wrapper."""
+
+    def test_canonical_attention_checks_wrapped_module_type(self) -> None:
+        """Accept resident V4.1 attention and reject an unrelated wrapped module."""
+        attention = SharedCompressedDSAAttention(DeepseekV41Attention(_config(), 0))
+        layer = SimpleNamespace(self_attn=CheckpointExcludeWrapper(attention))
+        model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+        result = _validate_canonical_module_tree(model, None)
+        self.assertIsNone(result, f"expected valid wrapped attention, got {result}")
+
+        layer.self_attn = CheckpointExcludeWrapper(torch.nn.Identity())
+        result = _validate_canonical_module_tree(model, None)
+        expected = {"invalid_attention_modules": ["model.layers.0.self_attn"], "invalid_engram_modules": []}
+        self.assertEqual(result, expected, f"expected {expected}, got {result}")
+
+    def test_engram_initialization_checks_declared_modules(self) -> None:
+        """Permit a declared backbone-only model and retain the Engram invariant when enabled."""
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(v41_model_mode="validation_crop", v41_engram_layer_ids=[])
+        self.assertIsNone(_validate_engram_scratch_state(model, None))
+        model.config.v41_engram_layer_ids = [1]
+        self.assertEqual(_validate_engram_scratch_state(model, None), {"final_engram_modules": 0})
+
+    def test_shared_state_requires_candidate_pool_events_when_enabled(self) -> None:
+        """Keep the normal CSA2 state checks when the candidate pool is off."""
+        spec = get_validation_spec().shared_state
+        for source_layer, block_count, expected in ((-1, 0, False), (0, 0, False), (0, 64, True)):
+            with self.subTest(source_layer=source_layer, block_count=block_count):
+                model = SimpleNamespace(config=SimpleNamespace(
+                    v41_candidate_source_layer_id=source_layer, v41_candidate_topk_blocks=block_count,
+                ))
+                result = spec.key_applies(model, "candidate_blocks")
+                self.assertEqual(result, expected, f"expected candidate-pool applicability {expected}, got {result}")
+                result = spec.key_applies(model, "compressed_kv")
+                self.assertTrue(result, f"expected compressed KV to be required, got {result}")
 
 
 class TestV41SharedExpert(unittest.TestCase):

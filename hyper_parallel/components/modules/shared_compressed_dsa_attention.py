@@ -989,8 +989,10 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
         denominator = batch_size * sequence_length
         total_loss = index_query.new_zeros((), dtype=torch.float32)
         grad_index_query = torch.zeros_like(index_query, dtype=torch.float32)
-        grad_index_key = torch.zeros_like(index_key, dtype=torch.float32)
+        grad_index_key = torch.zeros_like(index_key, dtype=torch.float32, memory_format=torch.contiguous_format)
         grad_merge_weight = torch.zeros_like(merge_weight, dtype=torch.float32)
+        key_length, key_dim = index_key.shape[-2:]
+        batch_key_offsets = torch.arange(batch_size, device=index_key.device).view(-1, 1, 1) * key_length
 
         with torch.no_grad(), torch.autocast(device_type=index_query.device.type, enabled=False):
             for start in range(0, sequence_length, query_chunk_size):
@@ -1056,11 +1058,12 @@ class _SharedCompressedIndexerKLLoss(torch.autograd.Function):
                 )
                 # Preserve the einsum result if SAC cached its storage.
                 selected_key_grad = selected_key_grad.masked_fill(~valid.unsqueeze(-1), 0.0)
-                scatter_indices = safe_indices.unsqueeze(-1).expand_as(selected_key_grad)
-                grad_index_key.scatter_add_(
-                    1,
-                    scatter_indices.reshape(batch_size, -1, index_key.shape[-1]),
-                    selected_key_grad.reshape(batch_size, -1, index_key.shape[-1]),
+                # The reference reduction adds full key vectors. Flattening the batch
+                # avoids the repeated-index, per-feature ScatterAdd path on Ascend.
+                grad_index_key.view(-1, key_dim).index_add_(
+                    0,
+                    (safe_indices + batch_key_offsets).reshape(-1),
+                    selected_key_grad.reshape(-1, key_dim),
                 )
 
         ctx.save_for_backward(grad_index_query, grad_index_key, grad_merge_weight)

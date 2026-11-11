@@ -71,19 +71,19 @@ class ModelIntegrationConfig:
     """Enable model-integration checks at one well-defined lifecycle scope.
 
     ``build`` validates the final module tree, sharding ownership, data
-    contract, optimizer layout, and checkpoint coverage. ``runtime`` includes
-    those checks and records one-step input, gradient, shared-state, and layout
-    evidence. Output location and probe selection are framework policy rather
-    than user-tunable training semantics.
+    contract, optimizer layout, and checkpoint coverage. ``runtime_scalars``
+    also records input identity, shared-state and layout checks, loss, and
+    gradient norms. ``runtime`` additionally records per-parameter probes.
+    Output location and probe selection are framework policy.
     """
 
-    mode: Literal["off", "build", "runtime"] = "off"
+    mode: Literal["off", "build", "runtime", "runtime_scalars"] = "off"
 
     def __post_init__(self) -> None:
         """Reject ambiguous validation scopes at the configuration boundary."""
-        if self.mode not in ("off", "build", "runtime"):
+        if self.mode not in ("off", "build", "runtime", "runtime_scalars"):
             raise ValueError(
-                "model_integration.mode must be one of: off, build, runtime"
+                "model_integration.mode must be one of: off, build, runtime, runtime_scalars"
             )
 
 

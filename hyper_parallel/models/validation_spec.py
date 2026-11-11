@@ -137,6 +137,7 @@ class SharedStateValidationSpec:
     consumer_keys: tuple[str, ...]
     begin_trace: Optional[Callable[[], Any]] = None
     finish_trace: Optional[Callable[[Any], tuple[dict[str, Any], ...]]] = None
+    key_applies: Optional[Callable[[Any, str], bool]] = None
 
     def __post_init__(self) -> None:
         if (self.begin_trace is None) != (self.finish_trace is None):
