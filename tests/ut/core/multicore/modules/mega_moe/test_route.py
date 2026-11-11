@@ -26,6 +26,7 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import route as route_module
 from hyper_parallel.core.multicore.modules.mega_moe.route import (
+    StaticTopKMetadata,
     _expert_capacity,
     _resolve_counts,
     prepare_topk_route,
@@ -36,6 +37,40 @@ from tests.common.mark_utils import arg_mark
 
 class TestMegaMoeRoute(unittest.TestCase):
     """Validate trusted Router counts and bounded capacity without hardware."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_static_topk_reuses_descriptors_but_permutates_current_states(self) -> None:
+        """Check the second fixed-route call reuses metadata and still moves the new values."""
+        spec = replace(self._spec(ep_size=2), auto_tokens=True, dispatch_mode="push")
+        hidden = torch.arange(12).reshape(3, 4).float()
+        ids = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int32)
+        weights = torch.ones(3, 2)
+        payload = torch.tensor([[0, 3, 15, 1, 2, 2, 1], [0, 3, 15, 1, 2, 2, 1]], dtype=torch.int32)
+        workspace, grow = Mock(), Mock()
+
+        def gather(output, *_args, **_kwargs):
+            output.copy_(payload.flatten())
+            return Mock()
+
+        def permute(states, _ids):
+            return states.repeat_interleave(2, dim=0), torch.arange(6, dtype=torch.int32)
+
+        with (
+            patch.object(route_module.dist, "all_gather_into_tensor", side_effect=gather) as exchange,
+            patch.object(route_module, "_permute_topk_input", side_effect=permute),
+        ):
+            first = prepare_topk_route(
+                hidden, ids, weights, spec, None, workspace, autograd_mask=15, prepare_workspace=grow,
+            )
+            second = prepare_topk_route(
+                hidden + 1, ids, weights, spec, None, workspace, autograd_mask=15, prepare_workspace=grow,
+                static_metadata=StaticTopKMetadata.capture(first),
+            )
+        exchange.assert_called_once()
+        self.assertIs(first.metadata, second.metadata)
+        self.assertEqual(grow.call_count, 2)
+        torch.testing.assert_close(second.routed_tokens, first.routed_tokens + 1, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

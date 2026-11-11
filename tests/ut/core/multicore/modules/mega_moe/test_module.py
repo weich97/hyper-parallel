@@ -824,6 +824,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources._workspace_closed = False  # pylint: disable=protected-access
         resources.heap_manager = Mock()
         resources._plans = OrderedDict()
+        resources.static_topk_routes = {15: Mock()}
         resources._closed = False  # pylint: disable=protected-access
 
         resources.heap_manager.close_workspace.side_effect = RuntimeError("close failed")
@@ -831,9 +832,11 @@ class TestMegaMoeExperts(unittest.TestCase):
             resources.close()
 
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
+        self.assertIn(15, resources.static_topk_routes)
 
         resources.heap_manager.close_workspace.side_effect = None
         resources.close()
+        self.assertFalse(resources.static_topk_routes)
         self.assertEqual(resources.heap_manager.close_workspace.call_count, 2)
 
 

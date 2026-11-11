@@ -73,6 +73,43 @@ class PreparedTopKRoute:
     maximum_received_slots: int = 0
 
 
+@dataclass(frozen=True)
+class StaticTopKMetadata:
+    """A validated route's descriptor tensors, independent of activation storage."""
+
+    tokens_per_expert: torch.Tensor
+    received_counts: torch.Tensor
+    metadata: RouteMetadata
+    maximum_received_slots: int
+    stream: Any
+    ready: Any
+
+    @classmethod
+    def capture(cls, route: PreparedTopKRoute) -> StaticTopKMetadata:
+        """Retain descriptors after the first group-agreed route."""
+        device = route.tokens_per_expert.device
+        stream, ready = None, None
+        if device.type == "npu":
+            stream = torch.npu.current_stream(device)
+            ready = torch.npu.Event()
+            ready.record(stream)
+        return cls(route.tokens_per_expert, route.received_counts, route.metadata, route.maximum_received_slots,
+                   stream, ready)
+
+    def wait(self, device: torch.device) -> None:
+        """Make immutable descriptors visible to another NPU stream."""
+        if self.ready is None:
+            return
+        current = torch.npu.current_stream(device)
+        if current != self.stream:
+            current.wait_event(self.ready)
+            self.tokens_per_expert.record_stream(current)
+            self.received_counts.record_stream(current)
+            for tensor in vars(self.metadata).values():
+                if isinstance(tensor, torch.Tensor):
+                    tensor.record_stream(current)
+
+
 class _DynamicRouteSummary(NamedTuple):
     """Physical receive requirements and schedule bounds from the same count exchange."""
 
@@ -413,6 +450,7 @@ def prepare_topk_route(
     *,
     autograd_mask: int = 0,
     prepare_workspace: Callable[[int, int], None] | None = None,
+    static_metadata: StaticTopKMetadata | None = None,
 ) -> PreparedTopKRoute:
     """Overlap Top-K permutation with count exchange and build route metadata.
 
@@ -426,11 +464,29 @@ def prepare_topk_route(
             requires a lease acquired by the caller or the automatic-capacity callback.
         autograd_mask: Group-consistent gradient participation flags in dynamic mode.
         prepare_workspace: Automatic-capacity callback, run after count agreement and before pull permutation.
+        static_metadata: Trusted descriptors for the same fixed Top-K assignments on every rank.
 
     Returns:
         Permuted tokens and exact native route metadata.
     """
     flat_ids = _validate_topk_inputs(hidden_states, topk_ids, topk_weights)
+    if static_metadata is not None:
+        if not spec.auto_tokens or prepare_workspace is None or workspace is None:
+            raise ValueError("Static MegaMoe descriptors require an automatic token workspace")
+        if static_metadata.metadata.local_num_tokens != hidden_states.shape[0]:
+            raise ValueError("Static MegaMoe descriptors require the original token count")
+        static_metadata.wait(hidden_states.device)
+        if spec.dispatch_mode == "push":
+            workspace.wait_for_reuse()
+        prepare_workspace(static_metadata.metadata.plan_tokens, static_metadata.maximum_received_slots)
+        permuted, mapping = (
+            _permute_dynamic_pull(hidden_states, topk_ids, spec, workspace) if spec.dispatch_mode == "pull"
+            else _permute_topk_input(hidden_states, topk_ids)
+        )
+        return PreparedTopKRoute(
+            permuted, mapping, static_metadata.tokens_per_expert, static_metadata.received_counts,
+            static_metadata.metadata, static_metadata.maximum_received_slots,
+        )
     if spec.dynamic_tokens:
         return _prepare_dynamic_route(hidden_states, topk_ids, flat_ids, spec, tokens_per_expert,
                                       workspace, autograd_mask, prepare_workspace)

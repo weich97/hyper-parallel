@@ -34,7 +34,7 @@ from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
 from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
-from .route import prepare_topk_route, restore_topk_output
+from .route import StaticTopKMetadata, prepare_topk_route, restore_topk_output
 from .spec import (
     _COMMUNICATION_SPLIT,
     _resolve_capacity_factors,
@@ -145,6 +145,8 @@ class _MegaMoeExecutionResources:
         self.spec = bind_mega_moe_spec(specification, tensor)
         self._token_capacity = self.spec.local_num_tokens
         self._plans = {}
+        self.static_topk_routes: dict[int, StaticTopKMetadata] = {}
+        self.static_route_reported = False
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
         reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
@@ -281,6 +283,7 @@ class _MegaMoeExecutionResources:
             self.heap_manager.close_workspace(self.workspace)
             self._workspace_closed = True
         self._plans.clear()
+        self.static_topk_routes.clear()
         self._closed = True
 
 
@@ -615,6 +618,7 @@ class MegaMoeExperts(MulticoreModule):
         *,
         tokens_per_expert: torch.Tensor | None = None,
         expert_weights: tuple[torch.Tensor, torch.Tensor] | None = None,
+        fixed_route_tokens: int | None = None,
     ) -> torch.Tensor:
         """Route token states through the configured experts.
 
@@ -627,6 +631,8 @@ class MegaMoeExperts(MulticoreModule):
                 by this executor. EOI weights must be contiguous for zero-copy execution.
             tokens_per_expert: Optional trusted exact global-expert histogram.
                 Supplying Router-produced counts skips histogram recomputation.
+            fixed_route_tokens: Benchmark-only fixed local token count. The
+                caller guarantees identical Top-K assignments on every invocation.
 
         Returns:
             Tensor matching the shape and dtype of ``hidden_states``.
@@ -657,6 +663,13 @@ class MegaMoeExperts(MulticoreModule):
         )}
         pull = self.dispatch_mode == "pull"
         automatic = resources.spec.auto_tokens
+        static_key = None
+        if fixed_route_tokens is not None:
+            if not automatic or hidden_flat.shape[0] != fixed_route_tokens:
+                raise ValueError("MegaMoe fixed routing requires the configured local token count")
+            static_key = route_options["autograd_mask"]
+            if static_key in resources.static_topk_routes:
+                route_options["static_metadata"] = resources.static_topk_routes[static_key]
         claimed = False
         def prepare_workspace(tokens: int, received: int) -> None:
             """Grow before publishing pull source rows into symmetric memory.
@@ -687,6 +700,12 @@ class MegaMoeExperts(MulticoreModule):
                     workspace=resources.workspace,
                     **route_options,
                 )
+                if static_key is not None:
+                    if static_key not in resources.static_topk_routes:
+                        resources.static_topk_routes[static_key] = StaticTopKMetadata.capture(route)
+                    elif not resources.static_route_reported:
+                        logger.info("MegaMoE fixed Top-K route metadata reused")
+                        resources.static_route_reported = True
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
             plan = resources.plan_for_tokens(

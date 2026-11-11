@@ -52,7 +52,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
-                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02) -> None:
+                 capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
+                 fixed_route_tokens: int | None = None, combine_split: int = 128) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -63,6 +64,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             initial_capacity_factor: Push initial receive capacity; None uses the executor default.
             capacity_growth_factor: Push capacity growth multiplier; omit for pull.
             initializer_range: Standard deviation used for meta-model random initialization.
+            fixed_route_tokens: Reuse route metadata for this fixed benchmark shape.
+            combine_split: Number of rows in each native token combine tile.
         """
         super().__init__()
         del module_fqn
@@ -77,6 +80,10 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
+        if fixed_route_tokens is not None and (type(fixed_route_tokens) is not int or fixed_route_tokens < 1):
+            raise ValueError("fixed_route_tokens must be a positive integer")
+        self.fixed_route_tokens = fixed_route_tokens
+        self.combine_split = combine_split
         source_limit = _swiglu_limit(module.limit)
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("MegaMoe Trainer replacement requires SiLU")
@@ -104,16 +111,19 @@ class DeepseekV41MegaMoeExperts(nn.Module):
                                 operations=[Transpose(dim0=-2, dim1=-1)])
                 for name in ("gate_up_proj", "down_proj")]
 
-    def configure(self, ep_group: Any, ep_size: int, top_k: int) -> None:
+    def configure(self, ep_group: Any, ep_size: int, top_k: int, *, fix_router: bool = False) -> None:
         """Bind the EP mesh and routing width after model replacement.
 
         Args:
             ep_group: Ordered EP process group, including a subgroup of the training world.
             ep_size: Number of EP ranks.
             top_k: Number of selected experts per token.
+            fix_router: Indicates the explicit benchmark-only balanced destinations.
         """
         if self._executor is not None:
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
+        if self.fixed_route_tokens is not None and not fix_router:
+            raise ValueError("Static MegaMoe routes require explicit fixed expert destinations")
         # Multicore is optional for the default native-EP replacement provider.
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
@@ -123,7 +133,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             top_k=top_k, ep_group=ep_group, ep_size=ep_size,
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
-            create_parameters=False,
+            create_parameters=False, combine_split=self.combine_split,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -142,7 +152,9 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        output = self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
+        output = self._executor(
+            hidden_states, top_k_index, top_k_weights, expert_weights=weights, fixed_route_tokens=self.fixed_route_tokens,
+        )
         if not DeepseekV41MegaMoeExperts._native_forward_reported:
             logger.info_rank0("DeepSeek-V4.1 native MegaMoE engaged")
             DeepseekV41MegaMoeExperts._native_forward_reported = True

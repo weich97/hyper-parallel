@@ -155,6 +155,8 @@ plan_overrides:
       implementation:
         _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
         dispatch_mode: push  # Set to pull for GET dispatch.
+        fixed_route_tokens: 16384
+        combine_split: 256
   # HyperMegaMhc reuses the original fn/base/scale parameters.
   - match:
       - "model.layers.*.attn_hc"
