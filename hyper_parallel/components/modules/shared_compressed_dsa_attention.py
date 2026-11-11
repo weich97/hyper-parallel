@@ -1563,6 +1563,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
 
     _fused_attention_reported = False
+    _fused_indexer_kl_reported = False
 
     def __init__(
             self,
@@ -1984,6 +1985,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 query_segments=query_segments,
                 use_fused=self.use_fused_ops,
             )
+            if self.use_fused_ops and not SharedCompressedDSAAttentionBase._fused_indexer_kl_reported:
+                logger.info_rank0("Native Lightning Indexer KL engaged")
+                SharedCompressedDSAAttentionBase._fused_indexer_kl_reported = True
             query = aux_loss_auto_scale(query, indexer_loss)
         return query
 
@@ -2013,7 +2017,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 self.compress_ratio, self.sliding_window, query_offset, query_segments, raw_key_offset, main_key_offset,
                 raw_document_starts,
             )
-            if self.use_fused_attention and not SharedCompressedDSAAttentionBase._fused_attention_reported:
+            if not SharedCompressedDSAAttentionBase._fused_attention_reported:
                 logger.info_rank0("Sparse Flash MLA native training path engaged")
                 SharedCompressedDSAAttentionBase._fused_attention_reported = True
             if compressed_kv is not None and all(end == start for _, _, start, end, _ in query_segments):
