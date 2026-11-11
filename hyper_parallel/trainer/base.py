@@ -144,7 +144,7 @@ def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfi
 
 
 def _attach_optimizer_swap(optimizer: Any, config: OptimizerSwapConfig) -> Any:
-    """Attach optimizer-state swap to every Adam/AdamW leaf of ``optimizer``.
+    """Attach optimizer-state swap to selected leaves of ``optimizer``.
 
     Every YAML optimizer target returns a ``ChainedOptimizer`` of leaf
     optimizers -- also for a single AdamW -- and the fp32 main-parameter wrapper
@@ -164,10 +164,17 @@ def _attach_optimizer_swap(optimizer: Any, config: OptimizerSwapConfig) -> Any:
     swap_config = _to_swap_optimizer_config(config)
     chained = optimizer.optimizer if isinstance(optimizer, MixedPrecisionOptimizer) else optimizer
     if not isinstance(chained, ChainedOptimizer):
+        if config.optimizer_names is not None:
+            raise ValueError("optimizer.swap.optimizer_names requires a named optimizer chain")
         return swap_optimizer(optimizer, swap_config)
 
     names = list(chained.optimizers_dict)
-    leaves = [swap_optimizer(chained.optimizers_dict[name], swap_config) for name in names]
+    selected = set(names if config.optimizer_names is None else config.optimizer_names)
+    unknown = sorted(selected.difference(names))
+    if unknown:
+        raise ValueError(f"Unknown optimizer.swap.optimizer_names: {unknown}")
+    leaves = [swap_optimizer(leaf, swap_config) if name in selected else leaf
+              for name, leaf in chained.optimizers_dict.items()]
     # In place: the fp32 main-parameter wrapper aliases both containers.
     chained.chained_optimizers[:] = leaves
     for name, leaf in zip(names, leaves):

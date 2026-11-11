@@ -53,6 +53,8 @@ class OptimizerSwapConfig:
         packed_swap: Whether the backend packs swapped state into two reusable
             staging buffers. ``None`` keeps the backend default (enabled on
             PyTorch, and for MindFormers AdamW on MindSpore).
+        optimizer_names: Optional names of the optimizer leaves to wrap in a
+            chained optimizer. Unselected leaves keep their original state.
     """
 
     enabled: bool = False
@@ -60,6 +62,7 @@ class OptimizerSwapConfig:
     min_numel: int = 1024
     state_keys: Optional[List[str]] = None
     packed_swap: Optional[bool] = None
+    optimizer_names: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
         """Reject a pipeline width or state key set the swap runtime cannot use."""
@@ -73,6 +76,12 @@ class OptimizerSwapConfig:
             )
         if self.state_keys is not None:
             validate_state_keys(self.state_keys)
+        if self.optimizer_names is not None and (
+            not self.optimizer_names
+            or any(not isinstance(name, str) or not name for name in self.optimizer_names)
+            or len(set(self.optimizer_names)) != len(self.optimizer_names)
+        ):
+            raise ValueError("optimizer.swap.optimizer_names must contain unique non-empty names")
 
 
 @dataclass
@@ -88,4 +97,6 @@ class OptimizerConfig:
         config = self.target.to_dict()
         config["fp32_main_params"] = self.fp32_main_params
         config["swap"] = _serialize_config_value(self.swap)
+        if self.swap.optimizer_names is None:
+            config["swap"].pop("optimizer_names")
         return config

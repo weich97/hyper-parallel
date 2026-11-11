@@ -35,6 +35,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.components.optim.builders import AdamW as AdamWBuilder
 from hyper_parallel.core.optimizer import ChainedOptimizer, SwapOptimizerConfig
+from hyper_parallel.core.optimizer.sinkhorn import Sinkhorn
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
 from hyper_parallel.models.build_options import FSDP2Config, FSDP2MixedPrecisionConfig
 from hyper_parallel.core.optimizer import swap_adam as swap_adapters
@@ -301,6 +302,21 @@ class TestOptimizerSwapBuildPath(unittest.TestCase):
                     f"leaf {name!r} was not swap-wrapped: {type(leaf).__name__}"
                 ))
         self.assertEqual(list(built.chained_optimizers), list(built.optimizers_dict.values()))
+
+    @arg_mark(**_MARK)
+    def test_named_swap_keeps_an_unsupported_sinkhorn_leaf(self):
+        """A selected leaf swaps state while the Sinkhorn update stays in the chain."""
+        model = nn.ModuleDict({name: nn.Linear(2, 2, bias=False) for name in ("sinkhorn", "adamw")})
+        sinkhorn = Sinkhorn(model["sinkhorn"].parameters())
+        adamw = torch.optim.AdamW(model["adamw"].parameters(), lr=0.01)
+        chain = ChainedOptimizer(model, {"sinkhorn": sinkhorn, "adamw": adamw})
+        config = OptimizerSwapConfig(enabled=True, optimizer_names=["adamw"])
+        built = trainer_base._attach_optimizer_swap(chain, config)
+
+        self.assertIs(built, chain)
+        self.assertIs(built.optimizers_dict["sinkhorn"], sinkhorn)
+        self.assertTrue(is_swap_optimizer(built.optimizers_dict["adamw"]))
+        self.assertEqual(built.chained_optimizers, list(built.optimizers_dict.values()))
 
     @arg_mark(**_MARK)
     def test_swap_config_gets_the_yaml_values(self):
