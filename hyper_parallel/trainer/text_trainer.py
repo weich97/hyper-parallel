@@ -25,6 +25,7 @@ import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
+from hyper_parallel.trainer.runtime.expert_grad_staging import build_expert_gradient_staging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -72,6 +73,7 @@ class TextTrainer:
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self._expert_gradient_staging = build_expert_gradient_staging(self.base)
         self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
@@ -285,6 +287,7 @@ class TextTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        expert_staging = getattr(self, "_expert_gradient_staging", None)
 
         for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
@@ -300,7 +303,11 @@ class TextTrainer:
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
+            if expert_staging is not None and micro_step == 0:
+                expert_staging.pack()
 
+        if expert_staging is not None:
+            expert_staging.restore()
         if trace_first_update:
             logger.info("First CP1 backward completed")
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
