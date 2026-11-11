@@ -2,3 +2,4 @@ timestamp	commit	metric	status	description
 2026-11-11T08:25:05-05:00	1c93b860	1.241	keep	DeepSeek V4.1 Flash 552B text backbone fixed-routing baseline B
 2026-11-11T08:29:28-05:00	xxxxxxx	0	crash	A01 fixed routing and partial Muon momentum residency
 2026-11-11T08:33:52-05:00	xxxxxxx	0	crash	A02 restore fused HyperMegaMhc on the fixed-routing best commit
+2026-11-11T08:35:54-05:00	eaddcf3b	1.297	keep	A02 recover fused HyperMegaMhc benchmark from all rank logs [c3_job=40326 c3_seconds=229]
