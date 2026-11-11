@@ -147,7 +147,7 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-        fix_router: false  # Benchmark-only balanced destinations; use false for normal training.
+        fix_router: true  # Balanced expert destinations for the fixed-routing benchmark.
   # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
   - match: "model.layers.*.mlp.experts"
     replace:
