@@ -322,8 +322,8 @@ class TaskSplitValue:
 
     @property
     def per_expert_seq(self) -> int:
-        """Sequence length per expert (across all EP ranks)."""
-        return self.seq_all // self.top_k
+        """Cover the tokens a single expert receives across EP ranks."""
+        return self.destination_expert_rows or self.seq_all // self.top_k
 
     @property
     def per_rank_seq(self) -> int:
@@ -332,8 +332,8 @@ class TaskSplitValue:
 
     @property
     def per_expert_seq_to_other(self) -> int:
-        """Sequence length per expert when sending to other ranks."""
-        return self.seq_all // (self.ep * self.top_k)
+        """Cover the tokens one source sends to one expert."""
+        return self.source_expert_rows or self.seq_all // (self.ep * self.top_k)
 
     @property
     def all_event_num(self) -> int:
@@ -349,6 +349,8 @@ class TaskSplitValue:
     pre_cube_task_num:    int = 0
     pre_vector_task_num:  int = 0
     pre_mix_task_num:     int = 0
+    source_expert_rows: int | None = None
+    destination_expert_rows: int | None = None
 
 
 def init_task_split_value(tsv: TaskSplitValue) -> None:

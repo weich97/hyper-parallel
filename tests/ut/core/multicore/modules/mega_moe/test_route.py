@@ -234,9 +234,10 @@ class TestMegaMoeRoute(unittest.TestCase):
         payload = torch.cat((header, counts), dim=1)
         for rank in range(2):
             spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
-            capacity, plan_tokens, maximum = route_module._dynamic_summary(payload, spec)
+            capacity, plan_tokens, maximum, source_rows, destination_rows = route_module._dynamic_summary(payload, spec)
             self.assertEqual((capacity, plan_tokens), ((4, 128) if rank == 0 else (2, 128)))
             self.assertEqual(maximum, 4)
+            self.assertEqual((source_rows, destination_rows), (3, 3))
             received = counts[:, rank * 2:rank * 2 + 2]
             meta = route_module._compute_route_metadata(counts[rank], counts, received, spec, capacity)
             self.assertEqual(meta.dispatch_src_off.tolist(), [0, 0, 0, 0] if rank == 0 else [0, 3, 4, 6])
@@ -552,13 +553,14 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
         return torch.tensor(rows, dtype=dtype)
 
     @staticmethod
-    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
+    def _reference(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int, int, int]:
         """Use tensor reductions to independently check the Host list implementation."""
         counts = payload[:, 3:]
         loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum((0, 2))
         maximum_tokens = int(payload[:, 1].max())
         schedule = max(128, (maximum_tokens + 127) // 128 * 128)
-        return max(1, int(loads[spec.rank_id])), schedule, int(loads.max())
+        return (max(1, int(loads[spec.rank_id])), schedule, int(loads.max()),
+                int(counts.max()), int(counts.sum(0).max()))
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"

@@ -54,6 +54,8 @@ class MegaMoeSpec:
     schedule_tokens: int | None = None
     expert_weight_layout: str = "EIO"
     auto_tokens: bool = False
+    schedule_source_expert_rows: int | None = None
+    schedule_destination_expert_rows: int | None = None
 
     @property
     def dynamic_tokens(self) -> bool:

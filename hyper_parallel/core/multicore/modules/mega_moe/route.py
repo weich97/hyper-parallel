@@ -20,7 +20,7 @@ from array import array
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from itertools import accumulate
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -57,6 +57,8 @@ class RouteMetadata:
     expert_capacity: int
     local_num_tokens: int | None = None
     plan_tokens: int | None = None
+    max_source_expert_rows: int | None = None
+    max_destination_expert_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -71,13 +73,23 @@ class PreparedTopKRoute:
     maximum_received_slots: int = 0
 
 
+class _DynamicRouteSummary(NamedTuple):
+    """Physical receive requirements and schedule bounds from the same count exchange."""
+
+    capacity: int
+    plan_tokens: int
+    maximum_received_slots: int
+    max_source_expert_rows: int
+    max_destination_expert_rows: int
+
+
 @dataclass(frozen=True)
 class _HostRouteCache:
     """One validated wire table and immutable route descriptors for a workspace."""
 
     signature: tuple[Any, ...]
     raw: list[list[int]]
-    summary: tuple[int, int, int]
+    summary: _DynamicRouteSummary
     metadata: RouteMetadata | None
     stream: Any = None
     ready: Any = None
@@ -479,17 +491,20 @@ def _validate_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> None:
         raise RuntimeError("MegaMoe counts must describe the actual distinct Top-K routes")
 
 
-def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> tuple[int, int, int]:
+def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> _DynamicRouteSummary:
     """Use one Host summary for shape, participation, receive limits, and schedule."""
     counts = payload[:, 3:]
-    loads = counts.reshape(spec.ep_size, spec.ep_size, spec.local_experts).sum(dim=(0, 2))
+    destination_expert_rows = counts.sum(dim=0)
+    loads = destination_expert_rows.reshape(spec.ep_size, spec.local_experts).sum(dim=1)
+    maximum_expert_rows = destination_expert_rows.amax().expand(spec.ep_size, 1)
     summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
-                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True), loads[:, None]), dim=1)
+                         counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
+                         loads[:, None], maximum_expert_rows), dim=1)
     rows = summary.tolist()
     return _summarize_dynamic_rows(rows, spec)
 
 
-def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> tuple[int, int, int]:
+def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> _DynamicRouteSummary:
     """Keep overflow and participation checks common to both metadata policies."""
     _validate_dynamic_rows(rows, spec)
     maximum = max(row[6] for row in rows)
@@ -502,13 +517,16 @@ def _summarize_dynamic_rows(rows: list[list[int]], spec: MegaMoeSpec) -> tuple[i
     plan_tokens = max(128, _align_capacity(max(row[1] for row in rows)))
     if plan_tokens * max(spec.hidden_size, spec.top_k) > 2**31 - 1 or maximum > 2**31 - 1:
         raise RuntimeError("MegaMoe dynamic route exceeds native INT32 size limits")
-    return max(1, rows[spec.rank_id][6]), plan_tokens, maximum
+    return _DynamicRouteSummary(
+        max(1, rows[spec.rank_id][6]), plan_tokens, maximum,
+        max(row[5] for row in rows), rows[0][7],
+    )
 
 
 def _read_dynamic_route(
     payload: torch.Tensor,
     spec: MegaMoeSpec,
-) -> tuple[tuple[int, int, int], list[list[int]] | None]:
+) -> tuple[_DynamicRouteSummary, list[list[int]] | None]:
     """Reuse the required readback for small descriptors; reduce large tables on device."""
     if spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
         return _dynamic_summary(payload, spec), None
@@ -516,14 +534,15 @@ def _read_dynamic_route(
     return _summarize_host_route(raw, spec), raw
 
 
-def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> tuple[int, int, int]:
+def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> _DynamicRouteSummary:
     """Validate a bounded Host table before allocating or publishing source rows."""
     counts = [row[3:] for row in raw]
     local = spec.local_experts
-    loads = [
-        sum(sum(values[start : start + local]) for values in counts) for start in range(0, spec.num_experts, local)
-    ]
-    rows = [row[:3] + [sum(values), min(values), max(values), load] for row, values, load in zip(raw, counts, loads)]
+    destination_expert_rows = [sum(values) for values in zip(*counts, strict=True)]
+    loads = [sum(destination_expert_rows[start:start + local]) for start in range(0, spec.num_experts, local)]
+    maximum_expert_rows = max(destination_expert_rows)
+    rows = [row[:3] + [sum(values), min(values), max(values), load, maximum_expert_rows]
+            for row, values, load in zip(raw, counts, loads, strict=True)]
     return _summarize_dynamic_rows(rows, spec)
 
 
@@ -535,7 +554,7 @@ def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
 
 def _read_cached_route(
     payload: torch.Tensor, spec: MegaMoeSpec, workspace: MegaMoeWorkspace | None, device: Any,
-) -> tuple[tuple[int, int, int], list[list[int]] | None, RouteMetadata | None]:
+) -> tuple[_DynamicRouteSummary, list[list[int]] | None, RouteMetadata | None]:
     """Reuse only an identical, previously validated all-rank wire table."""
     if workspace is None or not spec.auto_tokens or spec.ep_size * spec.num_experts > _HOST_ROUTE_MAX_COUNTS:
         summary, raw = _read_dynamic_route(payload, spec)
@@ -559,7 +578,7 @@ def _read_cached_route(
 
 def _cache_host_route(
     workspace: MegaMoeWorkspace | None, spec: MegaMoeSpec, raw: list[list[int]],
-    summary: tuple[int, int, int], metadata: RouteMetadata, device: Any,
+    summary: _DynamicRouteSummary, metadata: RouteMetadata, device: Any,
 ) -> None:
     """Retain descriptors only after confirming a repeated validated wire table."""
     if workspace is None or not spec.auto_tokens:
@@ -707,7 +726,7 @@ def _prepare_dynamic_route(
         summary, host_rows, metadata = _read_cached_route(gathered, spec, workspace, hidden_states.device)
         if prepare_workspace is None:
             raise RuntimeError("Automatic MegaMoe routes require workspace capacity preparation")
-        prepare_workspace(summary[1], summary[2])
+        prepare_workspace(summary.plan_tokens, summary.maximum_received_slots)
     if invalid:
         permuted = None
     elif spec.dispatch_mode == "pull":
@@ -719,17 +738,18 @@ def _prepare_dynamic_route(
         work.wait()
     if summary is None:
         summary, host_rows = _read_dynamic_route(gathered, spec)
-    capacity, plan_tokens, maximum = summary
     if metadata is None:
-        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, capacity)
+        metadata = _dynamic_route_metadata(counts, gathered, host_rows, spec, summary.capacity)
         if host_rows is not None:
             _cache_host_route(workspace, spec, host_rows, summary, metadata, hidden_states.device)
     received_counts = metadata.combine_size.reshape(spec.ep_size, spec.local_experts)
     return PreparedTopKRoute(
         routed_tokens=permuted[0], unpermute_mapping=permuted[1], tokens_per_expert=counts,
         received_counts=received_counts,
-        maximum_received_slots=maximum,
-        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=plan_tokens),
+        maximum_received_slots=summary.maximum_received_slots,
+        metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=summary.plan_tokens,
+                         max_source_expert_rows=summary.max_source_expert_rows,
+                         max_destination_expert_rows=summary.max_destination_expert_rows),
     )
 
 

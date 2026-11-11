@@ -18,6 +18,7 @@ from __future__ import annotations
 
 __all__ = ["MegaMoeExperts"]
 
+import logging
 import math
 import struct
 from collections.abc import Mapping
@@ -44,6 +45,20 @@ from .workspace import MegaMoeWorkspace
 
 ExpertWeightLayout = Literal["EIO", "EOI"]
 _EXPERT_WEIGHT_LAYOUTS = frozenset(("EIO", "EOI"))
+logger = logging.getLogger(__name__)
+
+
+def _bucket_expert_rows(rows: int | None, alignment: int) -> int | None:
+    """Round a route bound to a covering plan with at least one tile."""
+    if rows is None:
+        return None
+    bucket = 1 << (max(1, rows) - 1).bit_length()
+    return ((bucket + alignment - 1) // alignment) * alignment
+
+
+def _cover_expert_rows(previous: int | None, current: int | None) -> int | None:
+    """Retain the larger schedule in a token bucket, including unbounded plans."""
+    return None if previous is None or current is None else max(previous, current)
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -217,12 +232,17 @@ class _MegaMoeExecutionResources:
         if any(value != manifests[0] for value in manifests):
             raise ValueError("MegaMoe resource configurations differ across EP ranks")
 
-    def plan_for_tokens(self, tokens: int, device: Any) -> Any:
+    def plan_for_tokens(
+        self, tokens: int, device: Any, *,
+        source_expert_rows: int | None = None, destination_expert_rows: int | None = None,
+    ) -> Any:
         """Reuse one covering plan per geometric bucket within committed capacity.
 
         Args:
             tokens: EP group maximum input rows, already aligned to 128.
             device: Execution device used for the parameters and workspace.
+            source_expert_rows: Maximum rows from one source to one expert in this route.
+            destination_expert_rows: Maximum rows any expert receives across all sources.
 
         Returns:
             Immutable plan covering the requested rows without enlarging storage.
@@ -232,12 +252,25 @@ class _MegaMoeExecutionResources:
                                f"requested={tokens}, capacity={self._token_capacity}")
         bucket = 1 << (max(128, tokens) - 1).bit_length()
         plan = self._plans.get(bucket)
-        if plan is None or plan.spec.plan_tokens < tokens:
+        source_rows = _bucket_expert_rows(source_expert_rows, math.lcm(self.spec.dispatch_split, self.spec.combine_split))
+        destination_rows = _bucket_expert_rows(destination_expert_rows, self.spec.swiglu_split)
+        if plan is not None:
+            source_rows = _cover_expert_rows(plan.spec.schedule_source_expert_rows, source_rows)
+            destination_rows = _cover_expert_rows(plan.spec.schedule_destination_expert_rows, destination_rows)
+        if (plan is None or plan.spec.plan_tokens < tokens
+                or plan.spec.schedule_source_expert_rows != source_rows
+                or plan.spec.schedule_destination_expert_rows != destination_rows):
             schedule_tokens = min(bucket, self._token_capacity)
-            plan = build_mega_moe_plan(replace(self.spec, schedule_tokens=schedule_tokens), device)
+            plan_spec = replace(self.spec, schedule_tokens=schedule_tokens,
+                                schedule_source_expert_rows=source_rows,
+                                schedule_destination_expert_rows=destination_rows)
+            plan = build_mega_moe_plan(plan_spec, device)
             # INT32 route bounds allow at most 25 buckets starting at 128 rows.
             # A growing partial bucket replaces its plan; backward keeps the old object.
             self._plans[bucket] = plan
+            if source_rows is not None and (not dist.is_initialized() or dist.get_rank() == 0):
+                logger.info("MegaMoE route-bounded task plan active: local=%d source_expert=%d destination_expert=%d",
+                            schedule_tokens, source_rows, destination_rows)
         return plan
 
     def close(self) -> None:
@@ -656,7 +689,11 @@ class MegaMoeExperts(MulticoreModule):
                 )
             if not pull and not automatic:
                 resources.ensure_capacity(route.maximum_received_slots)
-            plan = resources.plan_for_tokens(route.metadata.plan_tokens, hidden_flat.device)
+            plan = resources.plan_for_tokens(
+                route.metadata.plan_tokens, hidden_flat.device,
+                source_expert_rows=route.metadata.max_source_expert_rows,
+                destination_expert_rows=route.metadata.max_destination_expert_rows,
+            )
             expert_output = execute_mega_moe_with_permutation(
                 hidden_flat,
                 topk_ids,

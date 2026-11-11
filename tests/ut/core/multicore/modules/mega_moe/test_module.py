@@ -134,6 +134,24 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_route_bounds_grow_without_expanding_the_physical_workspace(self) -> None:
+        """Keep a covering expert schedule as dynamic routing counts grow."""
+        resources = self._cache_resources(8192, automatic=True)
+        with patch.object(mega_moe_module, "build_mega_moe_plan",
+                          side_effect=lambda spec, device: SimpleNamespace(spec=spec)) as build:
+            first = resources.plan_for_tokens(8192, "cpu", source_expert_rows=128, destination_expert_rows=16384)
+            next_plan = resources.plan_for_tokens(8192, "cpu", source_expert_rows=129, destination_expert_rows=16385)
+            reused = resources.plan_for_tokens(8192, "cpu", source_expert_rows=120, destination_expert_rows=16000)
+        self.assertEqual((first.spec.schedule_source_expert_rows, first.spec.schedule_destination_expert_rows),
+                         (128, 16384))
+        self.assertEqual((next_plan.spec.schedule_source_expert_rows, next_plan.spec.schedule_destination_expert_rows),
+                         (256, 32768))
+        self.assertEqual(next_plan.spec.receive_capacity, first.spec.receive_capacity)
+        self.assertIs(next_plan, reused)
+        self.assertEqual(build.call_count, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_automatic_plan_uses_committed_capacity_in_both_transports(self) -> None:
         """Feature: automatic token schedule coverage.
 
@@ -491,7 +509,9 @@ class TestMegaMoeExperts(unittest.TestCase):
                                     plan=object(), workspace=object(), ensure_capacity=Mock(),
                                     plan_for_tokens=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=SimpleNamespace(plan_tokens=128),
+            routed_tokens=object(), metadata=SimpleNamespace(
+                plan_tokens=128, max_source_expert_rows=91, max_destination_expert_rows=152,
+            ),
             unpermute_mapping=object(), maximum_received_slots=512
         )
         resources.plan_for_tokens.return_value = resources.plan
@@ -528,6 +548,9 @@ class TestMegaMoeExperts(unittest.TestCase):
             workspace=resources.workspace, autograd_mask=13,
         )
         resources.ensure_capacity.assert_called_once_with(512)
+        resources.plan_for_tokens.assert_called_once_with(
+            128, hidden_flat.device, source_expert_rows=91, destination_expert_rows=152,
+        )
         mock_execute.assert_called_once_with(
             hidden_flat,
             topk_ids,
