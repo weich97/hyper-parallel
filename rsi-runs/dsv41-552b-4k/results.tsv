@@ -4,3 +4,4 @@ timestamp	commit	metric	status	description
 2026-11-11T08:33:52-05:00	xxxxxxx	0	crash	A02 restore fused HyperMegaMhc on the fixed-routing best commit
 2026-11-11T08:35:54-05:00	eaddcf3b	1.297	keep	A02 recover fused HyperMegaMhc benchmark from all rank logs [c3_job=40326 c3_seconds=229]
 2026-11-11T08:42:25-05:00	xxxxxxx	0	crash	A03 native Sparse Flash MLA with CED candidate pools
+2026-11-11T08:45:22-05:00	xxxxxxx	0	crash	A03 retry native Sparse Flash MLA with pinned CSA2 runtime
