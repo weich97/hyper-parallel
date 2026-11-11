@@ -83,8 +83,8 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
-        # Fused CSA2 requires candidate pools to remain disabled and TP=1.
-        use_fused_ops: true
+        use_fused_ops: false
+        use_fused_attention: true
   - match: "*.self_attn"
     tp_divide_attrs: [num_groups]
   - match: "*.self_attn.forward"
