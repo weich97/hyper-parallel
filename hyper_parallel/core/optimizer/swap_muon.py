@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -33,6 +34,8 @@ from hyper_parallel.core.optimizer.swap_optimizer_base import (
     SwapOptimizer as CoreSwapOptimizer,
     SwapSlot,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Muon's only persistent optimizer state that participates in swap.
 MUON_STATE_KEYS = ("momentum_buffer",)
@@ -266,6 +269,11 @@ class MuonSwapAdapter(StateSwapAdapter):
                 if batch_index >= len(group_batches):
                     continue
                 units.extend(self._make_hsdp_units(group_index, group_batches[batch_index], batch_index))
+
+        if num_groups and self.optimizer.param_groups[0]["step"] == 1:
+            offloaded = sum(slot.swappable for slot in self._slots.values())
+            logger.info_rank0("Muon state swap min_numel=%d offloaded_slots=%d resident_slots=%d",
+                              self.config.min_numel, offloaded, len(self._slots) - offloaded)
 
         return {
             "units": units,

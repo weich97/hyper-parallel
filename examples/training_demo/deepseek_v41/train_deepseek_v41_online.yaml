@@ -235,6 +235,8 @@ dataloader:
 optimizer:
   _target_: hyper_parallel.components.optim.Sinkhorn
   fp32_main_params: true
+  swap:
+    min_numel: 40000000
   muon_config:
     lr: 2.6e-4
     weight_decay: 0.1
