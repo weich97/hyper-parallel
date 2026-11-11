@@ -529,6 +529,34 @@ def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
     return torch.stack((-second, first), dim=-1).flatten(-2)
 
 
+class _NativeV41RotaryTail(torch.autograd.Function):
+    """Run interleaved RoPE while preserving the eager BF16 gradient rounding."""
+
+    @staticmethod
+    def forward(ctx, rotary, cos, sin, sequence_dim):
+        import torch_npu  # pylint: disable=import-outside-toplevel
+
+        ctx.save_for_backward(cos, sin)
+        rotated = torch_npu.npu_rotary_mul(
+            rotary.movedim(sequence_dim, 0).float().contiguous(),
+            cos.movedim(sequence_dim, 0).float().contiguous(),
+            sin.movedim(sequence_dim, 0).float().contiguous(),
+            rotary_mode="interleave",
+        )
+        return rotated.movedim(0, sequence_dim).to(rotary.dtype)
+
+    @staticmethod
+    def backward(ctx, grad):
+        cos, sin = ctx.saved_tensors
+        promoted = grad.float()
+        # The eager graph rounds each term before adding the two input gradients.
+        direct = (promoted * cos).to(grad.dtype)
+        paired = (promoted * sin).to(grad.dtype).unflatten(-1, (-1, 2))
+        first, second = paired.unbind(-1)
+        inverse_rotation = torch.stack((second, -first), dim=-1).flatten(-2)
+        return direct + inverse_rotation, None, None, None
+
+
 def _apply_v41_rope(
         tensor: torch.Tensor,
         cos: torch.Tensor,
@@ -540,7 +568,15 @@ def _apply_v41_rope(
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
     pass_through, rotary = tensor.split((tensor.shape[-1] - rope_dim, rope_dim), dim=-1)
-    rotary = ((rotary.float() * cos) + (_rotate_half(rotary).float() * sin)).to(tensor.dtype)
+    sequence_dim = 2 if unsqueeze_dim == 1 else 1
+    if (tensor.device.type == "npu" and tensor.dtype == torch.bfloat16
+            and tensor.ndim == 4 and tensor.shape[0] == 1 and rope_dim == 64
+            and unsqueeze_dim in (1, 2) and cos.ndim == 4 and cos.shape == sin.shape
+            and cos.shape[0] == 1 and cos.shape[sequence_dim] == rotary.shape[sequence_dim] > 0
+            and not (cos.requires_grad or sin.requires_grad)):
+        rotary = _NativeV41RotaryTail.apply(rotary, cos, sin, sequence_dim)
+    else:
+        rotary = ((rotary.float() * cos) + (_rotate_half(rotary).float() * sin)).to(tensor.dtype)
     return torch.cat((pass_through, rotary), dim=-1) if pass_through.shape[-1] else rotary
 
 
