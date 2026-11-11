@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 import math
 from typing import Any, TYPE_CHECKING
 
@@ -32,6 +33,9 @@ if TYPE_CHECKING:
     from hyper_parallel.core.multicore import MegaMoeExperts
 
 
+logger = logging.getLogger(__name__)
+
+
 def _swiglu_limit(value: float) -> float:
     """Require the positive clamp used by the source DeepSeek experts."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
@@ -42,6 +46,8 @@ def _swiglu_limit(value: float) -> float:
 @module_replacement
 class DeepseekV41MegaMoeExperts(nn.Module):
     """Own native-layout parameters while retaining the HF checkpoint names."""
+
+    _native_forward_reported = False
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
                  context: Mapping[str, Any] | None = None,
@@ -136,7 +142,11 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        return self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
+        output = self._executor(hidden_states, top_k_index, top_k_weights, expert_weights=weights)
+        if not DeepseekV41MegaMoeExperts._native_forward_reported:
+            logger.info_rank0("DeepSeek-V4.1 native MegaMoE engaged")
+            DeepseekV41MegaMoeExperts._native_forward_reported = True
+        return output
 
     @staticmethod
     def prepare_runtime_group(experts: list[DeepseekV41MegaMoeExperts]) -> None:
