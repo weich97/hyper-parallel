@@ -40,7 +40,7 @@ def attention_role(module: Any) -> str | None:
 
 
 def configure_shared_state(model: Any, roles: tuple[str, ...]) -> None:
-    """Pin the discrete selection of every recomputed index source.
+    """Preserve discrete selection and precomputed native KL across recomputation.
 
     The policy keeps the attention roles outside ``roles`` out of the recompute
     regions and hands the same tuple here, so a pinned selection always belongs
@@ -51,18 +51,20 @@ def configure_shared_state(model: Any, roles: tuple[str, ...]) -> None:
     """
     for module in model.modules():
         role = attention_role(module)
-        if role in _INDEX_SOURCE_ROLES and role in roles:
-            _pin_regions(module)
+        if role not in roles or role not in _INDEX_SOURCE_ROLES:
+            continue
+        _pin_regions(module)
+        exclude_kl = getattr(module, "exclude_indexer_kl_from_recompute", None)
+        if exclude_kl is not None:
+            exclude_kl()
 
 
 def _pin_regions(module: Any) -> None:
     """Turn the discrete selection of one recomputed index source into a region.
 
-    The selection is the only pinned block: recomputing it must not choose a
-    different Top-K set, and the block contains differentiable ops, whose
-    saved-tensor count has to match between the forward pass and the
-    recomputation. The compressor and the indexer projections recompute with the
-    rest of the layer.
+    Recomputing selection must not choose a different Top-K set. Differentiable
+    operations must save the same number of tensors in forward and replay. The
+    compressor and Indexer projections still recompute with the rest of the layer.
     """
     indexer = getattr(module, "indexer", None)
     if indexer is not None:

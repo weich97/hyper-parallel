@@ -1597,6 +1597,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
 
     _fused_attention_reported = False
     _fused_indexer_kl_reported = False
+    _indexer_kl_region: Callable[..., torch.Tensor] | None = None
 
     def __init__(
             self,
@@ -1976,6 +1977,12 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         )
         return combined_key_value, torch.cat((window, compressed_indices), dim=-1)
 
+    def exclude_indexer_kl_from_recompute(self) -> None:
+        """Reuse the native KL loss and its saved gradients during layer replay."""
+        if self.use_fused_ops and self.is_index_source and self._indexer_kl_region is None:
+            region = checkpoint_exclude_wrapper(shared_compressed_indexer_kl_loss)
+            object.__setattr__(self, "_indexer_kl_region", region)
+
     def _apply_indexer_loss(
             self,
             indexer_output: Any | None,
@@ -2002,7 +2009,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 selected = torch.where(selected >= 0, selected - main_key_offset, -1)
                 query_segments = tuple((s, e, ks-main_key_offset, ke-main_key_offset, residual)
                                        for s, e, ks, ke, residual in query_segments)
-            indexer_loss = shared_compressed_indexer_kl_loss(
+            compute_kl = self._indexer_kl_region or shared_compressed_indexer_kl_loss
+            indexer_loss = compute_kl(
                 indexer_output.index_query,
                 index_key,
                 indexer_output.merge_weight,
@@ -2019,7 +2027,8 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 use_fused=self.use_fused_ops,
             )
             if self.use_fused_ops and not SharedCompressedDSAAttentionBase._fused_indexer_kl_reported:
-                logger.info_rank0("Native Lightning Indexer KL engaged")
+                logger.info_rank0("Native Lightning Indexer KL engaged (checkpoint exclusion=%s)",
+                                  self._indexer_kl_region is not None)
                 SharedCompressedDSAAttentionBase._fused_indexer_kl_reported = True
             query = aux_loss_auto_scale(query, indexer_loss)
         return query

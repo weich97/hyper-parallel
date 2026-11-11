@@ -44,6 +44,7 @@ from hyper_parallel.distributed.context_parallel.compressed_document import docu
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.adapter.policies.shared_state import configure_shared_state
 from hyper_parallel.models.deepseek_v41.adapter.validation.model_validation_spec import (
     _validate_canonical_module_tree,
     _validate_engram_scratch_state,
@@ -103,6 +104,22 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
 
 class TestV41ModuleTreeValidation(unittest.TestCase):
     """Check the structure gate with the model's recompute wrapper."""
+
+    def test_native_kl_checkpoint_exclusion_only_applies_to_index_sources(self) -> None:
+        """Keep reuse layers valid when they have no local Indexer attribute."""
+        config = _config()
+        config.num_hidden_layers = 2
+        config.layer_types = ["sliding_attention"] * 2
+        config.v41_compress_ratios = [2, 2]
+        config.v41_kv_source_layer_ids = [0]
+        config.v41_index_source_layer_ids = [0]
+        attention = torch.nn.ModuleList([
+            SharedCompressedDSAAttention(DeepseekV41Attention(config, layer), use_fused_ops=True)
+            for layer in range(2)
+        ])
+        configure_shared_state(attention, ("full", "reindex", "reuse"))
+        self.assertIsNotNone(attention[0]._indexer_kl_region)  # pylint: disable=protected-access
+        self.assertIsNone(attention[1]._indexer_kl_region)  # pylint: disable=protected-access
 
     def test_canonical_attention_checks_wrapped_module_type(self) -> None:
         """Accept resident V4.1 attention and reject an unrelated wrapped module."""

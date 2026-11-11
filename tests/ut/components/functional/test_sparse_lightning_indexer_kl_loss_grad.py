@@ -36,7 +36,7 @@ from hyper_parallel.components.functional.sparse_lightning_indexer_kl_loss_grad 
     _SparseLightningIndexerKLLoss, _load_kl_ops, _stable_prediction_log, _teacher_bank, causal_attention_teacher,
     compressed_attention_teacher, gather_selected_keys, gather_selected_keys_fp32,
 )
-from hyper_parallel.core.activation_memory import checkpoint
+from hyper_parallel.core.activation_memory import checkpoint, checkpoint_exclude_wrapper
 from hyper_parallel.distributed.activation_checkpoint import make_selective_checkpoint_context_fn
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import SharedCompressedPackedSequence
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import shared_compressed_indexer_kl_loss
@@ -287,6 +287,51 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
                     self.assertIsNone(aq.grad)
                     self.assertIsNone(ak.grad)
                     self.assertIsNone(sinks.grad)
+
+    def test_excluded_kl_reuses_native_gradients_during_layer_replay(self):
+        """Backpropagate through replayed projections without running native KL twice."""
+        self.addCleanup(DefaultDeviceType.set_device_type, DefaultDeviceType.get_device_type())
+        DefaultDeviceType.set_device_type("cpu")
+        gradients = []
+        launch_count = 0
+
+        def kernel(query, key, weights, indices, target, **_kwargs):
+            del indices
+            nonlocal launch_count
+            launch_count += 1
+            return torch.ones_like(query), torch.ones_like(key), torch.ones_like(weights), target
+
+        segments = ((0, 4, 0, 6, 0),)
+        indices = torch.tensor([[[0, 1, -1], [1, 2, -1], [3, 4, -1], [4, 5, -1]]])
+        reference_q = torch.ones(1, 3, 4, 4)
+        reference_k = torch.ones(1, 6, 4)
+
+        def apply_kl(query, key, weights):
+            return kl_ops.sparse_lightning_indexer_kl_loss(
+                query, key, weights, reference_q, reference_k, indices, torch.zeros(3),
+                0.5, 0.7, 2, 1, segments,
+            )
+
+        def loss(query, key, weights, kl):
+            features = query.sin()
+            return features.square().sum() + kl(features, key, weights)
+
+        excluded = checkpoint_exclude_wrapper(apply_kl)
+        with patch.object(kl_ops, "_kl_metadata", return_value=({}, None)), \
+                patch.object(kl_ops, "_load_kl_ops", return_value=(kernel, None)):
+            for recompute in (False, True):
+                query = torch.ones(1, 4, 2, 4, requires_grad=True)
+                key = torch.ones(1, 6, 4, requires_grad=True)
+                weights = torch.ones(1, 4, 2, requires_grad=True)
+                if recompute:
+                    value = checkpoint(loss, query, key, weights, excluded, preserve_rng_state=False)
+                else:
+                    value = loss(query, key, weights, apply_kl)
+                gradients.append(torch.autograd.grad(value, (query, key, weights)))
+
+        self.assertEqual(launch_count, 2)
+        for expected, actual in zip(*gradients, strict=True):
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
     def test_flat_gather_keeps_batch_and_duplicate_gradient(self):
         """Noncontiguous banks retain independent batch offsets and repeated-key SUM."""
