@@ -1,2 +1,3 @@
 timestamp	commit	metric	status	description
 2026-11-11T08:25:05-05:00	1c93b860	1.241	keep	DeepSeek V4.1 Flash 552B text backbone fixed-routing baseline B
+2026-11-11T08:29:28-05:00	xxxxxxx	0	crash	A01 fixed routing and partial Muon momentum residency
