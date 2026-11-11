@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
+import logging
 from typing import Any, Protocol
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -1555,8 +1556,13 @@ def reference_sparse_attention(
     return torch.matmul(probabilities[..., :-1].to(key_value.dtype), key_value).transpose(1, 2)
 
 
+logger = logging.getLogger(__name__)
+
+
 class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
+
+    _fused_attention_reported = False
 
     def __init__(
             self,
@@ -1564,6 +1570,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             *,
             replace_indexer: bool,
             use_fused_ops: bool,
+            use_fused_attention: bool = False,
     ) -> None:
         """Transfer source state and configure the execution implementation."""
         super().__init__()
@@ -1594,6 +1601,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         self.sliding_window = module.sliding_window
         self.scaling = module.scaling
         self.use_fused_ops = use_fused_ops
+        self.use_fused_attention = use_fused_attention
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
         self.train(module.training)
@@ -1986,10 +1994,10 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             main_key_offset: int = 0, raw_document_starts: tuple = (), global_key_length: int | None = None,
     ) -> torch.Tensor:
         """Run the chosen implementation; unsupported explicit fusion always raises."""
-        if self.use_fused_ops:
+        if self.use_fused_ops or self.use_fused_attention:
             expected_topk = min(512, global_key_length if global_key_length is not None
                                 else global_sequence_length // max(1, self.compress_ratio))
-            if not (self.candidate_source_layer_idx is None
+            if not ((self.use_fused_attention or self.candidate_source_layer_idx is None)
                     and (topk_indices is None or topk_indices.shape[-1] == expected_topk)
                     and supports_fused_attention_inputs(
                         query, self.compress_ratio, self.sliding_window,
@@ -2005,6 +2013,9 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 self.compress_ratio, self.sliding_window, query_offset, query_segments, raw_key_offset, main_key_offset,
                 raw_document_starts,
             )
+            if self.use_fused_attention and not SharedCompressedDSAAttentionBase._fused_attention_reported:
+                logger.info_rank0("Sparse Flash MLA native training path engaged")
+                SharedCompressedDSAAttentionBase._fused_attention_reported = True
             if compressed_kv is not None and all(end == start for _, _, start, end, _ in query_segments):
                 # Empty-prefix ranks must still participate in the shared bank's collective backward.
                 output = output + compressed_kv[:, :0].sum().to(output.dtype)
@@ -2145,6 +2156,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         context: Mapping[str, Any] | None = None,
         *,
         use_fused_ops: bool = False,
+        use_fused_attention: bool = False,
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
@@ -2161,6 +2173,9 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 raising on unsupported calls without automatic fallback.
                 False selects eager PyTorch attention, Indexer and KL on every
                 device, without loading optional operator extensions.
+            use_fused_attention: Use native Sparse Flash MLA with the eager
+                Indexer and KL. The native kernel consumes the same selected
+                compressed keys, including selections from candidate pools.
             indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
                 Selection exchanges low-rank qr, merge weights and rotary embeddings;
                 attention and KL retain the original owner and autograd graph.
@@ -2189,6 +2204,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         """
         if not isinstance(use_fused_ops, bool):
             raise ValueError(f"use_fused_ops must be a bool, got {use_fused_ops!r}")
+        if not isinstance(use_fused_attention, bool) or (use_fused_attention and use_fused_ops):
+            raise ValueError("use_fused_attention requires a boolean and use_fused_ops=False")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
@@ -2202,6 +2219,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             module,
             replace_indexer=True,
             use_fused_ops=use_fused_ops,
+            use_fused_attention=use_fused_attention,
         )
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size
