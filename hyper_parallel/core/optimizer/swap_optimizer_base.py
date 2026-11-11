@@ -1976,6 +1976,16 @@ class SwapOptimizer(torch.optim.Optimizer):
         """Proxy optimizer state."""
         return self.optimizer.state
 
+    def state_for_inspection(self, parameter: Any) -> Dict[str, Any]:
+        """Expose a packed host mirror through its existing logical DTensor shell."""
+        state = dict(self.optimizer.state.get(parameter, {}))
+        for name, value in state.items():
+            slot = self.adapter._slots.get((id(parameter), name))
+            if (slot is not None and slot.packed and slot.state == "host"
+                    and slot.cpu_tensor is value and slot.logical_tensor is not None):
+                state[name] = slot.logical_tensor
+        return state
+
     @property
     def defaults(self) -> Dict[str, Any]:
         """Proxy optimizer defaults."""

@@ -44,6 +44,7 @@ from hyper_parallel.core.optimizer.sharding_category import (
     build_owner_by_size,
     select_owned_records,
 )
+from hyper_parallel.tools.model_integration.optimizer_layout import snapshot_training_layout, validate_optimizer_layout
 
 
 def _muon(params, **kwargs):
@@ -423,6 +424,31 @@ class TestMuonSwapAdapter(unittest.TestCase):
 
 class TestMuonPackedSwap(unittest.TestCase):
     """Packed host layout and live momentum-state rebinding."""
+
+    @mock.patch.object(DeviceMesh, "get_group", return_value=None)
+    @mock.patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_layout_inspection_reads_packed_momentum_without_materializing_it(self, get_rank, get_group):
+        """The validator sees the retained DTensor layout while storage stays on the host."""
+        del get_rank, get_group
+        mesh = DeviceMesh("cpu", [0], mesh_dim_names=("dp",), _init_backend=False)
+        host = torch.ones(4, 4)
+        logical = DTensor.from_local(host, mesh, (Replicate(),))
+        parameter = torch.nn.Parameter(DTensor.from_local(torch.zeros_like(host), mesh, (Replicate(),)))
+        model = torch.nn.Module()
+        model.register_parameter("weight", parameter)
+        optimizer = _muon([parameter])
+        wrapped = swap_muon(optimizer, _swap_config(packed_swap=True))
+        optimizer.state[parameter]["momentum_buffer"] = host
+        wrapped.adapter._slots[(id(parameter), "momentum_buffer")] = SwapSlot(
+            "momentum_buffer", host, cpu_tensor=host, state="host", packed=True, logical_tensor=logical,
+        )
+
+        self.assertEqual(validate_optimizer_layout(model, wrapped), [])
+        layout = snapshot_training_layout(model, wrapped)["parameters"]["weight"]["optimizer_state"]
+        self.assertTrue(layout["momentum_buffer"]["is_dtensor"])
+        self.assertEqual(layout["momentum_buffer"]["device"], "cpu")
+        self.assertIs(optimizer.state[parameter]["momentum_buffer"], host)
+        self.assertTrue(validate_optimizer_layout(model, optimizer))
 
     def setUp(self) -> None:
         """Replace pinned allocation and accelerator events with CPU equivalents."""

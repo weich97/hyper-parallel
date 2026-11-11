@@ -67,6 +67,8 @@ def optimizer_leaves(optimizer: Any) -> tuple[Any, ...]:
     chained = getattr(optimizer, "chained_optimizers", None)
     if chained is not None:
         return tuple(leaf for item in chained for leaf in optimizer_leaves(item))
+    if callable(getattr(optimizer, "state_for_inspection", None)):
+        return (optimizer,)
     inner = getattr(optimizer, "optimizer", None)
     if inner is not None and inner is not optimizer:
         return optimizer_leaves(inner)
@@ -78,6 +80,12 @@ def optimizer_leaves(optimizer: Any) -> tuple[Any, ...]:
 def optimizer_state_for_parameter(optimizer: Any, parameter: Any) -> Mapping[str, Any]:
     """Find one parameter's state through supported optimizer wrappers."""
     for leaf in optimizer_leaves(optimizer):
+        read_state = getattr(leaf, "state_for_inspection", None)
+        if callable(read_state):
+            value = read_state(parameter)
+            if value:
+                return value
+            continue
         state = getattr(leaf, "state", None)
         if isinstance(state, Mapping) and parameter in state:
             value = state[parameter]
