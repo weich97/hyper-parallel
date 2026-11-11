@@ -302,7 +302,9 @@ debug:
   check_nan_inf: false
   check_dataset: warn
 
-loss_fn: null
+loss_fn:
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
 
 profiler:
   enable: false
