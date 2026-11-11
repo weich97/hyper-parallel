@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 import math
 from typing import Any
 
@@ -28,6 +29,9 @@ from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41PipelinedHyperConnection,
 )
 from hyper_parallel.models.replacement import module_replacement
+
+
+logger = logging.getLogger(__name__)
 
 
 def _rms_norm_eps(module: nn.Module) -> float:
@@ -65,6 +69,8 @@ def _reference_shifted_boundary(
 @module_replacement
 class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
     """Retain V4.1 parameter names while executing a shifted MegaKernel boundary."""
+
+    _native_forward_reported = False
 
     def __init__(
             self,
@@ -117,7 +123,7 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             hyper_mega_mhc,
         )
 
-        return hyper_mega_mhc(
+        output = hyper_mega_mhc(
             previous_output,
             residual,
             previous_pre_mix,
@@ -132,6 +138,10 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             num_iters=self.hc_sinkhorn_iters,
             token_tile=self.token_tile,
         )
+        if not type(self)._native_forward_reported:
+            logger.info_rank0("HyperMegaMhc native NPU forward engaged")
+            type(self)._native_forward_reported = True
+        return output
 
 
 __all__ = ["DeepseekV41HyperMegaMhc"]
