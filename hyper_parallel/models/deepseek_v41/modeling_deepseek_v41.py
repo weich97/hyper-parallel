@@ -53,7 +53,7 @@ from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     sequence_load_balancing_loss,
     update_modality_bias,
 )
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, DSparkTokenEmbedding
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
@@ -663,6 +663,7 @@ def _v41_shifted_decoder_layer_forward(
         router_token_mask: torch.Tensor | None,
         router_sequence_ids: torch.Tensor | None,
         router_num_sequences: int | None,
+        collect_dspark_target: bool,
         **kwargs: Any,
 ) -> tuple[torch.Tensor, ...]:
     """Run the shifted-mHC decoder path after protocol selection."""
@@ -693,6 +694,8 @@ def _v41_shifted_decoder_layer_forward(
         previous_residual_mix,
         layer.input_layernorm.weight,
     )
+    if collect_dspark_target:
+        layer.dspark_target_hidden = residual.detach().mean(dim=2)
     attention_output, _ = layer.self_attn(
         attention_input,
         position_embeddings=position_embeddings,
@@ -740,6 +743,7 @@ def _v41_decoder_layer_forward(
         router_token_mask: torch.Tensor | None = None,
         router_sequence_ids: torch.Tensor | None = None,
         router_num_sequences: int | None = None,
+        collect_dspark_target: bool = False,
         **kwargs: Any,
 ) -> tuple[torch.Tensor, ...]:
     """Run one V4.1 block while preserving the decoder module call boundary."""
@@ -762,6 +766,7 @@ def _v41_decoder_layer_forward(
             router_token_mask=router_token_mask,
             router_sequence_ids=router_sequence_ids,
             router_num_sequences=router_num_sequences,
+            collect_dspark_target=collect_dspark_target,
             **kwargs,
         )
 
@@ -773,6 +778,8 @@ def _v41_decoder_layer_forward(
             token_mask=engram_token_mask,
         )
     residual = hidden_states
+    if collect_dspark_target:
+        self.dspark_target_hidden = residual.detach().mean(dim=2)
     attention_pre, attention_post, attention_comb = self.attn_hc(hidden_states)
     attention_input = self.input_layernorm(_hc_pre(hidden_states, pre_mix))
     attention_output, _ = self.self_attn(
@@ -824,12 +831,23 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             assets = json.load(assets_file)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if int(getattr(config, "v41_dspark_depth", 0)) > 0:
+            self.embed_tokens = DSparkTokenEmbedding(
+                config.vocab_size, config.hidden_size, self.padding_idx,
+                noise_token_id=int(config.v41_dspark_noise_token_id),
+            )
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.dspark_inputs_embeds = None
+        self.dspark_noise_embedding = None
+        self.dspark_token_mask = None
+        self.dspark_sequence_boundaries = None
         self.layers = nn.ModuleList(
             [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
+            layer.dspark_target_hidden = None
             layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
             layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
             layer.self_attn = DeepseekV41Attention(config, layer_idx)
@@ -1020,6 +1038,33 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             )
         return packed_sequence.segment_start_mask(input_ids.device).expand_as(input_ids)
 
+    def _prepare_token_embeddings(self, input_ids, inputs_embeds):
+        """Capture tied, frozen drafter embeddings before the visual feature merge."""
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+            draft_embeddings = inputs_embeds
+        elif isinstance(self.embed_tokens, DSparkTokenEmbedding):
+            # Caller-supplied embeddings must not reuse the previous batch's
+            # noise row or replace the drafter's tied vocabulary embedding.
+            draft_embeddings = self.embed_tokens(input_ids)
+        else:
+            draft_embeddings = inputs_embeds
+        if getattr(self.config, "v41_dspark_target_layer_ids", None):
+            self.dspark_inputs_embeds = draft_embeddings.detach()
+            if isinstance(self.embed_tokens, DSparkTokenEmbedding):
+                self.dspark_noise_embedding = self.embed_tokens.cached_noise_embedding
+        return inputs_embeds
+
+    def _set_dspark_metadata(self, packed_sequence, token_mask):
+        """Retain packed text-only supervision boundaries for the drafter."""
+        self.dspark_token_mask = token_mask
+        self.dspark_sequence_boundaries = None
+        if packed_sequence is not None and getattr(self.config, "v41_dspark_target_layer_ids", None):
+            if (packed_sequence.local_query_start != 0
+                    or packed_sequence.local_query_length != packed_sequence.global_sequence_length):
+                raise ValueError("DSpark requires complete document context; a CP-split drafter needs KV exchange")
+            self.dspark_sequence_boundaries = packed_sequence.document_boundaries()
+
     def _prepare_image_embeddings(
             self, *, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor | None,
             token_types: torch.LongTensor | None, image_inputs: dict[str, Any],
@@ -1044,8 +1089,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             ]
         if token_types is not None and token_types.shape != input_ids.shape:
             raise ValueError("token_types must have the same shape as input_ids")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = self._prepare_token_embeddings(input_ids, inputs_embeds)
         merge_token_types = token_types
         merge_start = image_sequence_start
         if encoder_parallel_plan is not None:
@@ -1101,7 +1145,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             segment_start_mask: Packed-sample boundary mask.
             engram_token_mask: Mask selecting tokens with Engram contributions.
             image_mask: Mask selecting visual tokens.
-            dspark_layer_ids: Layers whose outputs supervise the drafter.
+            dspark_layer_ids: Layers whose pre-attention stream means condition the drafter.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
@@ -1117,6 +1161,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             post_mix = torch.zeros_like(pre_mix)
             residual_mix = _identity_residual_mix(pre_mix)
         for layer_index, layer in enumerate(self.layers):
+            collect_target = self.dspark_target_hiddens is not None and layer_index in dspark_layer_ids
+            layer.dspark_target_hidden = None
             if shifted_mhc:
                 previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
                     hidden_states,
@@ -1132,6 +1178,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     segment_starts=segment_start_mask,
                     engram_token_mask=engram_token_mask,
                     image_mask=image_mask,
+                    collect_dspark_target=collect_target,
                     **kwargs,
                 )
             else:
@@ -1146,16 +1193,13 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     segment_starts=segment_start_mask,
                     engram_token_mask=engram_token_mask,
                     image_mask=image_mask,
+                    collect_dspark_target=collect_target,
                     **kwargs,
                 )
-            if self.dspark_target_hiddens is not None and layer_index in dspark_layer_ids:
-                # DSpark targets include the pending FFN post, but must not
-                # propagate drafter gradients into the backbone.
-                with torch.no_grad():
-                    target_hidden = hidden_states
-                    if shifted_mhc:
-                        target_hidden = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
-                    self.dspark_target_hiddens.append(_hc_pre(target_hidden, pre_mix).detach())
+            if collect_target:
+                if layer.dspark_target_hidden is None:
+                    raise RuntimeError("The decoder did not publish its DSpark pre-attention feature tap")
+                self.dspark_target_hiddens.append(layer.dspark_target_hidden)
         if shifted_mhc:
             hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
         return hidden_states, pre_mix
@@ -1243,13 +1287,13 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             kwargs["router_sequence_ids"] = sequence_ids
             kwargs["router_num_sequences"] = sequence_capacity
         segment_start_mask = self._build_segment_start_mask(packed_sequence, input_ids)
+        self._set_dspark_metadata(packed_sequence, engram_token_mask)
         hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1).contiguous()
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:2], self.config.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         shared_state = SharedAttentionState()
         dspark_layer_ids = tuple(getattr(self.config, "v41_dspark_target_layer_ids", ()) or ())
         self.dspark_target_hiddens = [] if dspark_layer_ids else None
-        self.dspark_inputs_embeds = inputs_embeds.detach() if dspark_layer_ids else None
         hidden_states, pre_mix = self._run_decoder_layers(
             hidden_states,
             pre_mix,
@@ -1378,7 +1422,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             if not targets:
                 raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
             dspark_loss, dspark_metrics = self.dspark(
-                targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head
+                targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head,
+                noise_embedding=self.model.dspark_noise_embedding,
+                token_mask=self.model.dspark_token_mask,
+                sequence_boundaries=self.model.dspark_sequence_boundaries,
             )
             dspark_term = self.dspark_loss_coeff * dspark_loss
             # The trainer's default ModelOutputLoss backpropagates

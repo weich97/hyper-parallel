@@ -25,20 +25,24 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import torch
 from torch import nn
 
 from tests.common.mark_utils import arg_mark
+from tests.ut.auto_models.models.deepseek_v41.test_modeling_deepseek_v41 import _config, DeepseekV4Config
 
 from hyper_parallel import DeviceMesh, Replicate, Shard, init_empty_weights
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, _DSparkHcCoefficients
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+from hyper_parallel.models.deepseek_v41.dspark import (
+    DeepseekV41DSpark, DSparkTokenEmbedding, _DSparkHcCoefficients,
+)
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM, DeepseekV41Model
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 
 
 def _small_config() -> SimpleNamespace:
@@ -95,6 +99,11 @@ def _build(config: SimpleNamespace) -> tuple[DeepseekV41DSpark, nn.Linear]:
     dspark = DeepseekV41DSpark(config, mlp_factory=lambda: _TinyMlp(config.hidden_size))
     head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
     return dspark, head
+
+
+def _noise(config):
+    """Provide a deterministic frozen embedding row independent of drafter parameters."""
+    return torch.linspace(0.01, 0.03, config.hidden_size)
 
 
 def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
@@ -242,8 +251,205 @@ class DSparkPublishedAttentionTest(unittest.TestCase):
                     torch.testing.assert_close(parameter.grad, reference.grad, rtol=5.0e-5, atol=5.0e-6, msg=name)
 
 
+class _TokenInjection(torch.nn.Module):
+    """Observe Engram's call boundary with a deterministic token-dependent injection."""
+
+    def __init__(self, config: DeepseekV4Config) -> None:
+        """Create a small differentiable injection without external hash-table assets."""
+        super().__init__()
+        self.embedding = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+        self.calls = 0
+
+    def forward(self, hidden: torch.Tensor, input_ids: torch.Tensor,
+                _segment_starts: torch.Tensor | None, *, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Count the injection and add token features to each residual stream."""
+        self.calls += 1
+        value = self.embedding(input_ids)
+        if token_mask is not None:
+            value = value * token_mask.unsqueeze(-1)
+        return hidden + value.unsqueeze(2)
+
+
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dspark_taps_pre_attention_stream_mean_after_engram(self) -> None:
+        """Feature: Published DSpark backbone feature taps.
+
+        Description: Observe real attention-boundary inputs with ordinary and shifted mHC.
+        Expectation: Targets are detached unweighted means after one Engram injection and before attention.
+        """
+        torch.manual_seed(170)
+        config = _config()
+        config.num_hidden_layers = 2
+        config.layer_types = ["sliding_attention"] * 2
+        config.mlp_layer_types = ["moe"] * 2
+        config.v41_compress_ratios = [0, 0]
+        config.v41_dspark_target_layer_ids = [0, 1]
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                   mock_open(read_data='{"layer_ids": []}')):
+            reference = DeepseekV41Model(config)
+        for layer in reference.layers:
+            layer.engram = _TokenInjection(config)
+        shifted = copy.deepcopy(reference)
+        for layer in shifted.layers:
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
+        observed = []
+
+        def _record_input(_module, arguments):
+            """Capture the reference attention-boundary stream without autograd state."""
+            observed.append(arguments[0].detach().mean(dim=2))
+
+        handles = [layer.attn_hc.register_forward_pre_hook(_record_input) for layer in reference.layers]
+        try:
+            ids = torch.tensor([[1, 2, 3, 4]])
+            expected = reference(input_ids=ids).last_hidden_state
+            actual = shifted(input_ids=ids).last_hidden_state
+        finally:
+            for handle in handles:
+                handle.remove()
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(len(observed), 2)
+        for model in (reference, shifted):
+            for layer, target, expected_target in zip(model.layers, model.dspark_target_hiddens, observed, strict=True):
+                self.assertEqual(layer.engram.calls, 1)
+                self.assertFalse(target.requires_grad)
+                torch.testing.assert_close(target, expected_target)
+
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_noise_row_is_shared_frozen_and_refreshed(self) -> None:
+        """Feature: Tied backbone token embeddings.
+
+        Description: Refresh the noise row after a backbone weight update and run draft backward.
+        Expectation: Noise follows the shared vocabulary row without an extra parameter or backbone gradient.
+        """
+        config = _small_config()
+        drafter, head = _build(config)
+        embedding = DSparkTokenEmbedding(config.vocab_size, config.hidden_size,
+                                         noise_token_id=config.v41_dspark_noise_token_id)
+        ids, labels, targets, _ = _batch(config)
+        previous = None
+        for iteration in range(2):
+            if iteration:
+                with torch.no_grad():
+                    embedding.weight[config.v41_dspark_noise_token_id].add_(0.25)
+            embeds = embedding(ids)
+            noise = embedding.cached_noise_embedding
+            torch.testing.assert_close(noise, embedding.weight[config.v41_dspark_noise_token_id], rtol=0, atol=0)
+            self.assertFalse(noise.requires_grad)
+            if previous is not None:
+                torch.testing.assert_close(noise, previous + 0.25, rtol=0, atol=0)
+            previous = noise.clone()
+            loss, _ = drafter(targets, ids, labels, embeds.detach(), head, noise_embedding=noise)
+            loss.backward()
+            self.assertIsNone(embedding.weight.grad)
+        self.assertEqual(set(dict(embedding.named_parameters())), {"weight"})
+        self.assertNotIn("noise_embedding", dict(drafter.named_parameters()))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_first_draft_input_and_markov_context_follow_main_context(self) -> None:
+        """Feature: Released DSpark decode alignment.
+
+        Description: Observe the actual first-stage input and Markov inputs in teacher forcing.
+        Expectation: Main context ending at t sees x[t+1] plus noise, then predicts x[t+2+j].
+        """
+        config = _small_config()
+        drafter, head = _build(config)
+        ids = torch.arange(1, 7)[None]
+        embeds = torch.arange(6 * config.hidden_size).float().view(1, 6, -1)
+        targets = [torch.zeros_like(embeds) for _ in config.v41_dspark_target_layer_ids]
+        stage_inputs, markov_inputs = [], []
+        handles = [drafter.stages[0].register_forward_pre_hook(
+            lambda _module, args: stage_inputs.append(args[0].detach().clone())),
+            drafter.markov_head.register_forward_pre_hook(
+                lambda _module, args: markov_inputs.append(args[0].detach().clone()))]
+        try:
+            drafter(targets, ids, None, embeds, head, noise_embedding=_noise(config))
+        finally:
+            for handle in handles:
+                handle.remove()
+        actual = stage_inputs[0][..., 0, :]
+        torch.testing.assert_close(actual[:, :-1, 0], embeds[:, 1:], rtol=0, atol=0)
+        torch.testing.assert_close(actual[:, -1, 0], _noise(config)[None], rtol=0, atol=0)
+        torch.testing.assert_close(actual[:, :, 1:], _noise(config).expand_as(actual[:, :, 1:]), rtol=0, atol=0)
+        expected = torch.tensor([[[2, 3, 4], [3, 4, 5], [4, 5, 6],
+                                  [5, 6, 63], [6, 63, 63], [63, 63, 63]]])
+        torch.testing.assert_close(torch.cat(markov_inputs, dim=1), expected, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_packed_draft_matches_independent_documents_and_gradients(self) -> None:
+        """Feature: Packed-document isolation.
+
+        Description: Compare uneven packed attention tiles and losses with two independent documents.
+        Expectation: Position reset, KV windows and teacher-forcing boundaries preserve loss and every gradient.
+        """
+        for backend in ("reference", "flash_v3"):
+            with self.subTest(backend=backend):
+                config = _small_config()
+                reference, head = _build(config)
+                config.v41_dspark_attention_backend = backend
+                config.v41_dspark_attention_chunk_size = 3
+                packed, _ = _build(config)
+                ids, _, hiddens, embeds = _batch(config, batch=2, seq=10)
+                counts, sums = [], []
+                for start, stop in ((0, 4), (4, 10)):
+                    loss, metrics = reference([value[:, start:stop] for value in hiddens],
+                                              ids[:, start:stop], None, embeds[:, start:stop], head,
+                                              noise_embedding=_noise(config))
+                    count = metrics["dspark_supervised_tokens"]
+                    counts.append(count)
+                    sums.append(loss * count)
+                expected = sum(sums) / sum(counts)
+                with patch("hyper_parallel.models.deepseek_v41.dspark._flash_attention_v3",
+                           side_effect=_flash_v3_torch_reference):
+                    actual, metrics = packed(hiddens, ids, None, embeds, head,
+                                             noise_embedding=_noise(config), sequence_boundaries=(0, 4, 10))
+                    actual.backward()
+                expected.backward()
+                torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=1.0e-7)
+                self.assertEqual(metrics["dspark_supervised_tokens"], sum(counts))
+                for (name, left), (_, right) in zip(
+                        reference.named_parameters(), packed.named_parameters(), strict=True):
+                    torch.testing.assert_close(right.grad, left.grad, rtol=4.0e-5, atol=3.0e-7, msg=name)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_draft_targets_do_not_cross_visual_spans_or_document_ends(self) -> None:
+        """Feature: Multimodal and packed supervision masks.
+
+        Description: Place a visual token inside a text draft and a document boundary near its end.
+        Expectation: Only uninterrupted text prefixes inside each document receive draft supervision.
+        """
+        config = _small_config()
+        drafter, _ = _build(config)
+        ids = torch.arange(1, 11)[None]
+        text = torch.tensor([[True, True, True, False, True, True, True, True, True, True]])
+        labels = torch.zeros_like(ids)
+        labels[:, 5] = IGNORE_INDEX
+        _, actual = drafter._teacher_forced_targets(ids, labels, text, (0, 7, 10))
+        expected = torch.full((1, 10, 3), IGNORE_INDEX)
+        expected[0, 0, 0] = 3
+        expected[0, 3, 0] = 6
+        expected[0, 7, 0] = 10
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        hiddens = [torch.randn(1, 10, config.hidden_size) for _ in config.v41_dspark_target_layer_ids]
+        embeds = torch.randn(1, 10, config.hidden_size)
+        head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        loss, metrics = drafter(hiddens, ids, None, embeds, head, noise_embedding=_noise(config),
+                                token_mask=torch.zeros_like(text))
+        loss.backward()
+        self.assertEqual(loss.item(), 0)
+        self.assertEqual(metrics["dspark_supervised_tokens"].item(), 0)
+        for parameter in drafter.parameters():
+            if parameter.grad is not None:
+                torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter.grad), rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -304,7 +510,7 @@ class DSparkComponentTest(unittest.TestCase):
         try:
             with patch("hyper_parallel.models.deepseek_v41.dspark.functional.cross_entropy",
                        side_effect=lambda logits, *args, **kwargs: logits.sum() * 0.0):
-                loss, _ = dspark(hiddens, ids, labels, embeds, head)
+                loss, _ = dspark(hiddens, ids, labels, embeds, head, noise_embedding=_noise(config))
                 loss.backward()
         finally:
             for handle in handles:
@@ -331,7 +537,7 @@ class DSparkComponentTest(unittest.TestCase):
         config = _small_config()
         reference, _ = _build(config)
         reference.init_weights(config.initializer_range)
-        parameter_names = ("noise_embedding", "stages.0.attn_hc.fn", "stages.0.ffn_hc.fn")
+        parameter_names = ("stages.0.attn_hc.fn", "stages.0.ffn_hc.fn")
         for shards in (1, 2, 3, 16):
             for rank in range(2 * shards):
                 with self.subTest(shards=shards, rank=rank), \
@@ -374,8 +580,8 @@ class DSparkComponentTest(unittest.TestCase):
         config.v41_dspark_attention_chunk_size = 3
         candidate, _ = _build(config)
         ids, labels, hiddens, embeds = _batch(config)
-        expected, _ = reference(hiddens, ids, labels, embeds, head)
-        actual, _ = candidate(hiddens, ids, labels, embeds, head)
+        expected, _ = reference(hiddens, ids, labels, embeds, head, noise_embedding=_noise(config))
+        actual, _ = candidate(hiddens, ids, labels, embeds, head, noise_embedding=_noise(config))
         torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=1.0e-7)
         expected.backward()
         actual.backward()
@@ -398,10 +604,10 @@ class DSparkComponentTest(unittest.TestCase):
                 config.v41_dspark_attention_chunk_size = chunk
                 candidate, _ = _build(config)
                 ids, labels, hiddens, embeds = _batch(config)
-                expected, _ = reference(hiddens, ids, labels, embeds, head)
+                expected, _ = reference(hiddens, ids, labels, embeds, head, noise_embedding=_noise(config))
                 with patch("hyper_parallel.models.deepseek_v41.dspark._flash_attention_v3",
                            side_effect=_flash_v3_torch_reference) as native:
-                    actual, _ = candidate(hiddens, ids, labels, embeds, head)
+                    actual, _ = candidate(hiddens, ids, labels, embeds, head, noise_embedding=_noise(config))
                     actual.backward()
                 self.assertGreater(native.call_count, 0)
                 expected.backward()
@@ -421,7 +627,7 @@ class DSparkComponentTest(unittest.TestCase):
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
-        loss, metrics = dspark(targets, input_ids, labels, embeds, head)
+        loss, metrics = dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
         self.assertTrue(torch.isfinite(loss).item(), "DSpark loss must be finite")
         for name in ("dspark_ce", "dspark_confidence_bce", "dspark_draft_accuracy",
                      "dspark_supervised_tokens"):
@@ -441,7 +647,7 @@ class DSparkComponentTest(unittest.TestCase):
         input_ids, labels, targets, embeds = _batch(config)
         targets[0] = targets[0].clone().requires_grad_(True)
         with self.assertRaisesRegex(ValueError, "detached"):
-            dspark(targets, input_ids, labels, embeds, head)
+            dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -454,7 +660,7 @@ class DSparkComponentTest(unittest.TestCase):
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
-        loss, _ = dspark(targets, input_ids, labels, embeds, head)
+        loss, _ = dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
         loss.backward()
         self.assertIsNone(head.weight.grad, "tied head must stay frozen under DSpark loss")
         touched = [name for name, parameter in dspark.named_parameters()
@@ -463,14 +669,14 @@ class DSparkComponentTest(unittest.TestCase):
         self.assertTrue(any(name.startswith("main_proj") for name in touched))
         self.assertTrue(any(name.startswith("markov_head") for name in touched))
         self.assertTrue(any(name.startswith("confidence_head") for name in touched))
-        self.assertTrue(any(name == "noise_embedding" for name in touched))
+        self.assertNotIn("noise_embedding", dict(dspark.named_parameters()))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_supervised_targets_align_with_future_tokens(self):
         """Feature: Configured teacher-forcing alignment.
 
-        Description: Draft offset j at position t must supervise the token at t+1+j.
+        Description: Draft offset j at position t must supervise the token at t+2+j.
         Expectation: Only in-range future tokens contribute to the supervision count.
         """
         config = _small_config()
@@ -481,10 +687,10 @@ class DSparkComponentTest(unittest.TestCase):
         labels = input_ids.clone()
         targets = [torch.zeros(batch, seq, config.hidden_size) for _ in config.v41_dspark_target_layer_ids]
         embeds = torch.zeros(batch, seq, config.hidden_size)
-        _, metrics = dspark(targets, input_ids, labels, embeds, head)
-        # Offsets j=0 supervises t+1 (five valid positions) and j=1 supervises
-        # t+2 (four valid positions); the padded tail carries IGNORE_INDEX.
-        self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 1) + (seq - 2))
+        _, metrics = dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
+        # Main context ends at t; the known draft input is t+1, so
+        # offsets predict t+2 and t+3 (four and three valid positions).
+        self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 2) + (seq - 3))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -496,10 +702,9 @@ class DSparkComponentTest(unittest.TestCase):
 
 
         The trainer hands labels over already shifted (labels[t] supervises
-        input_ids[t + 1]); gathering them as target values would move the
-        draft objective to t + 2 + j and the drafter would train against the
-        wrong token. Capture the cross-entropy targets and pin them to
-        input_ids[t + 1 + j] with the label mask aligned via labels[t + j].
+        input_ids[t + 1]). Main KV ends at t, the known draft input is t+1,
+        and draft offset j predicts input_ids[t + 2 + j]. Labels only mask
+        this target through labels[t + 1 + j].
         """
         config = _small_config()
         config.v41_dspark_block_size = 2
@@ -520,14 +725,14 @@ class DSparkComponentTest(unittest.TestCase):
 
         with patch("hyper_parallel.models.deepseek_v41.dspark.functional.cross_entropy",
                    side_effect=_spy):
-            _, metrics = dspark(hiddens, input_ids, labels, embeds, head)
+            _, metrics = dspark(hiddens, input_ids, labels, embeds, head, noise_embedding=_noise(config))
         got = torch.cat(captured).view(batch, seq, 2)
-        expected = torch.tensor([[[2, 3], [3, 4], [4, 5], [5, 6],
-                                  [6, IGNORE_INDEX],
+        expected = torch.tensor([[[3, 4], [4, 5], [5, 6], [6, IGNORE_INDEX],
+                                  [IGNORE_INDEX, IGNORE_INDEX],
                                   [IGNORE_INDEX, IGNORE_INDEX]]])
         self.assertTrue(torch.equal(got, expected),
                         msg=f"draft targets misaligned: {got.tolist()}")
-        self.assertEqual(int(metrics["dspark_supervised_tokens"]), 9)
+        self.assertEqual(int(metrics["dspark_supervised_tokens"]), 7)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -541,9 +746,9 @@ class DSparkComponentTest(unittest.TestCase):
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
         with torch.no_grad():
-            baseline, _ = dspark(targets, input_ids, labels, embeds, head)
+            baseline, _ = dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
             dspark.markov_head.head.weight.mul_(0.0)
-            ablated, _ = dspark(targets, input_ids, labels, embeds, head)
+            ablated, _ = dspark(targets, input_ids, labels, embeds, head, noise_embedding=_noise(config))
         self.assertNotAlmostEqual(float(baseline), float(ablated), places=6,
                                   msg="Markov bias must influence the draft objective")
 
@@ -562,8 +767,8 @@ class DSparkComponentTest(unittest.TestCase):
         input_ids = torch.arange(1, seq + 1).unsqueeze(0)
         targets = [torch.zeros(batch, seq, config.hidden_size) for _ in config.v41_dspark_target_layer_ids]
         embeds = torch.zeros(batch, seq, config.hidden_size)
-        _, metrics = dspark(targets, input_ids, None, embeds, head)
-        self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 1) + (seq - 2))
+        _, metrics = dspark(targets, input_ids, None, embeds, head, noise_embedding=_noise(config))
+        self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 2) + (seq - 3))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -758,9 +963,6 @@ _RELEASED_ONLY = {
 _OURS_ONLY = {
     # Grouped expert tensors, see above.
     "stages.N.mlp.experts.gate_up_proj", "stages.N.mlp.experts.down_proj",
-    # The release fills draft slots from the embedding of dspark_noise_token_id;
-    # this implementation learns a dedicated vector instead.
-    "noise_embedding",
 }
 
 

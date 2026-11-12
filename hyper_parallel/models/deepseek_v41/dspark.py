@@ -30,8 +30,9 @@ Training contract implemented here, following the report:
 * One forward computes base logits for all ``block_size`` draft offsets of
   every sequence position (teacher forcing). The Markov head adds a low-rank
   bias conditioned on the previous ground-truth token of each draft offset.
-* The draft objective is token-weighted cross-entropy against the ``j+1``-step
-  future token; the confidence objective is a BCE against greedy-hit events.
+* With the main context ending at ``t``, the first draft input is ``x[t+1]``;
+  draft offset ``j`` predicts ``x[t+2+j]``. The objective is token-weighted
+  cross-entropy and the confidence objective is a BCE against greedy-hit events.
   The report does not disclose the production loss coefficients, so both are
   configuration values, mirroring the Indexer-KL precedent.
 
@@ -55,6 +56,7 @@ from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.data.constants import IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
@@ -104,16 +106,69 @@ def _apply_rope(tensor, cos, sin, *, inverse=False):
 
 
 @lru_cache(maxsize=64)
-def _draft_pack_metadata(batch, sequence, block, window, start, device):
+def _document_geometry(sequence, boundaries):
+    """Return owned document-relative positions and exclusive ends without device synchronization."""
+    boundaries = (0, sequence) if boundaries is None else tuple(boundaries)
+    if (len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != sequence
+            or any(end <= start for start, end in zip(boundaries[:-1], boundaries[1:], strict=True))):
+        raise ValueError("DSpark document boundaries must strictly partition the complete sequence")
+    positions = tuple(position for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+                      for position in range(end - start))
+    ends = tuple(end for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+                 for _ in range(end - start))
+    return positions, ends
+
+
+@lru_cache(maxsize=64)
+def _draft_pack_metadata(batch, block, window, positions, device):
     """Build static TND metadata without synchronizing device-resident masks."""
     row_width = window + block
-    lengths = [min(window, start + anchor + 1) + block for anchor in range(sequence)] * batch
+    lengths = [min(window, position + 1) + block for position in positions] * batch
     indices = [row * row_width + offset
                for row, length in enumerate(lengths)
                for offset in range(row_width - length, row_width)]
-    query_lengths = torch.arange(1, batch * sequence + 1, dtype=torch.int64) * block
+    query_lengths = torch.arange(1, batch * len(positions) + 1, dtype=torch.int64) * block
     kv_lengths = torch.tensor(lengths, dtype=torch.int64).cumsum(0)
     return torch.tensor(indices, device=device, dtype=torch.long), query_lengths, kv_lengths
+
+
+class DSparkTokenEmbedding(nn.Embedding):
+    """Share a frozen noise-token row while FSDP exposes the backbone embedding."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int | None = None,
+                 *, noise_token_id: int) -> None:
+        """Create the ordinary embedding and validate the shared noise-token identity."""
+        if not 0 <= noise_token_id < num_embeddings:
+            raise ValueError("DSpark noise token must be inside the backbone vocabulary")
+        super().__init__(num_embeddings, embedding_dim, padding_idx)
+        self.noise_token_id = noise_token_id
+        self.cached_noise_embedding = None
+
+    @torch.no_grad()
+    def _read_noise_embedding(self):
+        """Gather only the selected row when TP shards the embedding vocabulary or width."""
+        indices = torch.tensor([self.noise_token_id], dtype=torch.long, device=self.weight.device)
+        if isinstance(self.weight, DTensor):
+            mesh = self.weight.device_mesh
+            indices = DTensor.from_local(indices, mesh, [Replicate()] * mesh.ndim)
+        row = functional.embedding(indices, self.weight)
+        if isinstance(row, DTensor):
+            if row.is_partial():
+                row = row.reduce_partial()
+            row = row.full_tensor()
+        return row.reshape(self.embedding_dim).detach()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
+        """Return ordinary token embeddings and refresh the frozen noise row.
+
+        Args:
+            input: Token IDs consumed by the backbone embedding.
+
+        Returns:
+            The ordinary differentiable token embeddings.
+        """
+        self.cached_noise_embedding = self._read_noise_embedding()
+        return super().forward(input)
 
 
 class DSparkMarkovHead(nn.Module):
@@ -205,6 +260,8 @@ class DSparkDraftAttention(nn.Module):
             main_states: torch.Tensor,
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
+            *,
+            sequence_boundaries: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         """Attend each draft block to its main window and all of its draft KV.
 
@@ -213,6 +270,7 @@ class DSparkDraftAttention(nn.Module):
             main_states: ``[batch, seq, hidden]`` stage KV source stream.
             rope_cos: FP32 ``[1, seq + block, rope_dim / 2]`` cosine table.
             rope_sin: FP32 ``[1, seq + block, rope_dim / 2]`` sine table.
+            sequence_boundaries: Optional complete-document boundaries for packed training.
 
         Returns:
             ``[batch, seq, block, hidden]`` attention output.
@@ -222,17 +280,21 @@ class DSparkDraftAttention(nn.Module):
             raise ValueError("DSpark rotary tables must cover the main context and every future draft position")
         key_value = self.kv_norm(self.wkv(main_states))
         rope = self.rope_dim
+        positions, _ = _document_geometry(seq, sequence_boundaries)
+        main_positions = torch.tensor(positions, device=main_states.device, dtype=torch.long)
         key_value = torch.cat(
-            [key_value[..., :-rope], _apply_rope(key_value[..., -rope:], rope_cos[:, :seq], rope_sin[:, :seq])],
+            [key_value[..., :-rope], _apply_rope(key_value[..., -rope:],
+                                               rope_cos.index_select(1, main_positions),
+                                               rope_sin.index_select(1, main_positions))],
             dim=-1,
         )
         chunk = self.attention_chunk_size
         if chunk == 0 or seq <= chunk:
-            return self._attend_range(draft_states, key_value, rope_cos, rope_sin, 0)
+            return self._attend_range(draft_states, key_value, rope_cos, rope_sin, 0, positions)
         outputs = []
         for start in range(0, seq, chunk):
             stop = min(start + chunk, seq)
-            arguments = (draft_states[:, start:stop], key_value, rope_cos, rope_sin, start)
+            arguments = (draft_states[:, start:stop], key_value, rope_cos, rope_sin, start, positions[start:stop])
             if self.training and torch.is_grad_enabled():
                 outputs.append(_checkpoint(self._attend_range, *arguments))
             else:
@@ -246,11 +308,13 @@ class DSparkDraftAttention(nn.Module):
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
             start: int,
+            document_positions: tuple[int, ...],
     ) -> torch.Tensor:
         """Run independent decode anchors at their absolute main and future positions."""
         batch, seq, block, _ = draft_states.shape
         rope = self.rope_dim
-        positions = (torch.arange(start + 1, start + seq + 1, device=draft_states.device)[:, None]
+        local_positions = torch.tensor(document_positions, device=draft_states.device, dtype=torch.long)
+        positions = (local_positions[:, None] + 1
                      + torch.arange(block, device=draft_states.device)[None, :])
         draft_cos = rope_cos.index_select(1, positions.flatten()).view(1, seq, block, rope // 2)
         draft_sin = rope_sin.index_select(1, positions.flatten()).view(1, seq, block, rope // 2)
@@ -261,9 +325,9 @@ class DSparkDraftAttention(nn.Module):
         draft_kv = self.kv_norm(self.wkv(draft_states))
         draft_kv = torch.cat((draft_kv[..., :-rope],
                               _apply_rope(draft_kv[..., -rope:], draft_cos, draft_sin)), dim=-1)
-        combined_kv, valid = self._gather_context(key_value, draft_kv, start)
+        combined_kv, valid = self._gather_context(key_value, draft_kv, start, local_positions)
         if self.attention_backend == "flash_v3":
-            context = self._flash_window_context(query, combined_kv, start)
+            context = self._flash_window_context(query, combined_kv, document_positions)
         else:
             context = self._reference_window_context(query, combined_kv, valid)
         context = torch.cat((context[..., :-rope], _apply_rope(
@@ -273,13 +337,14 @@ class DSparkDraftAttention(nn.Module):
         reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
         return self.wo_b(reduced.flatten(3))
 
-    def _gather_context(self, main_kv, draft_kv, start):
+    def _gather_context(self, main_kv, draft_kv, start, local_positions):
         """Gather bounded main windows on the device and append all draft keys/values."""
         batch, seq, block, dim = draft_kv.shape
         positions = torch.arange(start, start + seq, device=main_kv.device)
         backwards = torch.arange(self.window - 1, -1, -1, device=main_kv.device)
         indices = positions[:, None] - backwards[None, :]
-        valid_main = indices >= 0
+        document_starts = positions - local_positions
+        valid_main = indices >= document_starts[:, None]
         # Flattened IndexSelect avoids the AI CPU advanced-indexing path and
         # correctly sums gradients for keys shared by overlapping windows.
         main_windows = main_kv.index_select(1, indices.clamp_min(0).flatten())
@@ -287,11 +352,11 @@ class DSparkDraftAttention(nn.Module):
         valid = torch.cat((valid_main, torch.ones(seq, block, device=main_kv.device, dtype=torch.bool)), dim=-1)
         return torch.cat((main_windows, draft_kv), dim=2), valid
 
-    def _flash_window_context(self, query, key_value, start):
+    def _flash_window_context(self, query, key_value, positions):
         """Pack each anchor as an independent noncausal TND segment."""
         batch, seq, block, heads, dim = query.shape
         indices, query_lengths, kv_lengths = _draft_pack_metadata(
-            batch, seq, block, self.window, start, query.device)
+            batch, block, self.window, positions, query.device)
         packed_kv = key_value.reshape(-1, dim).index_select(0, indices).unsqueeze(1).to(query.dtype).contiguous()
         sink = self.attn_sink.to(query.dtype).float()
         output = _flash_attention_v3(
@@ -340,6 +405,7 @@ class DSparkStage(nn.Module):
             main_states: torch.Tensor,
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
+            sequence_boundaries: tuple[int, ...] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the communication-free stage prefix up to the FFN input.
 
@@ -354,6 +420,7 @@ class DSparkStage(nn.Module):
             main_states: Stage KV source stream.
             rope_cos: Rotary cosine table.
             rope_sin: Rotary sine table.
+            sequence_boundaries: Complete-document boundaries of the packed training input.
 
         Returns:
             Post-attention flat stream, FFN input, and the mHC pre/post/
@@ -367,7 +434,8 @@ class DSparkStage(nn.Module):
         attn_pre, attn_post, attn_comb = self.attn_hc(flat)
         collapsed = (pre_mix.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
         attn_input = self.input_layernorm(collapsed).view(batch, seq, block, hidden)
-        attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin)
+        attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin,
+                                    sequence_boundaries=sequence_boundaries)
         flat = pipelined_mhc_post(attn_output.reshape(batch, seq * block, hidden), residual, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(flat)
         collapsed = (attn_pre.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
@@ -383,6 +451,7 @@ class DSparkStage(nn.Module):
             rope_sin: torch.Tensor,
             input_ids: torch.Tensor,
             use_checkpoint: bool = False,
+            sequence_boundaries: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one DSpark stage over the flattened draft stream.
 
@@ -395,6 +464,7 @@ class DSparkStage(nn.Module):
             input_ids: Flattened draft token ids for the MoE router.
             use_checkpoint: Recompute the communication-free prefix in
                 backward instead of storing its activations.
+            sequence_boundaries: Complete-document boundaries of the packed training input.
 
         Returns:
             Updated hidden streams and the FFN-half pre-mix coefficients.
@@ -405,10 +475,10 @@ class DSparkStage(nn.Module):
         if use_checkpoint:
             flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
                 self._pre_ffn, hidden_streams, pre_mix, main_states,
-                rope_cos, rope_sin)
+                rope_cos, rope_sin, sequence_boundaries)
         else:
             flat, ffn_input, ffn_pre, ffn_post, ffn_comb = self._pre_ffn(
-                hidden_streams, pre_mix, main_states, rope_cos, rope_sin)
+                hidden_streams, pre_mix, main_states, rope_cos, rope_sin, sequence_boundaries)
         ffn_output = self.mlp(ffn_input, input_ids=input_ids)
         flat = pipelined_mhc_post(ffn_output, flat, ffn_post, ffn_comb)
         return flat.view(batch, seq, block, streams, hidden), ffn_pre
@@ -486,14 +556,6 @@ class DeepseekV41DSpark(nn.Module):
         self.main_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         depth = int(config.v41_dspark_depth)
         self.stages = nn.ModuleList(DSparkStage(config, mlp_factory) for _ in range(depth))
-        # v1 deviation (recorded): the released checkpoint feeds the noise
-        # placeholder through the tied backbone embedding row. This independent
-        # trainable vector differs from that frozen, shared embedding contract.
-        # An all-zero noise vector puts zero vectors through the stage
-        # RMSNorms, whose backward scales like 1/sqrt(eps) and compounds
-        # across stages into overflow-level gradients.
-        self.noise_embedding = nn.Parameter(
-            torch.randn(hidden) * float(config.initializer_range))
         self.norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(int(config.vocab_size), int(config.v41_dspark_markov_rank))
         self.confidence_head = DSparkConfidenceHead(hidden + int(config.v41_dspark_markov_rank))
@@ -552,7 +614,6 @@ class DeepseekV41DSpark(nn.Module):
             with torch.no_grad():
                 target.copy_(values)
 
-        _fill(self.noise_embedding, 0x44530001)
         for index, stage in enumerate(self.stages):
             _fill(stage.attn_hc.fn, 0x44530100 + index)
             _fill(stage.ffn_hc.fn, 0x44530200 + index)
@@ -563,6 +624,50 @@ class DeepseekV41DSpark(nn.Module):
                 _local(stage.ffn_hc.scale).fill_(1.0)
                 _local(stage.self_attn.attn_sink).zero_()
 
+    def _teacher_forced_targets(self, input_ids, labels, token_mask, sequence_boundaries):
+        """Align the released decode inputs and targets without crossing document or image spans."""
+        batch, seq = input_ids.shape
+        block = self.block_size
+        _, document_ends = _document_geometry(seq, sequence_boundaries)
+        previous = (torch.arange(seq, device=input_ids.device)[:, None] + 1
+                    + torch.arange(block, device=input_ids.device)[None, :])
+        previous_flat = previous.reshape(1, -1).expand(batch, -1)
+        next_flat = (previous + 1).reshape(1, -1).expand(batch, -1)
+        padded = functional.pad(input_ids, (0, block + 1), value=self.noise_token_id)
+        markov_inputs = padded.gather(1, previous_flat).view(batch, seq, block)
+        targets = padded.gather(1, next_flat).view(batch, seq, block)
+        ends = torch.tensor(document_ends, device=input_ids.device)[:, None]
+        valid = (previous + 1 < ends).unsqueeze(0).expand(batch, -1, -1)
+        # Trainer labels already predict the next token. Their values must not
+        # be shifted a second time; only the supervision mask is reused.
+        if labels is not None:
+            mask = functional.pad(labels != IGNORE_INDEX, (0, block + 1), value=False)
+            valid = valid & mask.gather(1, previous_flat).view(batch, seq, block)
+        if token_mask is not None:
+            # Every text-only draft prefix, including its first input and its
+            # target, must stop before a visual span. Main KV may contain images.
+            text_indices = (torch.arange(seq, device=input_ids.device)[:, None] + 1
+                            + torch.arange(block + 1, device=input_ids.device)[None, :])
+            text = functional.pad(token_mask, (0, block + 1), value=False)
+            text = text.gather(1, text_indices.reshape(1, -1).expand(batch, -1))
+            uninterrupted = (~text.view(batch, seq, block + 1)).cumsum(-1)[..., 1:] == 0
+            valid = valid & uninterrupted
+        return markov_inputs, targets.masked_fill(~valid, IGNORE_INDEX)
+
+    def _validate_backbone_inputs(self, target_hiddens, input_ids, inputs_embeds, noise_embedding):
+        """Require complete, detached backbone surfaces instead of silently training a changed model."""
+        if any(hidden.requires_grad for hidden in target_hiddens) or inputs_embeds.requires_grad:
+            raise ValueError("DSpark target hiddens and inputs_embeds must be detached from the backbone")
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("DSpark input_ids must contain a nonempty complete sequence")
+        expected = (*input_ids.shape, self.norm.weight.shape[0])
+        if (len(target_hiddens) != self.num_targets or inputs_embeds.shape != expected
+                or any(hidden.shape != expected for hidden in target_hiddens)):
+            raise ValueError("DSpark embeddings and feature taps must match the complete token sequence")
+        if (noise_embedding is None or noise_embedding.requires_grad
+                or noise_embedding.shape != (expected[-1],)):
+            raise ValueError("DSpark noise_embedding must be one detached backbone embedding row")
+
     def forward(
             self,
             target_hiddens: list[torch.Tensor],
@@ -570,6 +675,10 @@ class DeepseekV41DSpark(nn.Module):
             labels: torch.Tensor | None,
             inputs_embeds: torch.Tensor,
             lm_head: nn.Linear,
+            *,
+            noise_embedding: torch.Tensor,
+            token_mask: torch.Tensor | None = None,
+            sequence_boundaries: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the DSpark draft objective for one batch.
 
@@ -580,36 +689,47 @@ class DeepseekV41DSpark(nn.Module):
             labels: Optional ``[batch, seq]`` supervised labels with
                 ``IGNORE_INDEX`` holes; ``None`` supervises every position
                 from ``input_ids`` (full LM-draft objective).
-            embed_tokens: Backbone embedding tied into the drafter.
+            inputs_embeds: Detached token embeddings before visual feature injection.
             lm_head: Backbone output head tied into the drafter.
+            noise_embedding: Detached backbone embedding row of the configured noise token.
+            token_mask: Optional text-token mask; draft blocks do not predict visual placeholders.
+            sequence_boundaries: Host boundaries of complete packed documents, shared across batch rows.
 
         Returns:
             The scalar DSpark loss and a metrics dictionary.
         """
-        if any(hidden.requires_grad for hidden in target_hiddens):
-            raise ValueError("DSpark target hiddens must be detached from the backbone")
+        self._validate_backbone_inputs(target_hiddens, input_ids, inputs_embeds, noise_embedding)
         batch, seq = input_ids.shape
         block = self.block_size
         device = input_ids.device
+        if labels is not None and labels.shape != input_ids.shape:
+            raise ValueError("DSpark labels must match input_ids")
+        if token_mask is not None and (token_mask.shape != input_ids.shape or token_mask.dtype != torch.bool):
+            raise ValueError("DSpark token_mask must be a boolean mask matching input_ids")
+        _, document_ends = _document_geometry(seq, sequence_boundaries)
         main_states = self.main_norm(self.main_proj(torch.cat(target_hiddens, dim=-1)))
 
         # Tied-but-frozen backbone surfaces: the drafter reuses the backbone
         # token embeddings (already computed by the backbone forward, handed
         # over detached) and the frozen output head; the report forbids DSpark
         # gradients from reaching the backbone.
-        if inputs_embeds.requires_grad:
-            raise ValueError("DSpark inputs_embeds must be detached from the backbone")
         token_embeddings = inputs_embeds
-        noise = self.noise_embedding.to(token_embeddings.dtype)
+        noise = noise_embedding.to(token_embeddings.dtype)
         draft = torch.empty(batch, seq, block, token_embeddings.shape[-1],
                             dtype=token_embeddings.dtype, device=device)
-        draft[:, :, 0] = token_embeddings
+        first_embeddings = torch.cat((token_embeddings[:, 1:], noise.expand(batch, 1, -1)), dim=1)
+        next_is_in_document = (torch.arange(seq, device=device) + 1
+                               < torch.tensor(document_ends, device=device))
+        draft[:, :, 0] = torch.where(next_is_in_document[None, :, None], first_embeddings, noise)
         draft[:, :, 1:] = noise
         streams = draft.unsqueeze(3).expand(-1, -1, -1, self.hc_mult, -1).contiguous()
         pre_mix = streams.new_zeros(batch, seq * block, self.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         rope_cos, rope_sin = self._rope_tables(seq, device, token_embeddings.dtype)
-        draft_ids = input_ids.unsqueeze(-1).expand(-1, -1, block).reshape(batch, seq * block)
+        draft_ids = input_ids.new_full((batch, seq, block), self.noise_token_id)
+        first_ids = functional.pad(input_ids[:, 1:], (0, 1), value=self.noise_token_id)
+        draft_ids[:, :, 0] = torch.where(next_is_in_document, first_ids, self.noise_token_id)
+        draft_ids = draft_ids.reshape(batch, seq * block)
         # The flattened draft stream (seq x block positions, hc streams) makes
         # stage activations the dominant memory term; each stage recomputes
         # its communication-free prefix in backward while the draft-MoE
@@ -617,7 +737,8 @@ class DeepseekV41DSpark(nn.Module):
         gradient_active = torch.is_grad_enabled() and self.training
         for stage in self.stages:
             streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,
-                                     rope_sin, draft_ids, use_checkpoint=gradient_active)
+                                     rope_sin, draft_ids, use_checkpoint=gradient_active,
+                                     sequence_boundaries=sequence_boundaries)
         def _collapse(streams_in: torch.Tensor, pre_mix_in: torch.Tensor) -> torch.Tensor:
             merged = (pre_mix_in.unsqueeze(-1)
                       * streams_in.reshape(batch, seq * block, self.hc_mult, -1).float())
@@ -631,27 +752,8 @@ class DeepseekV41DSpark(nn.Module):
         else:
             hidden_out = _collapse(streams, pre_mix)
 
-        # Teacher-forced targets: draft offset j at position t predicts the
-        # token at t + 1 + j; the Markov head is conditioned on t + j.  When
-        # the trainer keeps labels on the loss-only path (the model never sees
-        # them), the drafter supervises every next token from input_ids — the
-        # standard LM-draft objective; labels only add the SFT ignore mask.
-        pad_ids = functional.pad(input_ids, (0, block), value=self.noise_token_id)
-        offsets = torch.arange(block, device=device)
-        gather = torch.arange(seq, device=device)[:, None] + offsets[None, :]
-        gather_flat = gather.reshape(1, -1).expand(batch, -1)
-        markov_inputs = pad_ids.gather(1, gather_flat).view(batch, seq, block)
-        # Draft targets always come from input_ids: offset j at position t
-        # predicts input_ids[t + 1 + j].  Trainer labels are already shifted
-        # (labels[t] supervises input_ids[t + 1]), so they must not be
-        # gathered as values; they only contribute the SFT ignore mask,
-        # aligned via labels[t + j] <-> input_ids[t + 1 + j].
-        pad_target_ids = functional.pad(input_ids, (0, block), value=IGNORE_INDEX)
-        targets = pad_target_ids.gather(1, (gather + 1).reshape(1, -1).expand(batch, -1)).view(batch, seq, block)
-        if labels is not None:
-            pad_label_mask = functional.pad(labels, (0, block), value=IGNORE_INDEX)
-            label_mask = pad_label_mask.gather(1, gather_flat).view(batch, seq, block) == IGNORE_INDEX
-            targets = targets.masked_fill(label_mask, IGNORE_INDEX)
+        markov_inputs, targets = self._teacher_forced_targets(
+            input_ids, labels, token_mask, sequence_boundaries)
 
         # Sequence-chunked objective: the [batch, seq, block, vocab] draft
         # logits are never materialized whole.  Each chunk recomputes its
@@ -680,16 +782,12 @@ class DeepseekV41DSpark(nn.Module):
                 reduction="sum",
             )
             with torch.no_grad():
-                hit_sum = ((logits.argmax(dim=-1) == target_chunk) & chunk_mask).sum()
+                chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
+                hit_sum = chunk_hits.sum()
             confidence = self.confidence_head(hidden_chunk, markov_embed)
-            if bool(chunk_mask.any()):
-                with torch.no_grad():
-                    chunk_hits = (logits.argmax(dim=-1) == target_chunk) & chunk_mask
-                bce_sum = functional.binary_cross_entropy_with_logits(
-                    confidence[chunk_mask], chunk_hits[chunk_mask].float(), reduction="sum"
-                )
-            else:
-                bce_sum = confidence.sum() * 0.0
+            bce = functional.binary_cross_entropy_with_logits(
+                confidence, chunk_hits.float(), reduction="none")
+            bce_sum = (bce * chunk_mask).sum()
             return ce_sum, bce_sum, hit_sum.float()
 
         ce_total = hidden_out.new_zeros((), dtype=torch.float32)
@@ -726,5 +824,6 @@ __all__ = [
     "DSparkDraftAttention",
     "DSparkMarkovHead",
     "DSparkStage",
+    "DSparkTokenEmbedding",
     "DeepseekV41DSpark",
 ]
