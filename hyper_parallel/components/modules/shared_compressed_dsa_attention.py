@@ -535,7 +535,17 @@ class _NativeV41RotaryTail(torch.autograd.Function):
     """Run interleaved RoPE while preserving the eager BF16 gradient rounding."""
 
     @staticmethod
-    def forward(ctx, rotary, cos, sin, sequence_dim):
+    def forward(ctx: Any, rotary: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                sequence_dim: int) -> torch.Tensor:
+        """Apply native interleaved rotation and save coefficients for its VJP.
+
+        Args:
+            ctx: Autograd context retaining rotation coefficients.
+            rotary: Input rotary channels.
+            cos: Broadcast cosine coefficients.
+            sin: Broadcast sine coefficients.
+            sequence_dim: Sequence axis in the input layout.
+        """
         import torch_npu  # pylint: disable=import-outside-toplevel
 
         ctx.save_for_backward(cos, sin)
@@ -548,7 +558,13 @@ class _NativeV41RotaryTail(torch.autograd.Function):
         return rotated.movedim(0, sequence_dim).to(rotary.dtype)
 
     @staticmethod
-    def backward(ctx, grad):
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
+        """Preserve the eager BF16 rounding boundaries in the rotation VJP.
+
+        Args:
+            ctx: Autograd context holding cosine and sine coefficients.
+            grad: Upstream gradient of the rotated channels.
+        """
         cos, sin = ctx.saved_tensors
         promoted = grad.float()
         # The eager graph rounds each term before adding the two input gradients.
@@ -567,6 +583,31 @@ def _load_fused_v41_partial_rope() -> Callable[..., torch.Tensor]:
     return backend.fused_v41_partial_rope
 
 
+def _supports_fused_partial_rope(
+        tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int,
+) -> bool:
+    """Check the token-major partial-rotation kernel's complete tensor contract."""
+    return (unsqueeze_dim == 2 and tensor.device.type == "npu"
+            and tensor.dtype == torch.bfloat16 and tensor.ndim == 4 and tensor.shape[0] == 1
+            and tensor.shape[1] > 0 and tensor.shape[2:] == (64, 512) and tensor.is_contiguous()
+            and cos.shape == sin.shape == (1, tensor.shape[1], 32)
+            and cos.device == sin.device == tensor.device
+            and cos.dtype in (torch.float32, torch.bfloat16) and sin.dtype == cos.dtype
+            and not (cos.requires_grad or sin.requires_grad))
+
+
+def _supports_native_rotary_tail(
+        tensor: torch.Tensor, rotary: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+        unsqueeze_dim: int, sequence_dim: int,
+) -> bool:
+    """Check the native interleaved tail's independent shape and layout contract."""
+    return (tensor.device.type == "npu" and tensor.dtype == torch.bfloat16
+            and tensor.ndim == 4 and tensor.shape[0] == 1 and cos.shape[-1] == 64
+            and unsqueeze_dim in (1, 2) and cos.ndim == 4 and cos.shape == sin.shape
+            and cos.shape[0] == 1 and cos.shape[sequence_dim] == rotary.shape[sequence_dim] > 0
+            and not (cos.requires_grad or sin.requires_grad))
+
+
 def _apply_v41_rope(
         tensor: torch.Tensor,
         cos: torch.Tensor,
@@ -576,24 +617,14 @@ def _apply_v41_rope(
         use_fused_partial_rope: bool = False,
 ) -> torch.Tensor:
     """Apply V4 interleaved RoPE to the trailing rotary channels."""
-    if (use_fused_partial_rope and unsqueeze_dim == 2 and tensor.device.type == "npu"
-            and tensor.dtype == torch.bfloat16 and tensor.ndim == 4 and tensor.shape[0] == 1
-            and tensor.shape[1] > 0 and tensor.shape[2:] == (64, 512) and tensor.is_contiguous()
-            and cos.shape == sin.shape == (1, tensor.shape[1], 32)
-            and cos.device == sin.device == tensor.device
-            and cos.dtype in (torch.float32, torch.bfloat16) and sin.dtype == cos.dtype
-            and not (cos.requires_grad or sin.requires_grad)):
+    if use_fused_partial_rope and _supports_fused_partial_rope(tensor, cos, sin, unsqueeze_dim):
         return _load_fused_v41_partial_rope()(tensor, cos, sin)
     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
     pass_through, rotary = tensor.split((tensor.shape[-1] - rope_dim, rope_dim), dim=-1)
     sequence_dim = 2 if unsqueeze_dim == 1 else 1
-    if (tensor.device.type == "npu" and tensor.dtype == torch.bfloat16
-            and tensor.ndim == 4 and tensor.shape[0] == 1 and rope_dim == 64
-            and unsqueeze_dim in (1, 2) and cos.ndim == 4 and cos.shape == sin.shape
-            and cos.shape[0] == 1 and cos.shape[sequence_dim] == rotary.shape[sequence_dim] > 0
-            and not (cos.requires_grad or sin.requires_grad)):
+    if _supports_native_rotary_tail(tensor, rotary, cos, sin, unsqueeze_dim, sequence_dim):
         rotary = _NativeV41RotaryTail.apply(rotary, cos, sin, sequence_dim)
     else:
         rotary = ((rotary.float() * cos) + (_rotate_half(rotary).float() * sin)).to(tensor.dtype)
@@ -865,6 +896,45 @@ def compressed_causal_candidates(
             )
         )
     return torch.cat(candidate_chunks, dim=1)
+
+
+def complete_candidate_block_indices(
+        query: torch.Tensor, key_length: int, compress_ratio: int, block_size: int,
+        query_offset: int = 0, minimum_key_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Enumerate the released candidate set when every block fits in the pool.
+
+    All reachable finite-score blocks survive a nonbinding block Top-K. The
+    released selector also pins the newest partial block, including a block
+    otherwise excluded by a document boundary. Consumers still apply their
+    causal and document masks to the positions inside these blocks.
+
+    Args:
+        query: Index queries carrying the batch, sequence, and device geometry.
+        key_length: Number of keys in the common bank.
+        compress_ratio: Tokens represented by each key.
+        block_size: Keys per candidate block.
+        query_offset: Global start of the local query interval.
+        minimum_key_indices: Optional document-local lower key bounds.
+
+    Returns:
+        Compact block IDs with unreachable slots set to minus one.
+    """
+    if key_length < 0 or compress_ratio <= 0 or block_size <= 0 or query_offset < 0:
+        raise ValueError("Candidate geometry requires nonnegative lengths and positive block sizes")
+    batch, length = query.shape[:2]
+    if minimum_key_indices is not None and minimum_key_indices.shape != (batch, length):
+        raise ValueError("minimum_key_indices must have shape [batch, query]")
+    blocks = torch.arange((key_length + block_size - 1) // block_size, device=query.device)
+    blocks = blocks.view(1, 1, -1).expand(batch, length, -1)
+    visible = ((torch.arange(query_offset, query_offset + length, device=query.device) + 1)
+               // compress_ratio).view(1, length, 1)
+    reachable = blocks * block_size < visible
+    if minimum_key_indices is not None:
+        block_ends = ((blocks + 1) * block_size).clamp(max=key_length)
+        reachable = reachable & (block_ends > minimum_key_indices.unsqueeze(-1))
+    pinned = blocks == (visible - 1) // block_size
+    return blocks.masked_fill(~(reachable | pinned), -1).to(torch.int32)
 
 
 def compressed_causal_topk_and_candidates(
@@ -1512,6 +1582,46 @@ class SharedCompressedDSAIndexer(nn.Module):
             capture_scores=cp_context is None and tp_context is None,
         )
 
+    def _select_complete_pool(
+            self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
+            candidate_blocks: torch.Tensor | None, query_offset: int,
+            reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
+            minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Use causal native selection only when the pool cannot remove a reachable block."""
+        pool_capacity = self.candidate_topk_blocks * self.candidate_block_size
+        if self.candidate_topk_blocks <= 0 or self.candidate_block_size <= 0 or pool_capacity < key.shape[1]:
+            raise NotImplementedError("Fused candidate-pool Indexer requires coverage of the complete key bank")
+        expected_blocks = (key.shape[1] + self.candidate_block_size - 1) // self.candidate_block_size
+        if self.uses_candidates:
+            if candidate_blocks is None:
+                raise RuntimeError("a hierarchical Reindex layer requires candidate block ids")
+            if candidate_blocks.shape != (*query.shape[:2], expected_blocks):
+                raise ValueError("Complete candidate pool must retain every key-bank block slot")
+        topk_indices = compressed_causal_topk(
+            query, key, merge_weight, compress_ratio=self.compress_ratio, sparse_count=self.index_topk,
+            query_offset=query_offset, query_chunk_size=self.query_chunk_size, reduce_sum=reduce_sum,
+            minimum_key_indices=minimum_key_indices, query_segments=query_segments, use_fused=True,
+        )
+        if self.is_candidate_source:
+            candidate_blocks = complete_candidate_block_indices(
+                query, key.shape[1], self.compress_ratio, self.candidate_block_size,
+                query_offset, minimum_key_indices,
+            )
+        else:
+            width = min(self.index_topk, expected_blocks * self.candidate_block_size)
+            topk_indices = torch.nn.functional.pad(topk_indices, (0, width - topk_indices.shape[-1]), value=-1)
+        return topk_indices, candidate_blocks, None
+
+    def _can_capture_native_scores(self, query: torch.Tensor, key: torch.Tensor, query_segments: tuple | None) -> bool:
+        """Resolve score reuse only for the native single-document training geometry."""
+        return (self.training and self.loss_coeff and self.use_fused
+                and query.device.type == "npu" and query.shape[0] == 1
+                and self.index_topk == 512 and key.shape[1] >= self.index_topk
+                and query_segments is not None and len(query_segments) == 1
+                and query_segments[0][:4] == (0, query.shape[1], 0, key.shape[1])
+                and lightning_indexer_supports_scores())
+
     def _select_indices(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
             candidate_blocks: torch.Tensor | None, query_offset: int,
@@ -1521,7 +1631,10 @@ class SharedCompressedDSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
-            raise NotImplementedError("V4.1 fused Indexer does not support candidate-pool selection")
+            return self._select_complete_pool(
+                query, key, merge_weight, candidate_blocks, query_offset,
+                reduce_sum, minimum_key_indices, query_segments,
+            )
         if self.is_candidate_source:
             topk_indices, candidate_blocks = compressed_causal_topk_and_candidates(
                 query,
@@ -1552,14 +1665,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
             )
-        elif (
-            capture_scores and self.training and self.loss_coeff and self.use_fused
-            and query.device.type == "npu" and query.shape[0] == 1
-            and self.index_topk == 512 and key.shape[1] >= self.index_topk
-            and query_segments is not None and len(query_segments) == 1
-            and query_segments[0][:4] == (0, query.shape[1], 0, key.shape[1])
-            and lightning_indexer_supports_scores()
-        ):
+        elif capture_scores and self._can_capture_native_scores(query, key, query_segments):
             topk_indices, scores = _run_lightning_indexer(
                 query, key, merge_weight, self.index_topk, self.compress_ratio, query_offset,
                 reduce_sum, minimum_key_indices, query_segments, return_scores=True,
@@ -1672,6 +1778,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             use_fused_ops: bool,
             use_fused_attention: bool = False,
             use_fused_partial_rope: bool = False,
+            use_fused_indexer_kl: bool | None = None,
     ) -> None:
         """Transfer source state and configure the execution implementation."""
         super().__init__()
@@ -1704,6 +1811,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         self.use_fused_ops = use_fused_ops
         self.use_fused_attention = use_fused_attention
         self.use_fused_partial_rope = use_fused_partial_rope
+        self.use_fused_indexer_kl = use_fused_ops if use_fused_indexer_kl is None else use_fused_indexer_kl
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
         self.train(module.training)
@@ -2048,7 +2156,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
 
     def exclude_indexer_kl_from_recompute(self) -> None:
         """Reuse the native KL loss and its saved gradients during layer replay."""
-        if self.use_fused_ops and self.is_index_source and self._indexer_kl_region is None:
+        if self.use_fused_indexer_kl and self.is_index_source and self._indexer_kl_region is None:
             region = checkpoint_exclude_wrapper(shared_compressed_indexer_kl_loss)
             object.__setattr__(self, "_indexer_kl_region", region)
 
@@ -2097,13 +2205,13 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 tp_context=tp_context,
                 compress_ratio=self.compress_ratio,
                 query_segments=query_segments,
-                use_fused=self.use_fused_ops,
+                use_fused=self.use_fused_indexer_kl,
                 **score_options,
             )
             if score_options and not SharedCompressedDSAAttentionBase._device_indexer_kl_reported:
                 logger.info_rank0("Native Indexer KL device score recovery engaged")
                 SharedCompressedDSAAttentionBase._device_indexer_kl_reported = True
-            if self.use_fused_ops and not SharedCompressedDSAAttentionBase._fused_indexer_kl_reported:
+            if self.use_fused_indexer_kl and not SharedCompressedDSAAttentionBase._fused_indexer_kl_reported:
                 logger.info_rank0("Native Lightning Indexer KL engaged (checkpoint exclusion=%s)",
                                   self._indexer_kl_region is not None)
                 SharedCompressedDSAAttentionBase._fused_indexer_kl_reported = True
@@ -2120,8 +2228,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         if self.use_fused_ops or self.use_fused_attention:
             expected_topk = min(512, global_key_length if global_key_length is not None
                                 else global_sequence_length // max(1, self.compress_ratio))
-            if not ((self.use_fused_attention or self.candidate_source_layer_idx is None)
-                    and (topk_indices is None or topk_indices.shape[-1] == expected_topk)
+            if not ((topk_indices is None or topk_indices.shape[-1] == expected_topk)
                     and supports_fused_attention_inputs(
                         query, self.compress_ratio, self.sliding_window,
                         0 if topk_indices is None else topk_indices.shape[-1])):
@@ -2289,7 +2396,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         *,
         use_fused_ops: bool = False,
         use_fused_attention: bool = False,
-            use_fused_partial_rope: bool = False,
+        use_fused_partial_rope: bool = False,
+        use_fused_indexer_kl: bool | None = None,
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
@@ -2311,6 +2419,9 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
                 compressed keys, including selections from candidate pools.
             use_fused_partial_rope: Fuse main-head forward and first-order
                 backward RoPE on contiguous BF16 NPU tensors with 64 heads of width 512.
+            use_fused_indexer_kl: Override the KL implementation independently of
+                Indexer selection and attention. None inherits use_fused_ops;
+                False retains reference KL while allowing native token selection.
             indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
                 Selection exchanges low-rank qr, merge weights and rotary embeddings;
                 attention and KL retain the original owner and autograd graph.
@@ -2332,7 +2443,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             Fusion supports ordinary causal r1/r2 training on NPU with BF16
             main attention, D=512, SWA=128, Indexer D=128, TopK=512 and TP=1.
             Active fused KL requires 8, 16, 32 or 64 Indexer heads. Candidate
-            pools are unsupported. Packed inputs compress each document independently;
+            pools require complete coverage of the key bank. Packed inputs compress each document independently;
             multiple local document segments use native TND batching.
             The ops-transformer training extension is loaded on the first
             supported fused call; a missing extension raises ImportError.
@@ -2343,6 +2454,8 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             raise ValueError("use_fused_attention requires a boolean and use_fused_ops=False")
         if not isinstance(use_fused_partial_rope, bool):
             raise ValueError("use_fused_partial_rope must be a bool")
+        if use_fused_indexer_kl is not None and not isinstance(use_fused_indexer_kl, bool):
+            raise ValueError("use_fused_indexer_kl must be a bool or None")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
@@ -2358,6 +2471,7 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             use_fused_ops=use_fused_ops,
             use_fused_attention=use_fused_attention,
             use_fused_partial_rope=use_fused_partial_rope,
+            use_fused_indexer_kl=use_fused_indexer_kl,
         )
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size
