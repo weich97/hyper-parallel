@@ -1753,6 +1753,40 @@ class TestSwapRuntimePackedStep(unittest.TestCase):
         runtime._packed_ready_events[batch_index] = None
         runtime._packed_offload_events[batch_index] = None
 
+    def test_arena_initialization_cannot_overwrite_prefetched_state(self):
+        """A delayed deterministic allocator fill must precede side-stream H2D."""
+        runtime = self.runtime
+        expected = torch.arange(4, dtype=torch.float32)
+        slot = self._prepared_slot(expected)
+        pending_fills = []
+        materialize = runtime._materialize_staging_arena
+
+        def allocate(*args):
+            arena = materialize(*args)
+            pending_fills.append(lambda: arena.raw_buffer.fill_(255))
+            return arena
+
+        def wait_for_initialization(event, _stream):
+            for fill in event:
+                fill()
+                pending_fills.remove(fill)
+
+        runtime._materialize_staging_arena = allocate
+        runtime.current_stream = mock.Mock(return_value=object())
+        runtime._get_copy_stream = mock.Mock(return_value=object())
+        runtime.record_event = mock.Mock(side_effect=lambda _stream: tuple(pending_fills))
+        runtime.wait_event = wait_for_initialization
+
+        runtime.begin_packed_step([[_unit(slot)]])
+        self._transfer_packed(0, 0)
+        for fill in pending_fills:
+            fill()
+        runtime.activate_packed_batch(0, 0)
+
+        self.assertTrue(torch.isfinite(slot.tensor).all())
+        torch.testing.assert_close(slot.tensor, expected, rtol=0, atol=0)
+        runtime.end_packed_step()
+
     def test_packed_step_round_trips_state_through_the_staging_arena(self):
         """H2D binds the arena view and D2H republishes the host buffer."""
         runtime = self.runtime

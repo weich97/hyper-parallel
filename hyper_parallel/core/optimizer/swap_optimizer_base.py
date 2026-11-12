@@ -885,6 +885,12 @@ class PipelineSwapRuntime:
                 }
                 arena.layout_signature = layout_signature
                 self._drop_packed_views(staging_index)
+        # Deterministic allocation may enqueue a fill on the compute stream.
+        # Side-stream H2D must follow that fill or it can overwrite loaded state.
+        copy_stream = self._get_copy_stream()
+        if copy_stream is not None:
+            initialized = self.record_event(self.current_stream())
+            self.wait_event(initialized, copy_stream)
         self._packed_ready_events = {}
         self._packed_offload_events = {}
 
