@@ -28,8 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from functools import lru_cache, partial
-from importlib import import_module
+from functools import partial
 import logging
 from typing import Any, Protocol
 
@@ -558,31 +557,13 @@ class _NativeV41RotaryTail(torch.autograd.Function):
         return direct + inverse_rotation, None, None, None
 
 
-@lru_cache(maxsize=1)
-def _load_fused_v41_partial_rope() -> Callable[..., torch.Tensor]:
-    """Resolve the optional Triton kernel for the NPU training path."""
-    backend = import_module("hyper_parallel.components.functional._triton.v41_partial_rope")
-    logger.info_rank0("Triton V4.1 fused partial RoPE training path engaged")
-    return backend.fused_v41_partial_rope
-
-
 def _apply_v41_rope(
         tensor: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         unsqueeze_dim: int = 1,
-        *,
-        use_fused_partial_rope: bool = False,
 ) -> torch.Tensor:
     """Apply V4 interleaved RoPE to the trailing rotary channels."""
-    if (use_fused_partial_rope and unsqueeze_dim == 2 and tensor.device.type == "npu"
-            and tensor.dtype == torch.bfloat16 and tensor.ndim == 4 and tensor.shape[0] == 1
-            and tensor.shape[1] > 0 and tensor.shape[2:] == (64, 512) and tensor.is_contiguous()
-            and cos.shape == sin.shape == (1, tensor.shape[1], 32)
-            and cos.device == sin.device == tensor.device
-            and cos.dtype in (torch.float32, torch.bfloat16) and sin.dtype == cos.dtype
-            and not (cos.requires_grad or sin.requires_grad)):
-        return _load_fused_v41_partial_rope()(tensor, cos, sin)
     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
     rope_dim = cos.shape[-1]
@@ -1625,7 +1606,6 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             replace_indexer: bool,
             use_fused_ops: bool,
             use_fused_attention: bool = False,
-            use_fused_partial_rope: bool = False,
     ) -> None:
         """Transfer source state and configure the execution implementation."""
         super().__init__()
@@ -1657,7 +1637,6 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         self.scaling = module.scaling
         self.use_fused_ops = use_fused_ops
         self.use_fused_attention = use_fused_attention
-        self.use_fused_partial_rope = use_fused_partial_rope
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
         self.train(module.training)
@@ -1713,9 +1692,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         """Expand main heads after low-rank query inputs have been dispatched."""
         query = self.q_b_proj(query_residual).view(*query_residual.shape[:2], -1, self.head_dim)
         # Preserve sequence-major storage for sparse attention while keeping the head-major API.
-        return _apply_v41_rope(
-            query, cos, sin, unsqueeze_dim=2, use_fused_partial_rope=self.use_fused_partial_rope,
-        ).transpose(1, 2)
+        return _apply_v41_rope(query, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
     @staticmethod
     def _validate_forward_inputs(
@@ -2104,9 +2081,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
             sequence_length: int,
     ) -> torch.Tensor:
         """Undo RoPE and apply the grouped low-rank output projection."""
-        attention_output = _apply_v41_rope(
-            attention_output, cos, -sin, unsqueeze_dim=2, use_fused_partial_rope=self.use_fused_partial_rope,
-        )
+        attention_output = _apply_v41_rope(attention_output, cos, -sin, unsqueeze_dim=2)
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
@@ -2228,7 +2203,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
         *,
         use_fused_ops: bool = False,
         use_fused_attention: bool = False,
-            use_fused_partial_rope: bool = False,
         indexer_load_balance: str = "none",
         main_kv_comm: str = "all_gather",
         indexer_balance_block_size: int | None = None,
@@ -2248,8 +2222,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             use_fused_attention: Use native Sparse Flash MLA with the eager
                 Indexer and KL. The native kernel consumes the same selected
                 compressed keys, including selections from candidate pools.
-            use_fused_partial_rope: Fuse main-head forward and first-order
-                backward RoPE on contiguous BF16 NPU tensors with 64 heads of width 512.
             indexer_load_balance: 'none', 'zigzag', 'greedy' or 'hybrid' query-task allocation.
                 Selection exchanges low-rank qr, merge weights and rotary embeddings;
                 attention and KL retain the original owner and autograd graph.
@@ -2280,8 +2252,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             raise ValueError(f"use_fused_ops must be a bool, got {use_fused_ops!r}")
         if not isinstance(use_fused_attention, bool) or (use_fused_attention and use_fused_ops):
             raise ValueError("use_fused_attention requires a boolean and use_fused_ops=False")
-        if not isinstance(use_fused_partial_rope, bool):
-            raise ValueError("use_fused_partial_rope must be a bool")
         if main_kv_comm not in ("all_gather", "all_to_all_v"):
             raise ValueError("main_kv_comm must be 'all_gather' or 'all_to_all_v'")
         indexer_balance_block_size = resolve_indexer_balance_block_size(
@@ -2296,7 +2266,6 @@ class SharedCompressedDSAAttention(SharedCompressedDSAAttentionBase):
             replace_indexer=True,
             use_fused_ops=use_fused_ops,
             use_fused_attention=use_fused_attention,
-            use_fused_partial_rope=use_fused_partial_rope,
         )
         self.indexer_load_balance = indexer_load_balance
         self.indexer_balance_block_size = indexer_balance_block_size

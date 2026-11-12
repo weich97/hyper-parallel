@@ -85,7 +85,6 @@ plan_overrides:
           hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
         use_fused_ops: false
         use_fused_attention: true
-        use_fused_partial_rope: true
   - match: "*.self_attn"
     tp_divide_attrs: [num_groups]
   - match: "*.self_attn.forward"
