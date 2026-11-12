@@ -18,6 +18,7 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
+from hyper_parallel.codegen.emit.parallel import lower_forward_boundaries
 from hyper_parallel.codegen.emit.recorded import materialize_recorded_forwards
 from hyper_parallel.codegen.emit.snapshot_patches import emission_patches_from_snapshot_payload
 from hyper_parallel.codegen.plan.observation import observe_emission_plan
@@ -95,4 +96,17 @@ def test_instance_forwards_survive_observation_and_materialize_separate_contract
     assert "def draft_forward_hp_impl(" in rendered
     assert "self.backbone.mlp._forward_impl = MethodType(backbone_forward_hp_impl" in rendered
     assert "mlp._forward_impl = MethodType(draft_forward_hp_impl" in rendered
-    compile(rendered, str(source), "exec")
+    lowered = lower_forward_boundaries(
+        rendered, meta, boundary_classes=meta.boundary_classes, module_name=spec.name)
+    assert lowered == rendered
+    assert all(entry["skip_source_lowering"] for entry in meta.param_plan.values())
+    generated_source = tmp_path / "modeling_emitted_toy.py"
+    generated_source.write_text(lowered, encoding="utf-8")
+    generated_spec = importlib.util.spec_from_file_location("modeling_emitted_toy", generated_source)
+    generated_module = importlib.util.module_from_spec(generated_spec)
+    monkeypatch.setitem(sys.modules, generated_spec.name, generated_module)
+    generated_spec.loader.exec_module(generated_module)
+    emitted_model = generated_module.ToyModel()
+    assert emitted_model.backbone.mlp._forward_impl(3) == 4
+    assert emitted_model.draft.mlp._forward_impl(3) == 5
+    assert emitted_model.plain(3) == 3

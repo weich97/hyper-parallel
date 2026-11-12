@@ -52,7 +52,17 @@ def materialize_recorded_forwards(
     patch_plan: Any = None,
     source_path: str | None = None,
 ) -> str:
-    """Lower observed local-compute decisions into their source-owned classes."""
+    """Lower observed local-compute decisions into their source-owned classes.
+
+    Args:
+        source_text: Model source to transform.
+        meta: Mutable generation metadata with per-instance boundary contracts.
+        patch_plan: Builder-recorded local-compute patches, when available.
+        source_path: Source file used to filter records by their owning module.
+
+    Returns:
+        Source with recorded local-compute wrappers materialized.
+    """
     patches = patch_plan
     records = getattr(patches, "local_computes", ()) if patches is not None else ()
     if not records:
@@ -78,6 +88,7 @@ def materialize_recorded_forwards(
             rendered = _materialize_bound_module_function(
                 rendered, source_function, group[0], meta
             )
+            _mark_class_source_lowering_skipped(meta, host_type.__name__)
             continue
         if not _has_source_class(rendered, host_type.__name__):
             continue
@@ -130,11 +141,11 @@ def _materialize_declared_local_computes(source_text: str, meta: Any) -> str:
 def _mark_class_source_lowering_skipped(meta: Any, class_name: str) -> None:
     """Keep generic boundary lowering off a source class with an EP toggle.
 
-    A source-visible local-compute patch rewrites the class method, not just
-    one module instance. Every boundary instance of that class must therefore
-    use the runtime per-instance boundary wrapper. Lowering another instance's
-    boundary into the shared method would extract a second ``_forward_impl``
-    and wrap the EP toggle a second time.
+    Source-visible patches can rewrite a shared class method or bind distinct
+    module functions to its instances. Keep these boundaries runtime-owned:
+    another class-level pass would wrap an existing EP toggle twice or collapse
+    distinct per-instance compute contracts into one shared method. Unpatched
+    instances of the same class retain the runtime boundary wrapper as well.
     """
     param_plan = getattr(meta, "param_plan", None) or {}
     boundary_classes = getattr(meta, "boundary_classes", None) or {}
@@ -263,7 +274,7 @@ def _function_info(node: ast.FunctionDef | ast.AsyncFunctionDef, source_text: st
     for line in lines:
         offsets.append(offsets[-1] + len(line))
 
-    def start(line_number: int) -> int:
+    def _line_start(line_number: int) -> int:
         return offsets[line_number - 1]
 
     positional = [arg.arg for arg in (*node.args.posonlyargs, *node.args.args)]
@@ -274,9 +285,9 @@ def _function_info(node: ast.FunctionDef | ast.AsyncFunctionDef, source_text: st
     )
     return FunctionInfo(
         name=node.name,
-        body_start=start(node.body[0].lineno),
+        body_start=_line_start(node.body[0].lineno),
         body_end=offsets[node.end_lineno],
-        def_offset=start(first_line),
+        def_offset=_line_start(first_line),
         param_names=positional,
         kwonly_names=[arg.arg for arg in node.args.kwonlyargs],
         vararg_name=node.args.vararg.arg if node.args.vararg else None,
