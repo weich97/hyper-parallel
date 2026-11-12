@@ -1,0 +1,2 @@
+timestamp	commit	metric	status	description
+2026-11-11T22:58:01-05:00	31263fd7	20.97	keep	16K GBS256 FSDP128 fixed-route capacity series. Apply confirmed 546f8dda expert weight-gradient GEMMs and lossless two-microstep expert gradient staging. Retain full model, FP32 accumulation, five Muon rounds, and the exact 40833 workload. Compare with 40833 at 19.4328% and report GBS128 independently. [c3_seconds=619 tokens_per_second_per_die=706.3357 c3_job=40873]
