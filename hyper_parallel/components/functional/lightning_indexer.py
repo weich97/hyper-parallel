@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from inspect import signature
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -84,6 +85,20 @@ def _load_indexer_op() -> Callable[..., Any]:
 
 
 @lru_cache(maxsize=1)
+def lightning_indexer_supports_scores() -> bool:
+    """Check the installed dispatcher schema or Python signature for TopK scores."""
+    indexer = _load_indexer_op()
+    overload = getattr(indexer, "default", indexer)
+    schema = getattr(overload, "_schema", None)
+    if schema is not None:
+        return any(argument.name == "return_value" for argument in schema.arguments)
+    try:
+        return "return_value" in signature(indexer).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+@lru_cache(maxsize=1)
 def _load_indexer_metadata_op() -> Callable[..., Any]:
     """Import the optional LI scheduling entry only when it will be used."""
     # The verified 910B kernel computes its own split and does not read metadata.
@@ -127,8 +142,8 @@ def _bsnd_indexer_metadata(device, batch, length, heads, dim, key_length, topk, 
 @torch.no_grad()
 def _bsnd_lightning_indexer(
         query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, ratio: int, topk: int,
-        segment: tuple[int, int, int, int, int],
-) -> torch.Tensor:
+        segment: tuple[int, int, int, int, int], *, return_scores: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Select one document segment per batch item in one BSND call.
 
     Query tiling is owned by the operator, independently of the external
@@ -142,11 +157,14 @@ def _bsnd_lightning_indexer(
         topk: Output selection width, including invalid tail slots.
         segment: Local Q start/end, global compressed K start/end, and raw
             prefix length modulo ratio, shared by all physical batch items.
+        return_scores: Also return FP32 scores aligned with the sorted key IDs.
     """
     batch, length, heads, dim = query.shape
     result = torch.full((batch, length, topk), -1, device=query.device, dtype=torch.int32)
     start, end, key_start, key_end, residual = segment
     if key_end <= key_start or start == end:
+        if return_scores:
+            return result, result.new_zeros(result.shape, dtype=torch.float32)
         return result
     indexer = _load_indexer_op()
     residue, metadata = _bsnd_indexer_metadata(
@@ -157,17 +175,32 @@ def _bsnd_lightning_indexer(
     with torch.autocast(device_type=query.device.type, enabled=False):
         # Singleton batch strides may survive contiguous(); view canonicalizes the native BSND layout.
         native_key = key[:, key_start:key_end].contiguous().view(batch, key_end-key_start, 1, dim)
-        indices, _ = indexer(
+        score_option = {"return_value": 1} if return_scores else {}
+        indices, scores = indexer(
             query[:, start:end].contiguous(), native_key,
             weights[:, start:end].float().contiguous(), topk,
             cmp_residual_k=residue, metadata=metadata,
             layout_q="BSND", layout_k="BSND", mask_mode=3, cmp_ratio=ratio,
+            **score_option,
         )
+    if return_scores and (scores is None or scores.shape != indices.shape or scores.dtype != torch.float32):
+        raise RuntimeError("Lightning Indexer returned invalid TopK scores")
     indices = indices[:, :, 0]
     indices = torch.where(indices >= 0, indices + key_start, key.shape[1])
-    indices = sort_key_indices(indices, key.shape[1])
-    result[:, start:end] = indices.masked_fill(indices == key.shape[1], -1)
-    return result
+    if not return_scores:
+        indices = sort_key_indices(indices, key.shape[1])
+        result[:, start:end] = indices.masked_fill(indices == key.shape[1], -1)
+        return result
+
+    sortable = indices.float() if key.shape[1] <= _FP32_EXACT_INT_LIMIT else indices
+    sorted_indices, order = sortable.sort(dim=-1)
+    result[:, start:end] = sorted_indices.masked_fill(sorted_indices == key.shape[1], -1)
+    sorted_scores = scores[:, :, 0].gather(-1, order)
+    if start == 0 and end == length:
+        return result, sorted_scores
+    score_result = sorted_scores.new_zeros(result.shape)
+    score_result[:, start:end] = sorted_scores
+    return result, score_result
 
 
 @lru_cache(maxsize=128)
@@ -187,7 +220,8 @@ def _tnd_indexer_metadata(plan, device, heads, dim, topk, ratio):
 @torch.no_grad()
 def lightning_indexer(
         query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, ratio: int, topk: int, segments: tuple,
-) -> torch.Tensor:
+        *, return_scores: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Select packed document prefixes in one TND call; single documents use BSND.
 
     Args:
@@ -198,12 +232,18 @@ def lightning_indexer(
         topk: Selection width, including invalid tail slots.
         segments: Local Q start/end, global document K start/prefix end and
             raw-prefix residual. Packed documents require batch size one.
+        return_scores: Request aligned FP32 TopK scores for a BSND segment.
 
     Returns:
         Sorted global key IDs [batch, queries, topk], with invalid slots -1.
+        When requested, return a pair of key IDs and corresponding scores.
     """
     if len(segments) == 1:
-        return _bsnd_lightning_indexer(query, key, weights, ratio, topk, segments[0])
+        return _bsnd_lightning_indexer(
+            query, key, weights, ratio, topk, segments[0], return_scores=return_scores,
+        )
+    if return_scores:
+        raise ValueError("TopK score recovery requires a single BSND segment")
     if query.shape[0] != 1:
         raise ValueError("Packed Lightning Indexer requires batch size one")
     plan = csa_tnd_plan(segments, ratio)

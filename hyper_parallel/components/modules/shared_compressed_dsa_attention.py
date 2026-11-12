@@ -39,7 +39,7 @@ from torch.utils._pytree import register_pytree_node  # pylint: disable=forbidde
 
 from hyper_parallel.components.functional.aux_loss import aux_loss_auto_scale
 from hyper_parallel.components.functional.lightning_indexer import (
-    lightning_indexer, sort_key_indices, validate_indexer_tensors,
+    lightning_indexer, lightning_indexer_supports_scores, sort_key_indices, validate_indexer_tensors,
 )
 from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
@@ -206,6 +206,7 @@ class SharedCompressedIndexerOutput:
     candidate_blocks: torch.Tensor | None
     index_query: torch.Tensor
     merge_weight: torch.Tensor
+    topk_scores: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -628,7 +629,8 @@ def _run_lightning_indexer(
         top_k: int, compress_ratio: int, query_offset: int,
         reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
         minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
-) -> torch.Tensor:
+        *, return_scores: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run LI V2 with explicit adapter errors and native capability validation."""
     if reduce_sum is not None:
         raise NotImplementedError("Fused LightningIndexer does not support TP score reduction before TopK")
@@ -641,6 +643,8 @@ def _run_lightning_indexer(
         length = query.shape[1]
         raw_end = query_offset + length
         query_segments = ((0, length, 0, raw_end // compress_ratio, raw_end % compress_ratio),)
+    if return_scores:
+        return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments, return_scores=True)
     return lightning_indexer(query, key, merge_weight, compress_ratio, top_k, query_segments)
 
 
@@ -1153,6 +1157,7 @@ def shared_compressed_indexer_kl_loss(
         compress_ratio: int = 1,
         query_segments: tuple[tuple[int, int, int, int, int], ...] | None = None,
         use_fused: bool = False,
+        selected_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the sparse-stage DSA KL objective on V4.1 compressed keys.
 
@@ -1185,7 +1190,7 @@ def shared_compressed_indexer_kl_loss(
         return sparse_lightning_indexer_kl_loss(
             index_query, index_key, merge_weight, attention_query.detach(), compressed_key.detach(),
             topk_indices, sinks.detach(), attention_scale, loss_coeff, query_chunk_size,
-            compress_ratio, query_segments,
+            compress_ratio, query_segments, selected_scores=selected_scores,
         )
     return _SharedCompressedIndexerKLLoss.apply(
         index_query,
@@ -1379,7 +1384,7 @@ class SharedCompressedDSAIndexer(nn.Module):
         reduce_sum = None if tp_context is None else tp_context.reduce_sum
         if key_handle is not None:
             key = key_handle.wait()
-        topk_indices, candidate_blocks = self._run_selection(
+        topk_indices, candidate_blocks, topk_scores = self._run_selection(
             query, key, merge_weight, query_residual, (cos, sin), cp_context, tp_context,
             candidate_blocks, query_offset, reduce_sum, minimum_key_indices, query_segments,
             document_lengths,
@@ -1390,6 +1395,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             candidate_blocks=candidate_blocks,
             index_query=query,
             merge_weight=merge_weight,
+            topk_scores=topk_scores,
         )
 
     def _forward_dispatched(
@@ -1464,7 +1470,9 @@ class SharedCompressedDSAIndexer(nn.Module):
         """Cache completed IDs; replay never consumes an already finished handle."""
         return result.wait().unsqueeze(0)
 
-    def _run_selection(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _run_selection(
+            self, *args: Any, **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Select directly, or reuse the result retained by the checkpoint region."""
         selection = self._select_tokens if self._selection_region is None else self._selection_region
         return selection(*args, **kwargs)
@@ -1478,7 +1486,7 @@ class SharedCompressedDSAIndexer(nn.Module):
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
             document_lengths: tuple,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Cache dispatch, discrete selection and TopK return as one recompute region."""
         cos, sin = embeddings
         if cp_context is not None and cp_context.balance_indexer is not None:
@@ -1498,20 +1506,20 @@ class SharedCompressedDSAIndexer(nn.Module):
             topk_indices = cp_context.balance_indexer(
                 query_residual, merge_weight, (cos, sin), select_tasks, document_lengths, self.compress_ratio,
             )
-            candidate_blocks = None
-        else:
-            topk_indices, candidate_blocks = self._select_indices(
-                query, key, merge_weight, candidate_blocks, query_offset,
-                reduce_sum, minimum_key_indices, query_segments,
-            )
-        return topk_indices, candidate_blocks
+            return topk_indices, None, None
+        return self._select_indices(
+            query, key, merge_weight, candidate_blocks, query_offset,
+            reduce_sum, minimum_key_indices, query_segments,
+            capture_scores=cp_context is None and tp_context is None,
+        )
 
     def _select_indices(
             self, query: torch.Tensor, key: torch.Tensor, merge_weight: torch.Tensor,
             candidate_blocks: torch.Tensor | None, query_offset: int,
             reduce_sum: Callable[[torch.Tensor], torch.Tensor] | None,
             minimum_key_indices: torch.Tensor | None, query_segments: tuple | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            *, capture_scores: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Select the requested implementation without changing candidate policies."""
         if self.use_fused and (self.is_candidate_source or self.uses_candidates):
             raise NotImplementedError("V4.1 fused Indexer does not support candidate-pool selection")
@@ -1545,6 +1553,19 @@ class SharedCompressedDSAIndexer(nn.Module):
                 reduce_sum=reduce_sum,
                 minimum_key_indices=minimum_key_indices,
             )
+        elif (
+            capture_scores and self.training and self.loss_coeff and self.use_fused
+            and query.device.type == "npu" and query.shape[0] == 1
+            and self.index_topk == 512 and key.shape[1] >= self.index_topk
+            and query_segments is not None and len(query_segments) == 1
+            and query_segments[0][:4] == (0, query.shape[1], 0, key.shape[1])
+            and lightning_indexer_supports_scores()
+        ):
+            topk_indices, scores = _run_lightning_indexer(
+                query, key, merge_weight, self.index_topk, self.compress_ratio, query_offset,
+                reduce_sum, minimum_key_indices, query_segments, return_scores=True,
+            )
+            return topk_indices, None, scores
         else:
             candidate_blocks = None
             topk_indices = compressed_causal_topk(
@@ -1560,7 +1581,7 @@ class SharedCompressedDSAIndexer(nn.Module):
                 query_segments=query_segments,
                 use_fused=self.use_fused,
             )
-        return topk_indices, candidate_blocks
+        return topk_indices, candidate_blocks, None
 
 
 def reference_sparse_attention(
@@ -1641,6 +1662,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
     _fused_attention_reported = False
     _fused_indexer_kl_reported = False
     _fused_grouped_projection_reported = False
+    _device_indexer_kl_reported = False
     _indexer_kl_region: Callable[..., torch.Tensor] | None = None
 
     def __init__(
@@ -2058,6 +2080,10 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 query_segments = tuple((s, e, ks-main_key_offset, ke-main_key_offset, residual)
                                        for s, e, ks, ke, residual in query_segments)
             compute_kl = self._indexer_kl_region or shared_compressed_indexer_kl_loss
+            score_options = (
+                {"selected_scores": indexer_output.topk_scores}
+                if indexer_output.topk_scores is not None else {}
+            )
             indexer_loss = compute_kl(
                 indexer_output.index_query,
                 index_key,
@@ -2073,7 +2099,11 @@ class SharedCompressedDSAAttentionBase(nn.Module):
                 compress_ratio=self.compress_ratio,
                 query_segments=query_segments,
                 use_fused=self.use_fused_ops,
+                **score_options,
             )
+            if score_options and not SharedCompressedDSAAttentionBase._device_indexer_kl_reported:
+                logger.info_rank0("Native Indexer KL device score recovery engaged")
+                SharedCompressedDSAAttentionBase._device_indexer_kl_reported = True
             if self.use_fused_ops and not SharedCompressedDSAAttentionBase._fused_indexer_kl_reported:
                 logger.info_rank0("Native Lightning Indexer KL engaged (checkpoint exclusion=%s)",
                                   self._indexer_kl_region is not None)

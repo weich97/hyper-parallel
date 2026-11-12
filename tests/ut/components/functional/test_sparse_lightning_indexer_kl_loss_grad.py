@@ -165,6 +165,39 @@ class TestSparseLightningIndexerKL(unittest.TestCase):
         prediction = torch.tensor([[[1., 0., 0.], [1., 0., 0.], [0., 0., 0.]]])
         actual = _stable_prediction_log(prediction, query, key, weights, indices, 1)
         torch.testing.assert_close(actual, torch.tensor([[[0., -2000., 0.], [0., 0., 0.], [0., 0., 0.]]]))
+        scores = torch.tensor([[[2000., 0., 12.], [2., 12., 12.], [12., 12., 12.]]])
+        device_result = kl_ops._prediction_log_from_scores(prediction, indices, scores)
+        torch.testing.assert_close(device_result, actual, atol=0, rtol=0)
+
+    def test_native_bsnd_scores_follow_sorted_global_keys(self):
+        """Keep scores aligned after converting the selection to global key IDs."""
+        query = torch.zeros(1, 2, 2, 128)
+        key = torch.zeros(1, 6, 128)
+        weights = torch.zeros(1, 2, 2)
+        native_ids = torch.tensor([[[[2, -1, 0]]]], dtype=torch.int32)
+        native_scores = torch.tensor([[[[4., 0., 1.]]]])
+        with patch.object(indexer_ops, "_bsnd_indexer_metadata", return_value=(None, None)), \
+                patch.object(indexer_ops, "_load_indexer_op") as loader:
+            loader.return_value.return_value = native_ids, native_scores
+            indices, scores = lightning_indexer(
+                query, key, weights, 2, 3, ((1, 2, 3, 6, 0),), return_scores=True,
+            )
+        self.assertEqual(loader.return_value.call_args.kwargs["return_value"], 1)
+        torch.testing.assert_close(indices, torch.tensor([[[-1, -1, -1], [3, 5, -1]]], dtype=torch.int32))
+        torch.testing.assert_close(scores, torch.tensor([[[0., 0., 0.], [1., 4., 0.]]]), atol=0, rtol=0)
+
+    def test_score_capability_uses_the_registered_dispatcher_schema(self):
+        """A callable torch.ops packet advertises its arguments in the schema."""
+        check = indexer_ops.lightning_indexer_supports_scores
+        self.addCleanup(check.cache_clear)
+        library = torch.library.Library("hp_test_lightning_indexer_scores", "DEF")
+        library.define("scored(Tensor x, *, int return_value=0) -> Tensor")
+        library.define("unscored(Tensor x) -> Tensor")
+        namespace = torch.ops.hp_test_lightning_indexer_scores
+        for operator, supported in ((namespace.scored, True), (namespace.unscored, False)):
+            with patch.object(indexer_ops, "_load_indexer_op", return_value=operator):
+                check.cache_clear()
+                self.assertEqual(check(), supported)
 
     def test_prefix_teacher_matches_selected_teacher(self):
         """Cover partial/full transition, a zero row, and odd CP offsets."""

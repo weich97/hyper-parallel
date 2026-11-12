@@ -240,6 +240,17 @@ def _stable_prediction_log(
     return log_prediction
 
 
+def _prediction_log_from_scores(
+        prediction: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor,
+) -> torch.Tensor:
+    """Recover underflowed rows from aligned native scores without a host read."""
+    valid = indices >= 0
+    recover = ((prediction <= 0) & valid).any(dim=-1, keepdim=True)
+    ordinary = prediction.masked_fill(~valid | recover, 1).log()
+    recovered = scores.masked_fill(~valid, -1.0e9).log_softmax(dim=-1).masked_fill(~valid, 0)
+    return torch.where(recover, recovered, ordinary)
+
+
 class _SparseLightningIndexerKLLoss(torch.autograd.Function):
     """Adapt SparseLightningIndexerKLLossGrad to Hyper's scalar-loss autograd contract."""
 
@@ -248,6 +259,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             ctx: Any, query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
             attention_query: torch.Tensor, main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
             scale: float, coefficient: float, chunk_size: int, ratio: int, residual: int,
+            selected_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Save native gradients while retaining Hyper's detached teacher and loss.
 
@@ -265,6 +277,7 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             chunk_size: Maximum query count for sparse teacher temporaries.
             ratio: Key compression ratio.
             residual: Raw prefix length modulo the compression ratio.
+            selected_scores: Aligned native scores for device-side underflow recovery.
 
         Returns:
             Scalar KL normalized by this document segment's batch and query count.
@@ -284,7 +297,11 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
                 query.contiguous(), native_key, weights.float().contiguous(),
                 indices.unsqueeze(2).int().contiguous(), target.unsqueeze(2), metadata=metadata, **options,
             )
-            log_prediction = _stable_prediction_log(prediction[:, :, 0], query, key, weights, indices, chunk_size)
+            prediction = prediction[:, :, 0]
+            if selected_scores is None:
+                log_prediction = _stable_prediction_log(prediction, query, key, weights, indices, chunk_size)
+            else:
+                log_prediction = _prediction_log_from_scores(prediction, indices, selected_scores)
             loss = (target * (target.clamp_min(torch.finfo(torch.float32).tiny).log() - log_prediction)).sum()
             ctx.save_for_backward(dq, dk.squeeze(2), dw)
             ctx.factor = coefficient / (batch * length)
@@ -302,14 +319,14 @@ class _SparseLightningIndexerKLLoss(torch.autograd.Function):
             Student Q/K/weight gradients and None for teacher and sequence metadata.
         """
         gradients = tuple(value.float() * (seed * ctx.factor) for value in ctx.saved_tensors)
-        return (*gradients, *((None,) * 9))
+        return (*gradients, *((None,) * (len(ctx.needs_input_grad) - len(gradients))))
 
 
 def _bsnd_sparse_lightning_indexer_kl_loss(
         query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor,
         attention_query: torch.Tensor, main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor,
         scale: float, coefficient: float, chunk_size: int, ratio: int,
-        segment: tuple[int, int, int, int, int],
+        segment: tuple[int, int, int, int, int], selected_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fuse one document segment per batch item with the original KL denominator.
 
@@ -330,6 +347,7 @@ def _bsnd_sparse_lightning_indexer_kl_loss(
         ratio: Compression ratio.
         segment: Local Q start/end, document K start/prefix end and residual,
             shared by all physical batch items.
+        selected_scores: Optional scores aligned with the original selection.
     """
     # Zero-length views attach zero gradients even when the segment has no key.
     total = query[..., :0].float().sum() + key[..., :0].float().sum() + weights[..., :0].float().sum()
@@ -338,12 +356,16 @@ def _bsnd_sparse_lightning_indexer_kl_loss(
         return total
     selected = indices[:, start:end]
     selected = torch.where(selected >= 0, selected - key_start, -1)
+    scores = None if selected_scores is None else selected_scores[:, start:end]
     if selected.shape[-1] < 512:
-        selected = torch.nn.functional.pad(selected, (0, 512-selected.shape[-1]), value=-1)
+        padding = (0, 512 - selected.shape[-1])
+        selected = torch.nn.functional.pad(selected, padding, value=-1)
+        if scores is not None:
+            scores = torch.nn.functional.pad(scores, padding)
     loss = _SparseLightningIndexerKLLoss.apply(
         query[:, start:end], key[:, key_start:key_end], weights[:, start:end],
         attention_query[:, :, start:end], main_key[:, key_start:key_end], selected, sinks,
-        scale, coefficient, chunk_size, ratio, residual,
+        scale, coefficient, chunk_size, ratio, residual, scores,
     )
     return total + loss * ((end-start) / query.shape[1])
 
@@ -402,6 +424,7 @@ def sparse_lightning_indexer_kl_loss(
         query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, attention_query: torch.Tensor,
         main_key: torch.Tensor, indices: torch.Tensor, sinks: torch.Tensor, scale: float,
         coefficient: float, chunk_size: int, ratio: int, segments: tuple,
+        *, selected_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Batch packed student KL without changing the detached teacher or normalization.
 
@@ -418,15 +441,21 @@ def sparse_lightning_indexer_kl_loss(
         chunk_size: Maximum queries per external teacher/recovery chunk.
         ratio: Compression ratio.
         segments: Local Q start/end, document K start/prefix end and residual.
+        selected_scores: Optional FP32 logits matching the selected key IDs in BSND.
 
     Returns:
         Scalar KL normalized by all local queries, including empty-prefix rows.
         The external teacher retains its per-document bounded computation.
     """
+    if selected_scores is not None and (
+        len(segments) != 1 or selected_scores.shape != indices.shape
+        or selected_scores.dtype != torch.float32 or selected_scores.device != indices.device
+    ):
+        raise ValueError("Lightning Indexer scores must match the BSND key selection")
     if len(segments) == 1:
         return _bsnd_sparse_lightning_indexer_kl_loss(
             query, key, weights, attention_query, main_key, indices, sinks,
-            scale, coefficient, chunk_size, ratio, segments[0],
+            scale, coefficient, chunk_size, ratio, segments[0], selected_scores,
         )
     if query.shape[0] != 1:
         raise ValueError("Packed Lightning Indexer KL requires batch size one")
