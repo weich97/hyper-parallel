@@ -700,8 +700,7 @@ def _v41_shifted_decoder_layer_forward(
         previous_residual_mix,
         layer.input_layernorm.weight,
     )
-    if collect_dspark_target:
-        layer.dspark_target_hidden = residual.detach().mean(dim=2)
+    target_hidden = residual.detach().mean(dim=2) if collect_dspark_target else None
     attention_output, _ = layer.self_attn(
         attention_input,
         position_embeddings=position_embeddings,
@@ -727,7 +726,8 @@ def _v41_shifted_decoder_layer_forward(
         router_sequence_ids=router_sequence_ids,
         router_num_sequences=router_num_sequences,
     )
-    return ffn_output, residual, ffn_pre, ffn_post, ffn_comb
+    outputs = (ffn_output, residual, ffn_pre, ffn_post, ffn_comb)
+    return (*outputs, target_hidden) if collect_dspark_target else outputs
 
 
 def _v41_decoder_layer_forward(
@@ -784,8 +784,7 @@ def _v41_decoder_layer_forward(
             token_mask=engram_token_mask,
         )
     residual = hidden_states
-    if collect_dspark_target:
-        self.dspark_target_hidden = residual.detach().mean(dim=2)
+    target_hidden = residual.detach().mean(dim=2) if collect_dspark_target else None
     attention_pre, attention_post, attention_comb = self.attn_hc(hidden_states)
     attention_input = self.input_layernorm(_hc_pre(hidden_states, pre_mix))
     attention_output, _ = self.self_attn(
@@ -807,7 +806,8 @@ def _v41_decoder_layer_forward(
         router_sequence_ids=router_sequence_ids, router_num_sequences=router_num_sequences,
     )
     hidden_states = _hc_post(ffn_output, residual, ffn_post, ffn_comb)
-    return hidden_states, ffn_pre
+    outputs = (hidden_states, ffn_pre)
+    return (*outputs, target_hidden) if collect_dspark_target else outputs
 
 
 class DeepseekV41Model(DeepseekV4PreTrainedModel):
@@ -853,7 +853,6 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         )
         for layer_idx in range(config.num_hidden_layers):
             layer = self.layers[layer_idx]
-            layer.dspark_target_hidden = None
             layer.attn_hc = DeepseekV41PipelinedHyperConnection(layer.attn_hc)
             layer.ffn_hc = DeepseekV41PipelinedHyperConnection(layer.ffn_hc)
             layer.self_attn = DeepseekV41Attention(config, layer_idx)
@@ -1168,9 +1167,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             residual_mix = _identity_residual_mix(pre_mix)
         for layer_index, layer in enumerate(self.layers):
             collect_target = self.dspark_target_hiddens is not None and layer_index in dspark_layer_ids
-            layer.dspark_target_hidden = None
             if shifted_mhc:
-                previous_output, hidden_states, pre_mix, post_mix, residual_mix = layer(
+                outputs = layer(
                     hidden_states,
                     pre_mix=pre_mix,
                     previous_output=previous_output,
@@ -1188,7 +1186,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     **kwargs,
                 )
             else:
-                hidden_states, pre_mix = layer(
+                outputs = layer(
                     hidden_states,
                     pre_mix=pre_mix,
                     input_ids=input_ids,
@@ -1203,9 +1201,14 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
                     **kwargs,
                 )
             if collect_target:
-                if layer.dspark_target_hidden is None:
-                    raise RuntimeError("The decoder did not publish its DSpark pre-attention feature tap")
-                self.dspark_target_hiddens.append(layer.dspark_target_hidden)
+                # Return feature taps through activation/FSDP wrappers; assigning
+                # cache attributes on a wrapper shadows the inner layer's state.
+                self.dspark_target_hiddens.append(outputs[-1])
+                outputs = outputs[:-1]
+            if shifted_mhc:
+                previous_output, hidden_states, pre_mix, post_mix, residual_mix = outputs
+            else:
+                hidden_states, pre_mix = outputs
         if shifted_mhc:
             hidden_states = _hc_post(previous_output, hidden_states, post_mix, residual_mix)
         return hidden_states, pre_mix

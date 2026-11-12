@@ -34,6 +34,7 @@ from tests.common.mark_utils import arg_mark
 from tests.ut.auto_models.models.deepseek_v41.test_modeling_deepseek_v41 import _config, DeepseekV4Config
 
 from hyper_parallel import DeviceMesh, Replicate, Shard, init_empty_weights
+from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -279,8 +280,8 @@ class DSparkComponentTest(unittest.TestCase):
     def test_dspark_taps_pre_attention_stream_mean_after_engram(self) -> None:
         """Feature: Published DSpark backbone feature taps.
 
-        Description: Observe real attention-boundary inputs with ordinary and shifted mHC.
-        Expectation: Targets are detached unweighted means after one Engram injection and before attention.
+        Description: Observe ordinary and shifted mHC paths, including real activation-checkpoint wrappers.
+        Expectation: Detached pre-attention targets and backbone gradients survive wrapper boundaries and replay.
         """
         torch.manual_seed(170)
         config = _config()
@@ -298,6 +299,9 @@ class DSparkComponentTest(unittest.TestCase):
         for layer in shifted.layers:
             layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
             layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
+        models = [reference, shifted, copy.deepcopy(reference), copy.deepcopy(shifted)]
+        for model in models[2:]:
+            model.layers = nn.ModuleList(CheckpointWrapper(layer, early_stop=False) for layer in model.layers)
         observed = []
 
         def _record_input(_module, arguments):
@@ -307,17 +311,30 @@ class DSparkComponentTest(unittest.TestCase):
         handles = [layer.attn_hc.register_forward_pre_hook(_record_input) for layer in reference.layers]
         try:
             ids = torch.tensor([[1, 2, 3, 4]])
-            expected = reference(input_ids=ids).last_hidden_state
-            actual = shifted(input_ids=ids).last_hidden_state
+            outputs = [model(input_ids=ids).last_hidden_state for model in models]
         finally:
             for handle in handles:
                 handle.remove()
-        torch.testing.assert_close(actual, expected)
+        for output in outputs[1:]:
+            torch.testing.assert_close(output, outputs[0])
         self.assertEqual(len(observed), 2)
-        for model in (reference, shifted):
+        for model in models:
             for layer, target, expected_target in zip(model.layers, model.dspark_target_hiddens, observed, strict=True):
                 self.assertEqual(layer.engram.calls, 1)
                 self.assertFalse(target.requires_grad)
+                torch.testing.assert_close(target, expected_target)
+        for output in outputs:
+            output.square().sum().backward()
+        self._assert_replayed_gradients_and_targets(models[1:], reference, observed)
+
+    @staticmethod
+    def _assert_replayed_gradients_and_targets(models, reference, observed):
+        """Check replay preserves detached targets and all backbone parameter gradients."""
+        expected_gradients = {name: parameter.grad for name, parameter in reference.named_parameters()}
+        for model in models:
+            for name, parameter in model.named_parameters():
+                torch.testing.assert_close(parameter.grad, expected_gradients[name])
+            for target, expected_target in zip(model.dspark_target_hiddens, observed, strict=True):
                 torch.testing.assert_close(target, expected_target)
 
 
