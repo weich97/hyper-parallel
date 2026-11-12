@@ -1611,11 +1611,36 @@ def reference_sparse_attention(
 logger = logging.getLogger(__name__)
 
 
+class _NativeGroupedOutputProjection(torch.autograd.Function):
+    """Keep token-major forward storage and preserve the PyTorch BMM gradients."""
+
+    @staticmethod
+    def forward(ctx: Any, grouped: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Apply one projection per attention group through CANN."""
+        ctx.save_for_backward(grouped, weight)
+        return torch.ops.npu.npu_transpose_batchmatmul(
+            grouped, weight.transpose(1, 2).contiguous(), perm_x1=[1, 0, 2],
+        )
+
+    @staticmethod
+    def backward(ctx: Any, gradient: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Use the same operands and transpose order as the reference BMM backward."""
+        grouped, weight = ctx.saved_tensors
+        grouped_gradient = gradient.transpose(0, 1)
+        input_gradient = weight_gradient = None
+        if ctx.needs_input_grad[0]:
+            input_gradient = torch.bmm(grouped_gradient, weight).transpose(0, 1)
+        if ctx.needs_input_grad[1]:
+            weight_gradient = torch.bmm(grouped.permute(1, 2, 0), grouped_gradient).transpose(1, 2)
+        return input_gradient, weight_gradient
+
+
 class SharedCompressedDSAAttentionBase(nn.Module):
     """Shared V4.1 attention semantics with selectable reference execution."""
 
     _fused_attention_reported = False
     _fused_indexer_kl_reported = False
+    _fused_grouped_projection_reported = False
     _indexer_kl_region: Callable[..., torch.Tensor] | None = None
 
     def __init__(
@@ -2110,11 +2135,18 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         grouped = attention_output.reshape(batch_size, sequence_length, self.num_groups, -1)
         hidden_per_group = grouped.shape[-1]
         output_per_group = self.o_a_proj.weight.shape[0] // self.num_groups
-        projection = self.o_a_proj.weight.view(
-            self.num_groups, output_per_group, hidden_per_group
-        ).transpose(1, 2)
-        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group).transpose(0, 1)
-        projected = torch.bmm(flattened, projection).transpose(0, 1)
+        projection = self.o_a_proj.weight.view(self.num_groups, output_per_group, hidden_per_group)
+        flattened = grouped.reshape(-1, self.num_groups, hidden_per_group)
+        if (self.use_fused_ops and flattened.device.type == "npu" and flattened.dtype == torch.bfloat16
+                and flattened.shape == (16384, 8, 4096) and projection.shape == (8, 1024, 4096)
+                and flattened.is_contiguous() and projection.dtype == flattened.dtype
+                and hasattr(torch.ops.npu, "npu_transpose_batchmatmul")):
+            projected = _NativeGroupedOutputProjection.apply(flattened, projection)
+            if not SharedCompressedDSAAttentionBase._fused_grouped_projection_reported:
+                logger.info_rank0("CANN grouped output projection engaged")
+                SharedCompressedDSAAttentionBase._fused_grouped_projection_reported = True
+        else:
+            projected = torch.bmm(flattened.transpose(0, 1), projection.transpose(1, 2)).transpose(0, 1)
         projected = projected.reshape(batch_size, sequence_length, -1)
         return self.o_b_proj(projected)
 

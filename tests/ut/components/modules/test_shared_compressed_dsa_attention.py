@@ -66,6 +66,27 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
 
+    def test_grouped_output_projection_preserves_weight_and_input_gradients(self):
+        """Use the same grouped projection and VJP with token-major native output."""
+        generator = torch.Generator().manual_seed(41)
+        inputs = torch.randn(9, 3, 4, generator=generator).requires_grad_()
+        weights = torch.randn(3, 5, 4, generator=generator).requires_grad_()
+        upstream = torch.randn(9, 3, 5, generator=generator)
+        reference = torch.bmm(inputs.transpose(0, 1), weights.transpose(1, 2)).transpose(0, 1)
+
+        def native_projection(grouped, packed_weight, *, perm_x1):
+            self.assertEqual(perm_x1, [1, 0, 2])
+            self.assertTrue(packed_weight.is_contiguous())
+            return torch.bmm(grouped.permute(perm_x1), packed_weight).transpose(0, 1).contiguous()
+
+        with patch.object(torch.ops.npu, "npu_transpose_batchmatmul", native_projection, create=True):
+            projected = attention._NativeGroupedOutputProjection.apply(inputs, weights)
+        torch.testing.assert_close(projected, reference, rtol=0, atol=0)
+        expected = torch.autograd.grad(reference, (inputs, weights), upstream)
+        actual = torch.autograd.grad(projected, (inputs, weights), upstream)
+        for candidate, baseline in zip(actual, expected, strict=True):
+            torch.testing.assert_close(candidate, baseline, rtol=0, atol=0)
+
     def test_indexer_requires_native_when_explicitly_selected(self):
         """Unsupported CPU inputs cannot silently satisfy native mode."""
         kwargs = {"compress_ratio": 1, "sparse_count": 2}
