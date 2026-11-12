@@ -287,8 +287,6 @@ class TextTrainer:
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
-        expert_staging = getattr(self, "_expert_gradient_staging", None)
-
         for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
@@ -303,13 +301,8 @@ class TextTrainer:
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
-            if expert_staging is not None and micro_step == 0:
-                expert_staging.pack()
-                if trace_first_update:
-                    logger.info("First CP1 expert gradient partials staged")
+            self._stage_expert_gradient_partial(micro_step, num_micro_steps)
 
-        if expert_staging is not None:
-            expert_staging.finish()
         if trace_first_update:
             logger.info("First CP1 backward completed")
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
@@ -337,6 +330,29 @@ class TextTrainer:
             "loss": total_loss,
             "grad_norm": grad_norm_value,
         }
+
+    def _stage_expert_gradient_partial(self, micro_step: int, num_micro_steps: int) -> None:
+        """Consume the previous staged sum before preparing the next backward."""
+        staging = getattr(self, "_expert_gradient_staging", None)
+        if staging is None:
+            return
+        if micro_step > 0:
+            staging.finish()
+        if micro_step + 1 == num_micro_steps:
+            return
+        staging.pack(first_partial=micro_step == 0)
+        if self.base.state.global_step == 0 and self.base.global_rank == 0:
+            if micro_step == 0:
+                logger.info("First CP1 expert gradient partials staged")
+            else:
+                logger.info("V4.1 cumulative expert gradients staged in FP32 after microbatch=%d", micro_step)
+
+    def _begin_data_epoch(self, loader: Any, balanced: bool, epoch: int, start_epoch: int) -> None:
+        """Preserve a restored collective-loader cursor on its initial epoch."""
+        if hasattr(loader, "set_epoch") and (not balanced or epoch != start_epoch):
+            loader.set_epoch(epoch)
+        self.base.state.epoch = epoch
+        self.on_epoch_begin()
 
     def _train_epoch(self, epoch: int, balanced_loader: bool) -> bool:
         """Consume complete optimizer steps and report whether the source epoch ended."""
@@ -381,12 +397,7 @@ class TextTrainer:
             for epoch in epochs:
                 if self.base.state.global_step >= self.base.train_iters:
                     break
-                # The first collective iterator may hold a restored checkpoint cursor.
-                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
-                    train_dataloader.set_epoch(epoch)
-
-                self.base.state.epoch = epoch
-                self.on_epoch_begin()
+                self._begin_data_epoch(train_dataloader, balanced_loader, epoch, start_epoch)
                 epoch_start_step = self.base.state.global_step
                 epoch_exhausted = self._train_epoch(epoch, balanced_loader)
 

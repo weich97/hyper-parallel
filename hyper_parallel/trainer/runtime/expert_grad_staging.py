@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lossless staging of local expert gradients between two microbatches."""
+"""Lossless staging of owned expert gradients between microbatches."""
+
+from __future__ import annotations
 
 from typing import Any
 
@@ -27,9 +29,15 @@ logger = create_logger(__name__)
 
 
 class ExpertGradientStaging:
-    """Keep exactly representable BF16 partials and accumulate into FP32."""
+    """Keep the first exact BF16 partial and later accumulated partials in FP32."""
 
     def __init__(self, parameters: tuple[torch.nn.Parameter, ...], host_count: int = 0) -> None:
+        """Own the gradient partials for a set of local expert parameters.
+
+        Args:
+            parameters: Parameters whose local FP32 gradients are staged.
+            host_count: Number of first-partial tensors to store on the host.
+        """
         self.parameters = parameters
         self.host_count = host_count
         self.active = False
@@ -43,23 +51,36 @@ class ExpertGradientStaging:
         return gradients
 
     @torch.no_grad()
-    def pack(self) -> None:
-        """Check the first partials before releasing their original FP32 storage."""
+    def pack(self, *, first_partial: bool = True) -> None:
+        """Stage a completed partial before the next backward.
+
+        Args:
+            first_partial: Check and compact the initial BF16-representable gradient.
+                Later accumulated gradients remain FP32 and are staged entirely on the host.
+        """
         if self.active:
-            raise RuntimeError("Expert gradient staging already owns the first microbatch")
+            raise RuntimeError("Expert gradient staging already owns an unconsumed partial")
         gradients = self._local_gradients()
-        packed = tuple(gradient.to(dtype=torch.bfloat16) for gradient in gradients)
-        lossless = torch.stack([
-            (original == compact).all() for original, compact in zip(gradients, packed, strict=True)
-        ]).all().to(torch.int32)
-        if dist.is_initialized():
-            dist.all_reduce(lossless, op=dist.ReduceOp.MIN)
-        if not lossless.item():
-            raise RuntimeError("First expert gradient partial has values outside the BF16 format")
+        if first_partial:
+            packed = tuple(gradient.to(dtype=torch.bfloat16) for gradient in gradients)
+            lossless = torch.stack([
+                (original == compact).all() for original, compact in zip(gradients, packed, strict=True)
+            ]).all().to(torch.int32)
+            if dist.is_initialized():
+                dist.all_reduce(lossless, op=dist.ReduceOp.MIN)
+            if not lossless.item():
+                raise RuntimeError("First expert gradient partial has values outside the BF16 format")
+        else:
+            # A sum of BF16 gradients is generally not BF16-representable. Preserve
+            # the FP32 accumulator and its addition order across subsequent microbatches.
+            packed = gradients
         staged = list(packed)
+        host_count = self.host_count if first_partial else len(packed)
+        if packed[0].device.type == "cpu":
+            host_count = 0
         ready = None
-        if self.host_count:
-            for index, compact in enumerate(packed[:self.host_count]):
+        if host_count:
+            for index, compact in enumerate(packed[:host_count]):
                 host = torch.empty_like(compact, device="cpu", pin_memory=True)
                 host.copy_(compact, non_blocking=True)
                 staged[index] = host
@@ -73,23 +94,45 @@ class ExpertGradientStaging:
     def finish(self) -> None:
         """Require the FSDP reduction path to have consumed all staged partials."""
         if not self.active:
-            raise RuntimeError("Expert gradient staging has no first microbatch")
+            raise RuntimeError("Expert gradient staging has no pending partial")
         if any(hasattr(parameter, "_hp_staged_main_grad") for parameter in self.parameters):
-            raise RuntimeError("Expert gradients were not consumed during the second backward")
+            raise RuntimeError("Expert gradients were not consumed during the next backward")
         self._local_gradients()
         self.active = False
 
 
-def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
-    """Select local MegaMoE weights when each optimizer update uses two microbatches."""
+def _supports_owned_expert_staging(base: Any) -> bool:
+    """Require a reduction boundary exposing each staged local expert partial."""
     config = base.config
     model_type = (getattr(base.model_config, "v41_source_model_type", None)
                   or getattr(base.model_config, "model_type", ""))
-    if (base.num_micro_batches != 2 or model_type != "deepseek_v41"
-            or config.accelerator.ep_size != 128 or config.accelerator.cp_size != 1 or config.accelerator.tp_size != 1
-            or config.fsdp_config.edp_shard_size != 1 or config.fsdp_config.comm_fusion
-            or config.fsdp_config.dp_shard_size not in (32, 64, 128) or not config.fsdp_config.requires_grad_sync
-            or not config.optimizer.fp32_main_params):
+    return all((
+        base.num_micro_batches >= 2,
+        model_type == "deepseek_v41",
+        config.accelerator.ep_size == 128,
+        config.accelerator.cp_size == 1,
+        config.accelerator.tp_size == 1,
+        config.fsdp_config.edp_shard_size == 1,
+        not config.fsdp_config.comm_fusion,
+        config.fsdp_config.dp_shard_size in (32, 64, 128),
+        config.fsdp_config.requires_grad_sync,
+        config.optimizer.fp32_main_params,
+        # Full sharding does not expose intermediate local expert reductions.
+        base.num_micro_batches == 2 or config.fsdp_config.dp_shard_size != 128,
+    ))
+
+
+def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
+    """Select owned MegaMoE weights with supported microbatch reduction boundaries.
+
+    Args:
+        base: Trainer state containing the model and distributed configuration.
+
+    Returns:
+        A staging owner, or None when the layout cannot expose every required partial.
+    """
+    config = base.config
+    if not _supports_owned_expert_staging(base):
         return None
     # Import the model adapter only for the optional V4.1 execution path.
     from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (  # pylint: disable=C0415
@@ -109,4 +152,6 @@ def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
         elements = sum(to_local_if_dtensor(parameter).numel() for parameter in parameters)
         logger.info("V4.1 lossless streaming gradient staging weights=%d host_weights=%d compact_bytes=%d",
                     len(parameters), host_count, 2 * elements)
+        logger.info("V4.1 expert accumulation microbatches=%d later_partial_dtype=float32 later_storage=host",
+                    base.num_micro_batches)
     return ExpertGradientStaging(parameters, host_count)
