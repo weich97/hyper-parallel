@@ -70,6 +70,8 @@ def _configure_recompute(model: Any, *, roles: tuple[str, ...]) -> None:
                 if isinstance(block, CheckpointWrapper):
                     block.checkpoint_kwargs.update(
                         context_fn=encoder_attention_checkpoint_contexts,
+                        # All blocks reuse one rotary table from the vision tower.
+                        swap_inputs=False,
                         # All ranks must replay every Ulysses/FSDP collective.
                         early_stop=False,
                     )

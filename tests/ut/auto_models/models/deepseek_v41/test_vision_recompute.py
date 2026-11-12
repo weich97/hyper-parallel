@@ -119,19 +119,21 @@ class TestVisionRecompute(unittest.TestCase):
     def test_full_checkpointing_preserves_vision_output_and_all_gradients(self) -> None:
         """Feature: Model-owned full vision activation checkpointing.
 
-        Description: Compare a two-block checkpointed tower with its eager copy.
+        Description: Compare a two-block tower with its eager copy when input offload is requested.
         Expectation: Both blocks replay fully and outputs and every gradient agree.
         """
         torch.manual_seed(1385)
         model = _vision_model()
         expected = copy.deepcopy(model.model.vision)
-        _apply_activation_checkpointing(model, "full")
+        with patch("hyper_parallel.distributed.activation_checkpoint._register_forward_prefetch_layers"):
+            _apply_activation_checkpointing(model, "full", swap_inputs=True)
         tower = model.model.vision
         replay_hooks = [Mock(return_value=None) for _ in tower.blocks]
         for block, hook in zip(tower.blocks, replay_hooks):
             self.assertIsInstance(block, CheckpointWrapper)
             self.assertIs(block.checkpoint_kwargs["context_fn"], encoder_attention_checkpoint_contexts)
             self.assertIs(block.checkpoint_kwargs["early_stop"], False)
+            self.assertIs(block.checkpoint_kwargs["swap_inputs"], False)
             handle = block.get_submodule("_wrapped_module").register_forward_hook(hook)
             self.addCleanup(handle.remove)
         DeepseekV41VisionBridge(model).validate_training({"micro_batch_size": 1, "loss_parallel": False})
