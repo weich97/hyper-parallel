@@ -38,7 +38,7 @@ def sequence_load_balancing_loss(
     Args:
         scores: Nonnegative, unbiased scores for all experts, shaped ``[T, E]``.
         selected_experts: Top-K experts selected from unbiased scores, shaped ``[T, K]``.
-        sequence_ids: Logical sample index of each token, shaped ``[T]``.
+        sequence_ids: Logical sample index of each token in ``[0, num_sequences)``, shaped ``[T]``.
         num_sequences: Global number of samples shared by the token-partition ranks.
         token_mask: Optional boolean ``[T]`` mask; true tokens contribute.
         sequence_partition_groups: Independent axes partitioning the same
@@ -69,9 +69,15 @@ def sequence_load_balancing_loss(
     counts = scores.new_zeros(num_sequences * num_experts).scatter_add(
         0, indices.reshape(-1), valid.unsqueeze(-1).expand(-1, top_k).reshape(-1),
     ).view(num_sequences, num_experts)
-    probability_sum = scores.new_zeros(num_sequences, num_experts).index_add(
-        0, sequence_ids, probabilities * valid.unsqueeze(-1),
-    )
+    weighted_probabilities = probabilities * valid.unsqueeze(-1)
+    if num_sequences == 1:
+        # Every token contributes to the same output row, so a dense
+        # reduction avoids contending on one indexed destination.
+        probability_sum = weighted_probabilities.sum(dim=0, keepdim=True)
+    else:
+        probability_sum = scores.new_zeros(num_sequences, num_experts).index_add(
+            0, sequence_ids, weighted_probabilities,
+        )
     for group in sequence_partition_groups:
         dist.all_reduce(counts, group=group)
         probability_sum = differentiable_all_reduce(probability_sum, "sum", group)
