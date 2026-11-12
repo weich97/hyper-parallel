@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from types import MethodType
 from typing import Any
 
 from hyper_parallel.codegen.plan.placements import (
@@ -33,6 +34,7 @@ class EmissionPlanObservation:
     injections: list[dict[str, Any]] = field(default_factory=list)
     boundary_classes: dict[str, str] = field(default_factory=dict)
     boundary_types: dict[str, str] = field(default_factory=dict)
+    boundary_forwards: dict[str, str] = field(default_factory=dict)
     nested_components: list[dict[str, str]] = field(default_factory=list)
     mesh_dim_names: tuple[str, ...] = ()
 
@@ -42,7 +44,15 @@ class EmissionPlanObservation:
 
 
 def observe_emission_plan(plan: Any, model: Any) -> EmissionPlanObservation:
-    """Project a native sharding plan without changing or applying it."""
+    """Project a native sharding plan without changing or applying it.
+
+    Args:
+        plan: Resolved native sharding plan, or None when no plan is required.
+        model: Constructed model before distributed wrappers are applied.
+
+    Returns:
+        Serializable source identities and layout contracts for emission.
+    """
     if plan is None:
         return EmissionPlanObservation()
     return EmissionPlanObservation(
@@ -50,6 +60,7 @@ def observe_emission_plan(plan: Any, model: Any) -> EmissionPlanObservation:
         injections=_observe_injections(plan),
         boundary_classes=_observe_boundary_classes(plan, model),
         boundary_types=_observe_boundary_types(plan, model),
+        boundary_forwards=_observe_boundary_forwards(plan, model),
         nested_components=_observe_nested_components(plan, model),
         mesh_dim_names=tuple(getattr(plan, "mesh_dim_names", ()) or ()),
     )
@@ -112,6 +123,25 @@ def _observe_boundary_types(plan: Any, model: Any) -> dict[str, str]:
     for fqn in (getattr(plan, "modules", {}) or {}):
         module_type = type(model.get_submodule(fqn))
         result[fqn] = f"{module_type.__module__}:{module_type.__qualname__}"
+    return result
+
+
+def _observe_boundary_forwards(plan: Any, model: Any) -> dict[str, str]:
+    """Preserve source-owned instance bindings before distributed wrappers are installed."""
+    if model is None:
+        return {}
+    result = {}
+    for fqn in (getattr(plan, "modules", {}) or {}):
+        module = model.get_submodule(fqn)
+        forward = vars(module).get("forward")
+        if not isinstance(forward, MethodType):
+            continue
+        function = forward.__func__
+        if function is getattr(type(module), "forward", None):
+            continue
+        if "<locals>" in function.__qualname__:
+            raise ValueError(f"Cannot emit local instance forward for {fqn!r}: {function.__qualname__}")
+        result[fqn] = f"{function.__module__}:{function.__qualname__}"
     return result
 
 

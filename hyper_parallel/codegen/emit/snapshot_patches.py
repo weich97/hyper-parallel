@@ -28,7 +28,14 @@ from hyper_parallel.codegen.source.resolver import resolve_remote_siblings
 def emission_patches_from_snapshot_payload(
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Translate resolved native observations into emitter patch records."""
+    """Translate resolved native observations into emitter patch records.
+
+    Args:
+        payload: Frozen source, replacement and native-plan observations.
+
+    Returns:
+        Module replacements, local computes and inner-wrapper descriptors.
+    """
     applications = payload["replacements"]["applications"]
     replacements = [
         {
@@ -48,6 +55,7 @@ def emission_patches_from_snapshot_payload(
     injections = plan.get("injections") or ()
     boundary_classes = plan.get("boundary_classes") or {}
     boundary_types = plan.get("boundary_types") or {}
+    boundary_forwards = plan.get("boundary_forwards") or {}
     param_plan = plan.get("param_plan") or {}
     local_computes, inner_wrappers = [], []
     for injection in injections:
@@ -58,6 +66,7 @@ def emission_patches_from_snapshot_payload(
             boundary_types,
             replacement_types,
             param_plan,
+            boundary_forwards,
         )
         if local is not None:
             local_computes.append(local)
@@ -77,6 +86,7 @@ def _injection_patches(
     boundary_types: dict[str, Any],
     replacement_types: dict[str, str],
     param_plan: dict[str, Any],
+    boundary_forwards: dict[str, str],
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
     """Translate one resolved injection into source-emission patches."""
     module_fqn = injection.get("match")
@@ -89,7 +99,9 @@ def _injection_patches(
     observed_type = boundary_types.get(module_fqn)
     if source_type is None and _is_remote_boundary_type(observed_type):
         source_type = observed_type
-    bound_forward = _bound_forward_identity(source, module_fqn)
+    # Suffix matching cannot distinguish backbone.mlp from draft.mlp. Prefer
+    # the actual per-instance binding observed before distributed application.
+    bound_forward = boundary_forwards.get(module_fqn) or _bound_forward_identity(source, module_fqn)
     local = _local_compute_patch(
         injection,
         source,
