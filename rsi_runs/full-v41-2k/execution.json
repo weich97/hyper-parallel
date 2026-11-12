@@ -1,4 +1,4 @@
 {
-  "use_fused_ops": false,
-  "use_fused_attention": true
+  "use_fused_ops": true,
+  "use_fused_attention": false
 }
