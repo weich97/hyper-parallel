@@ -40,8 +40,8 @@ runtime-semantic deltas to revisit):
 
 * Draft attention lets every draft position attend the sliding
   ``dspark_window`` of backbone-projected KV entries only; intra-block
-  draft-to-draft KV visibility is omitted and left to the Markov head, which
-  matches the report's division of labor for draft-token dependencies.
+  draft-to-draft KV visibility is omitted. This does not reproduce the
+  released attention contract; the Markov head is a separate computation.
 * The published FP4/FP8 ``.scale`` companions are not materialized; the crop
   trains in BF16 like the rest of the validation model.
 """
@@ -55,6 +55,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 
@@ -115,7 +116,14 @@ class DSparkMarkovHead(nn.Module):
         self.head = nn.Linear(markov_rank, vocab_size, bias=False)
 
     def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the vocabulary bias and the rank-space embedding."""
+        """Return the vocabulary bias and the rank-space embedding.
+
+        Args:
+            token_ids: Ground-truth previous token for each draft offset.
+
+        Returns:
+            Vocabulary bias and low-rank token features.
+        """
         embedded = self.embed(token_ids)
         return self.head(embedded), embedded
 
@@ -129,7 +137,15 @@ class DSparkConfidenceHead(nn.Module):
         self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
 
     def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        """Return per-position confidence logits in FP32."""
+        """Return per-position confidence logits in FP32.
+
+        Args:
+            hidden: Unnormalized features from the collapsed residual streams.
+            markov_embed: Low-rank features of the previous token.
+
+        Returns:
+            Confidence logits for each draft position.
+        """
         joined = torch.cat([hidden, markov_embed], dim=-1)
         return self.proj(joined.float()).squeeze(-1)
 
@@ -398,8 +414,8 @@ class _DSparkHcCoefficients(nn.Module):
         self.hc_mult = int(config.hc_mult)
         self.hc_sinkhorn_iters = int(config.hc_sinkhorn_iters)
         self.hc_eps = float(config.hc_eps)
+        self.norm_eps = float(config.rms_norm_eps)
         mix = (self.hc_mult + 2) * self.hc_mult
-        self.input_norm = nn.RMSNorm(self.hc_mult * config.hidden_size, eps=config.rms_norm_eps)
         self.fn = nn.Parameter(
             torch.randn(mix, self.hc_mult * config.hidden_size) * float(config.initializer_range)
         )
@@ -407,11 +423,20 @@ class _DSparkHcCoefficients(nn.Module):
         self.scale = nn.Parameter(torch.ones(3))
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Produce pre/post/combine coefficients for the next sublayers."""
-        from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps  # pylint: disable=C0415
+        """Produce pre/post/combine coefficients for the next sublayers.
 
-        flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+        Args:
+            hidden_streams: Residual streams with trailing stream and hidden dimensions.
+
+        Returns:
+            Input-collapse, output-expansion and residual-mixing coefficients.
+        """
+        # The released coefficient path has no trainable RMSNorm weight. Keep its
+        # statistic epsilon separate from the Sinkhorn/coefficient epsilon.
+        flattened = hidden_streams.flatten(start_dim=2).float()
+        inverse_rms = torch.rsqrt(flattened.square().mean(-1, keepdim=True) + self.norm_eps)
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
+        mix = mix * inverse_rms
         streams = self.hc_mult
         pre, post, comb = mix.split([streams, streams, streams * streams], dim=-1)
         pre_bias, post_bias, comb_bias = self.base.split([streams, streams, streams * streams])
@@ -449,9 +474,8 @@ class DeepseekV41DSpark(nn.Module):
         depth = int(config.v41_dspark_depth)
         self.stages = nn.ModuleList(DSparkStage(config, mlp_factory) for _ in range(depth))
         # v1 deviation (recorded): the released checkpoint feeds the noise
-        # placeholder through the tied backbone embedding row; a drafter-owned
-        # vector is training-equivalent and avoids sharded-embedding lookups
-        # from the frozen tied table.
+        # placeholder through the tied backbone embedding row. This independent
+        # trainable vector differs from that frozen, shared embedding contract.
         # An all-zero noise vector puts zero vectors through the stage
         # RMSNorms, whose backward scales like 1/sqrt(eps) and compounds
         # across stages into overflow-level gradients.
@@ -565,10 +589,10 @@ class DeepseekV41DSpark(nn.Module):
             merged = (pre_mix_in.unsqueeze(-1)
                       * streams_in.reshape(batch, seq * block, self.hc_mult, -1).float())
             merged = merged.sum(dim=2).to(streams_in.dtype).view(batch, seq, block, -1)
-            return self.norm(merged)
+            return merged
 
-        # The fp32 merge buffer otherwise stays resident for the norm
-        # backward; recomputing it is cheap and communication-free.
+        # The FP32 merge buffer otherwise stays resident for backward;
+        # recomputing it is cheap and communication-free.
         if gradient_active:
             hidden_out = _checkpoint(_collapse, streams, pre_mix)
         else:
@@ -610,7 +634,11 @@ class DeepseekV41DSpark(nn.Module):
 
         def _chunk_objective(hidden_chunk, markov_chunk, target_chunk):
             markov_bias, markov_embed = self.markov_head(markov_chunk)
-            logits = functional.linear(hidden_chunk, head_weight) + markov_bias  # pylint: disable=not-callable
+            # Only vocabulary projection uses the final RMSNorm. The confidence
+            # head consumes the unnormalized merged features in the release.
+            logits = functional.linear(  # pylint: disable=not-callable
+                self.norm(hidden_chunk), head_weight,
+            ) + markov_bias
             chunk_mask = target_chunk != IGNORE_INDEX
             ce_sum = functional.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]).float(),

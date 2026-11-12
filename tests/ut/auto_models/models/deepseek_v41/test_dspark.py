@@ -35,7 +35,7 @@ from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, _DSparkHcCoefficients
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
 
 
@@ -127,6 +127,80 @@ def _flash_v3_torch_reference(query, key, value, sink, mask, query_lengths, kv_l
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_hc_coefficients_use_unweighted_published_normalization(self) -> None:
+        """Feature: Published DSpark hyper-connection normalization.
+
+        Description: Compare coefficients and gradients with the FP32 projection/RMS formula.
+        Expectation: The norm uses norm epsilon and has no additional trainable affine weight.
+        """
+        for epsilon in (1.0e-6, 1.0e-20):
+            with self.subTest(epsilon=epsilon):
+                config = _small_config()
+                config.rms_norm_eps = epsilon
+                module = _DSparkHcCoefficients(config)
+                generator = torch.Generator().manual_seed(31)
+                hidden = (torch.randn(2, 3, config.hc_mult, config.hidden_size, generator=generator)
+                          * 1.0e-4).requires_grad_()
+                reference = hidden.detach().clone().requires_grad_()
+                weight = module.get_parameter("fn").detach().clone().requires_grad_()
+                flat = reference.flatten(2)
+                projected = (flat @ weight.T) / (flat.square().mean(-1, keepdim=True) + epsilon).sqrt()
+                expected_pre = projected[..., :config.hc_mult].sigmoid() + config.hc_eps
+                expected_post = 2 * projected[..., config.hc_mult:2 * config.hc_mult].sigmoid()
+                actual_pre, actual_post, _ = module(hidden)
+                torch.testing.assert_close(actual_pre, expected_pre, rtol=1.0e-6, atol=1.0e-7)
+                torch.testing.assert_close(actual_post, expected_post, rtol=1.0e-6, atol=1.0e-7)
+                (actual_pre.square().sum() + actual_post.square().sum()).backward()
+                (expected_pre.square().sum() + expected_post.square().sum()).backward()
+                torch.testing.assert_close(hidden.grad, reference.grad, rtol=2.0e-4, atol=2.0e-4)
+                torch.testing.assert_close(module.fn.grad, weight.grad, rtol=2.0e-4, atol=2.0e-5)
+                self.assertEqual(set(dict(module.named_parameters())), {"fn", "base", "scale"})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_confidence_reads_features_before_output_normalization(self) -> None:
+        """Feature: Separate vocabulary and confidence feature branches.
+
+        Description: Observe a full drafter call and backpropagate confidence loss alone.
+        Expectation: Confidence receives the raw merged stream and never trains output RMSNorm.
+        """
+        config = _small_config()
+        dspark, head = _build(config)
+        with torch.no_grad():
+            dspark.norm.weight.copy_(torch.linspace(0.5, 2.0, config.hidden_size))
+        stage_outputs, confidence_inputs = [], []
+
+        def _record_stage(_module, _inputs, output):
+            """Keep the final residual streams without retaining their autograd graph."""
+            stage_outputs.append(tuple(value.detach().clone() for value in output))
+
+        def _record_confidence(_module, inputs):
+            """Observe the actual confidence-head features across objective chunks."""
+            confidence_inputs.append(inputs[0].detach().clone())
+
+        handles = [dspark.stages[-1].register_forward_hook(_record_stage),
+                   dspark.confidence_head.register_forward_pre_hook(_record_confidence)]
+        ids, labels, hiddens, embeds = _batch(config)
+        try:
+            with patch("hyper_parallel.models.deepseek_v41.dspark.functional.cross_entropy",
+                       side_effect=lambda logits, *args, **kwargs: logits.sum() * 0.0):
+                loss, _ = dspark(hiddens, ids, labels, embeds, head)
+                loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+        streams, pre_mix = stage_outputs[-1]
+        expected = (streams.reshape(ids.shape[0], -1, config.hc_mult, config.hidden_size).float()
+                    * pre_mix.unsqueeze(-1)).sum(2).to(streams.dtype)
+        expected = expected.view(ids.shape[0], ids.shape[1], config.v41_dspark_block_size, config.hidden_size)
+        torch.testing.assert_close(torch.cat(confidence_inputs, dim=1), expected, rtol=0, atol=0)
+        torch.testing.assert_close(dspark.norm.weight.grad, torch.zeros_like(dspark.norm.weight), rtol=0, atol=0)
+        self.assertGreater(dspark.confidence_head.proj.weight.grad.abs().sum().item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_initialization_preserves_logical_weights_across_shards_and_replicas(self):
         """Initialize the same global parameters under replicated and uneven layouts.
 
@@ -169,8 +243,14 @@ class DSparkComponentTest(unittest.TestCase):
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0,
                                                    msg=f"Parameter {name}, shards={shards}, rank={rank}")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_attention_query_tiles_keep_cross_tile_causal_context(self):
-        """Compare full drafter loss and gradients with an uneven query tiling."""
+        """Feature: Query chunking.
+
+        Description: Compare full drafter loss and gradients with an uneven query tiling.
+        Expectation: Loss and every parameter gradient match the unchunked reference.
+        """
         config = _small_config()
         reference, head = _build(config)
         config.v41_dspark_attention_chunk_size = 3
@@ -184,8 +264,14 @@ class DSparkComponentTest(unittest.TestCase):
         for (name, left), (_, right) in zip(reference.named_parameters(), candidate.named_parameters(), strict=True):
             torch.testing.assert_close(right.grad, left.grad, rtol=2.0e-5, atol=1.0e-7, msg=name)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_flash_attention_adapter_preserves_draft_offsets_and_gradients(self):
-        """Validate batch isolation and nonzero tile starts against full reference attention."""
+        """Feature: Native attention adapter.
+
+        Description: Validate batch isolation and nonzero tile starts against full reference attention.
+        Expectation: Offset, batch and gradient results match the portable reference.
+        """
         for chunk in (0, 3):
             with self.subTest(chunk=chunk):
                 config = _small_config()
@@ -206,8 +292,14 @@ class DSparkComponentTest(unittest.TestCase):
                         reference.named_parameters(), candidate.named_parameters(), strict=True):
                     torch.testing.assert_close(right.grad, left.grad, rtol=3.0e-5, atol=1.0e-7, msg=name)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_produces_finite_losses_and_metrics(self):
-        """A full forward returns finite loss values and metric entries."""
+        """Feature: Drafter forward contract.
+
+        Description: A full forward returns finite loss values and metric entries.
+        Expectation: All declared loss and metric entries are present and finite.
+        """
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
@@ -218,8 +310,14 @@ class DSparkComponentTest(unittest.TestCase):
             self.assertIn(name, metrics, f"missing metric {name}")
             self.assertTrue(torch.isfinite(metrics[name].float()).item(), f"{name} must be finite")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_requires_detached_target_hiddens(self):
-        """Grad-carrying backbone hiddens are rejected up front."""
+        """Feature: Backbone gradient isolation.
+
+        Description: Grad-carrying backbone hiddens are rejected up front.
+        Expectation: Gradient-carrying target features raise a descriptive error.
+        """
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
@@ -227,8 +325,14 @@ class DSparkComponentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "detached"):
             dspark(targets, input_ids, labels, embeds, head)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_gradients_stay_inside_the_drafter(self):
-        """The DSpark objective must not reach tied backbone surfaces."""
+        """Feature: Drafter parameter ownership.
+
+        Description: The DSpark objective must not reach tied backbone surfaces.
+        Expectation: Drafter components receive gradients while the tied backbone head remains frozen.
+        """
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
@@ -243,8 +347,14 @@ class DSparkComponentTest(unittest.TestCase):
         self.assertTrue(any(name.startswith("confidence_head") for name in touched))
         self.assertTrue(any(name == "noise_embedding" for name in touched))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_supervised_targets_align_with_future_tokens(self):
-        """Draft offset j at position t must supervise the token at t+1+j."""
+        """Feature: Configured teacher-forcing alignment.
+
+        Description: Draft offset j at position t must supervise the token at t+1+j.
+        Expectation: Only in-range future tokens contribute to the supervision count.
+        """
         config = _small_config()
         config.v41_dspark_block_size = 2
         dspark, head = _build(config)
@@ -258,8 +368,14 @@ class DSparkComponentTest(unittest.TestCase):
         # t+2 (four valid positions); the padded tail carries IGNORE_INDEX.
         self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 1) + (seq - 2))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shifted_labels_keep_targets_from_input_ids(self):
-        """Pre-shifted trainer labels must only mask, never shift the targets.
+        """Feature: Trainer label masking.
+
+        Description: Pre-shifted trainer labels must only mask, never shift the targets.
+        Expectation: Cross-entropy targets use input token values with the declared shifted label mask.
+
 
         The trainer hands labels over already shifted (labels[t] supervises
         input_ids[t + 1]); gathering them as target values would move the
@@ -295,8 +411,14 @@ class DSparkComponentTest(unittest.TestCase):
                         msg=f"draft targets misaligned: {got.tolist()}")
         self.assertEqual(int(metrics["dspark_supervised_tokens"]), 9)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_markov_head_biases_the_draft_logits(self):
-        """Zeroing the Markov head must change the draft cross-entropy."""
+        """Feature: Markov-head engagement.
+
+        Description: Zeroing the Markov head must change the draft cross-entropy.
+        Expectation: Removing the Markov bias changes draft cross-entropy.
+        """
         config = _small_config()
         dspark, head = _build(config)
         input_ids, labels, targets, embeds = _batch(config)
@@ -307,8 +429,14 @@ class DSparkComponentTest(unittest.TestCase):
         self.assertNotAlmostEqual(float(baseline), float(ablated), places=6,
                                   msg="Markov bias must influence the draft objective")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_none_labels_supervise_from_input_ids(self):
-        """Without labels the drafter supervises all next tokens."""
+        """Feature: Unmasked draft objective.
+
+        Description: Without labels the drafter supervises all next tokens.
+        Expectation: Missing labels retain all valid future-token targets.
+        """
         config = _small_config()
         config.v41_dspark_block_size = 2
         dspark, head = _build(config)
@@ -319,8 +447,14 @@ class DSparkComponentTest(unittest.TestCase):
         _, metrics = dspark(targets, input_ids, None, embeds, head)
         self.assertEqual(int(metrics["dspark_supervised_tokens"]), (seq - 1) + (seq - 2))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_zero_depth_configuration_is_rejected(self):
-        """Constructing with no stages/targets is a configuration error."""
+        """Feature: Drafter construction validation.
+
+        Description: Constructing with no stages/targets is a configuration error.
+        Expectation: An invalid direct drafter configuration fails before execution.
+        """
         config = _small_config()
         config.v41_dspark_block_size = 0
         with self.assertRaises(ValueError):
@@ -471,6 +605,8 @@ _DRAFTER_RENAMES = {
     "hc_ffn_base": "stages.N.ffn_hc.base",
     "hc_ffn_fn": "stages.N.ffn_hc.fn",
     "hc_ffn_scale": "stages.N.ffn_hc.scale",
+    "attn_norm.weight": "stages.N.input_layernorm.weight",
+    "ffn_norm.weight": "stages.N.post_attention_layernorm.weight",
     "attn.attn_sink": "stages.N.self_attn.attn_sink",
     "attn.kv_norm.weight": "stages.N.self_attn.kv_norm.weight",
     "attn.q_norm.weight": "stages.N.self_attn.q_norm.weight",
@@ -498,18 +634,12 @@ _RELEASED_ONLY = {
     # The release stores 128 experts per stage separately; the crop MoE packs
     # them into two grouped tensors.
     "ffn.experts.N.w1.weight", "ffn.experts.N.w2.weight", "ffn.experts.N.w3.weight",
-    # One RMSNorm per sublayer here lives inside the hyper-connection module,
-    # so the stage exposes two norms the release keeps flat.
-    "attn_norm.weight", "ffn_norm.weight",
 }
 
 # Ours with no counterpart in the released weights, and why.
 _OURS_ONLY = {
     # Grouped expert tensors, see above.
     "stages.N.mlp.experts.gate_up_proj", "stages.N.mlp.experts.down_proj",
-    # The hyper-connection sublayer norms and the stage norms.
-    "stages.N.attn_hc.input_norm.weight", "stages.N.ffn_hc.input_norm.weight",
-    "stages.N.input_layernorm.weight", "stages.N.post_attention_layernorm.weight",
     # The release fills draft slots from the embedding of dspark_noise_token_id;
     # this implementation learns a dedicated vector instead.
     "noise_embedding",
@@ -540,8 +670,14 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
             return {re.sub(r"\.\d+\.", ".N.", name)
                     for name, _ in model.dspark.named_parameters()}
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_every_released_name_is_accounted_for(self):
-        """No released parameter family is silently missing."""
+        """Feature: Released parameter inventory.
+
+        Description: No released parameter family is silently missing.
+        Expectation: Every released leaf maps to a local parameter or an explicit remaining difference.
+        """
         ours = self._drafter_leaves()
         for released in sorted(_RELEASED_DRAFTER_LEAVES):
             with self.subTest(released=released):
@@ -549,14 +685,26 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
                     continue
                 self.assertIn(_DRAFTER_RENAMES[released], ours)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_no_undocumented_parameters_here(self):
-        """Anything we add beyond the released layout stays documented."""
+        """Feature: Local parameter inventory.
+
+        Description: Anything we add beyond the released layout stays documented.
+        Expectation: All additional local parameters have a recorded correspondence or difference.
+        """
         ours = self._drafter_leaves()
         mapped = set(_DRAFTER_RENAMES.values())
         self.assertEqual(sorted(ours - mapped - _OURS_ONLY), [])
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_hyperparameters_match_the_release(self):
-        """Depth, block width, expert counts and the noise token come from the release."""
+        """Feature: Released drafter configuration.
+
+        Description: Depth, block width, expert counts and the noise token come from the release.
+        Expectation: Depth, block width, expert configuration and noise token match the fixture.
+        """
         with tempfile.TemporaryDirectory() as directory:
             config_path = _write_released_config(directory)
             released = json.loads(config_path.read_text(encoding="utf-8"))["text_config"]
@@ -589,30 +737,54 @@ class TestDSparkCropSwitches(unittest.TestCase):
             return build_deepseek_v41_validation_config(
                 str(config_path.parent), str(assets), **kwargs)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_drafter_is_off_by_default(self):
-        """No drafter parameters are requested unless depth is positive."""
+        """Feature: Optional drafter configuration.
+
+        Description: No drafter parameters are requested unless depth is positive.
+        Expectation: The default configuration does not enable drafter parameters.
+        """
         config = self._build()
         self.assertEqual(config.v41_dspark_depth, 0)
         self.assertEqual(config.v41_dspark_target_layer_ids, [])
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_attention_backend_is_explicit_and_validated(self):
-        """Keep the reference default and reject unrecognized native backends."""
+        """Feature: Attention backend selection.
+
+        Description: Keep the reference default and reject unrecognized native backends.
+        Expectation: Supported backends are retained and unknown names are rejected.
+        """
         self.assertEqual(self._build().v41_dspark_attention_backend, "reference")
         config = self._build(dspark_depth=1, dspark_attention_backend="flash_v3")
         self.assertEqual(config.v41_dspark_attention_backend, "flash_v3")
         with self.assertRaisesRegex(ValueError, "dspark_attention_backend"):
             self._build(dspark_depth=1, dspark_attention_backend="typo")
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_depth_populates_the_released_layout(self):
-        """A positive depth targets the last three layers, as released."""
+        """Feature: Drafter target defaults.
+
+        Description: A positive depth targets the last three layers, as released.
+        Expectation: Positive depth selects the expected final backbone layers.
+        """
         config = self._build(dspark_depth=1)
         self.assertEqual(config.v41_dspark_depth, 1)
         self.assertEqual(config.v41_dspark_target_layer_ids, [37, 38, 39])
         self.assertEqual(config.v41_dspark_window, 128)
         self.assertLessEqual(config.v41_dspark_top_k, config.v41_dspark_n_routed_experts)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_model_builds_the_drafter_only_when_depth_is_positive(self):
-        """The config field must actually reach the model, not just the config.
+        """Feature: Model component construction.
+
+        Description: The config field must actually reach the model, not just the config.
+        Expectation: The model contains a drafter exactly when the configuration enables one.
+
 
         A run with the drafter silently absent looks like a run with the
         drafter present but ineffective, so assert the object exists.
@@ -632,8 +804,14 @@ class TestDSparkCropSwitches(unittest.TestCase):
         self.assertIsInstance(on.dspark, DeepseekV41DSpark)
         self.assertGreater(on.dspark_loss_coeff, 0.0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_explicit_targets_override_the_default(self):
-        """Callers can point the drafter at other backbone layers."""
+        """Feature: Explicit backbone feature taps.
+
+        Description: Callers can point the drafter at other backbone layers.
+        Expectation: User-specified target layers replace the default target set.
+        """
         config = self._build(dspark_depth=1, dspark_target_layer_ids=[10, 11])
         self.assertEqual(config.v41_dspark_target_layer_ids, [10, 11])
 
@@ -646,6 +824,8 @@ if __name__ == "__main__":
 class TestHFLayerCropConfig(unittest.TestCase):
     """Exercise the real config helpers after upstream crop API changes."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_released_engram_assets_preserve_table_shapes(self) -> None:
         """Feature: HF prefix crop with Engram.
 
@@ -679,6 +859,8 @@ class TestHFLayerCropConfig(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "Released Engram assets"):
                         build_layer_cropped_config(source, destination, text_layers=2, engram_assets_path=str(path))
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_retained_engram_requires_released_assets(self) -> None:
         """Feature: HF prefix crop with Engram.
 

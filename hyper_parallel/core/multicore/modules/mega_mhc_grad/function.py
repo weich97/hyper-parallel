@@ -172,7 +172,8 @@ def hyper_mega_mhc_grad(
         norm_weight: RMSNorm weight.
         cache: Forward intermediates required by the backward kernel.
         hc_eps: RMSNorm epsilon.
-        token_tile: Number of tokens assigned to each AIV task.
+        token_tile: Number of tokens assigned to each AIV task. Global deterministic
+            mode overrides this with one full-token tile to order parameter reductions.
 
     Returns:
         Gradients for the five block inputs and four trainable tensors.
@@ -188,6 +189,10 @@ def hyper_mega_mhc_grad(
     )
     leading_shape, hidden_size = residual.shape[:-2], residual.shape[-1]
     token_count = residual.numel() // (4 * hidden_size)
+    # Multiple tasks atomically accumulate shared parameter gradients in scheduling
+    # order. A single task removes that source of variation, at a performance cost.
+    if torch.are_deterministic_algorithms_enabled():
+        token_tile = token_count
     plan = _get_plan_for_shape(token_count, hidden_size, residual.device, token_tile)
     events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
     kernel_inputs = (

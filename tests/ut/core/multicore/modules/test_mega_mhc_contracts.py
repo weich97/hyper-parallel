@@ -266,3 +266,37 @@ class TestMegaMhcInvocationState(unittest.TestCase):
         Expectation: No counter clearing can corrupt another in-flight invocation.
         """
         self._check_invocation_buffers(backward=True)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_backward_honors_global_deterministic_mode(self) -> None:
+        """Feature: Deterministic native parameter-gradient accumulation.
+
+        Description: Toggle PyTorch determinism through the public backward entry.
+        Expectation: Determinism uses one reduction tile; disabling it restores the requested tile.
+        """
+        function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_mhc_grad.function")
+        inputs, cache = _make_inputs(), _make_cache()
+        plan = SimpleNamespace(runtime=SimpleNamespace(runtime_config=object(), is_active=False), event_capacity=1024)
+        native_outputs = (inputs[1], inputs[5], inputs[6], inputs[7], inputs[0],
+                          inputs[2], inputs[3], inputs[4], inputs[8])
+        original_mode = torch.are_deterministic_algorithms_enabled()
+        original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        try:
+            with (
+                patch.object(function, "validate_mega_mhc_native_inputs"),
+                patch.object(function, "_resolve_core_counts", return_value=(20, 40)),
+                patch.object(function, "_get_cached_plan", return_value=plan) as get_plan,
+                patch.object(torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True),
+                patch.object(function.multicore_ops, "hyper_mega_mhc_grad", return_value=native_outputs),
+            ):
+                for enabled, warn_only, expected_tile in ((False, False, 32), (True, False, 40),
+                                                          (True, True, 40), (False, False, 32)):
+                    with self.subTest(enabled=enabled, warn_only=warn_only):
+                        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+                        outputs = function.hyper_mega_mhc_grad(*_make_gradients(), *inputs, cache, token_tile=32)
+                        self.assertEqual(get_plan.call_args.args, (40, 128, 0, 20, 40, expected_tile))
+                        for output, expected in zip(outputs, inputs, strict=True):
+                            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        finally:
+            torch.use_deterministic_algorithms(original_mode, warn_only=original_warn_only)

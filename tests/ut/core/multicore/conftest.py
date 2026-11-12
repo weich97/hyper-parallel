@@ -14,6 +14,7 @@
 # ============================================================================
 """Allow multicore Host unit tests to collect without an installed NPU backend."""
 
+import importlib.machinery
 import importlib.util
 import sys
 from types import ModuleType
@@ -39,7 +40,11 @@ def pytest_configure(config: pytest.Config) -> None:
     if "torch_npu" in sys.modules or importlib.util.find_spec("torch_npu") is not None:
         return
     backend = ModuleType("torch_npu")
+    backend.__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
     npu = ModuleType("torch.npu")
+    # Model tests may collect in the same session; the placeholder is not an
+    # available accelerator even though the optional module can now be imported.
+    npu.is_available = lambda: False
     for name in ("synchronize", "current_device", "current_stream", "Event", "Stream", "stream", "get_device_name",
                  "get_device_limit", "is_current_stream_capturing"):
         setattr(npu, name, mock.Mock(side_effect=_unmocked_npu_call))
