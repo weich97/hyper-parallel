@@ -37,6 +37,7 @@ from hyper_parallel import DeviceMesh, Replicate, Shard, init_empty_weights
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
 from hyper_parallel.models.deepseek_v41.dspark import (
     DeepseekV41DSpark, DSparkTokenEmbedding, _DSparkHcCoefficients,
@@ -566,6 +567,43 @@ class DSparkComponentTest(unittest.TestCase):
                         actual = candidate.get_parameter(name).to_local()
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0,
                                                    msg=f"Parameter {name}, shards={shards}, rank={rank}")
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_model_initialization_reaches_drafter_parameter_owners(self) -> None:
+        """Feature: DSpark initialization through the native model lifecycle.
+
+        Description: Materialize a meta model whose drafter has no direct parameters.
+        Expectation: Native initialization fills every bare coefficient and attention sink.
+        """
+        config = _config()
+        for name, value in vars(_small_config()).items():
+            if name.startswith("v41_dspark_"):
+                setattr(config, name, value)
+        config.v41_dspark_depth = 2
+        config.v41_dspark_noise_token_id = config.vocab_size - 1
+        config.v41_dspark_target_layer_ids = [0]
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                   mock_open(read_data='{"layer_ids": []}')), init_empty_weights():
+            model = DeepseekV41ForCausalLM(config)
+        model.to_empty(device="cpu")
+        with torch.no_grad():
+            for parameter in model.dspark.parameters():
+                parameter.fill_(float("nan"))
+        self.assertEqual(list(model.dspark.parameters(recurse=False)), [])
+
+        _initialize_model_weights(model)
+
+        for index, stage in enumerate(model.dspark.stages):
+            for owner, seed in ((stage.attn_hc, 0x44530100 + index),
+                                (stage.ffn_hc, 0x44530200 + index)):
+                expected = torch.randn(owner.fn.shape, generator=torch.Generator().manual_seed(seed))
+                expected = expected * config.initializer_range
+                torch.testing.assert_close(owner.fn, expected, rtol=0, atol=0)
+                torch.testing.assert_close(owner.base, torch.zeros_like(owner.base), rtol=0, atol=0)
+                torch.testing.assert_close(owner.scale, torch.ones_like(owner.scale), rtol=0, atol=0)
+            torch.testing.assert_close(stage.self_attn.attn_sink, torch.zeros_like(stage.self_attn.attn_sink),
+                                       rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

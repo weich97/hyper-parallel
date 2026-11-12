@@ -382,17 +382,18 @@ class DSparkDraftAttention(nn.Module):
 class DSparkStage(nn.Module):
     """One trainable DSpark Transformer stage with pipelined-mHC semantics."""
 
-    def __init__(self, config: Any, mlp_factory: Any) -> None:
+    def __init__(self, config: Any, mlp_factory: Any, stage_index: int = 0) -> None:
         """Create the stage from the shared crop configuration.
 
         Args:
             config: Crop configuration carrying ``v41_dspark_*`` fields.
             mlp_factory: Zero-argument callable building the stage MoE FFN.
+            stage_index: Stable logical index used for layout-independent initialization.
         """
         super().__init__()
         self.hc_mult = int(config.hc_mult)
-        self.attn_hc = _DSparkHcCoefficients(config)
-        self.ffn_hc = _DSparkHcCoefficients(config)
+        self.attn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530100 + stage_index)
+        self.ffn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530200 + stage_index)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = DSparkDraftAttention(config)
@@ -487,9 +488,10 @@ class DSparkStage(nn.Module):
 class _DSparkHcCoefficients(nn.Module):
     """Parameter-owning pipelined-mHC coefficient module for DSpark stages."""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, initialization_seed: int = 0x44530100) -> None:
         """Create the ``fn/base/scale`` coefficient layout."""
         super().__init__()
+        self.initialization_seed = initialization_seed
         self.hc_mult = int(config.hc_mult)
         self.hc_sinkhorn_iters = int(config.hc_sinkhorn_iters)
         self.hc_eps = float(config.hc_eps)
@@ -500,6 +502,25 @@ class _DSparkHcCoefficients(nn.Module):
         )
         self.base = nn.Parameter(torch.zeros(mix))
         self.scale = nn.Parameter(torch.ones(3))
+
+    @torch.no_grad()
+    def init_weights(self, std: float) -> None:
+        """Initialize logical weights on the parameter owner after meta materialization.
+
+        Args:
+            std: Standard deviation of the canonical full FP32 random draw.
+        """
+        target = self.fn.to_local() if isinstance(self.fn, DTensor) else self.fn
+        generator = torch.Generator().manual_seed(self.initialization_seed)
+        values = torch.randn(self.fn.shape, generator=generator, device="cpu") * std
+        values = values.to(target.device, target.dtype)
+        if isinstance(self.fn, DTensor):
+            values = distribute_tensor(values, self.fn.device_mesh, self.fn.placements).to_local()
+        target.copy_(values)
+        base = self.base.to_local() if isinstance(self.base, DTensor) else self.base
+        scale = self.scale.to_local() if isinstance(self.scale, DTensor) else self.scale
+        base.zero_()
+        scale.fill_(1.0)
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Produce pre/post/combine coefficients for the next sublayers.
@@ -555,7 +576,7 @@ class DeepseekV41DSpark(nn.Module):
         self.main_proj = nn.Linear(hidden * self.num_targets, hidden, bias=False)
         self.main_norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         depth = int(config.v41_dspark_depth)
-        self.stages = nn.ModuleList(DSparkStage(config, mlp_factory) for _ in range(depth))
+        self.stages = nn.ModuleList(DSparkStage(config, mlp_factory, index) for index in range(depth))
         self.norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(int(config.vocab_size), int(config.v41_dspark_markov_rank))
         self.confidence_head = DSparkConfidenceHead(hidden + int(config.v41_dspark_markov_rank))
@@ -601,28 +622,11 @@ class DeepseekV41DSpark(nn.Module):
         Args:
             std: Backbone initializer range for the random draws.
         """
-        def _local(parameter: torch.Tensor) -> torch.Tensor:
-            return parameter.to_local() if hasattr(parameter, "to_local") else parameter
-
-        def _fill(parameter: torch.Tensor, seed: int) -> None:
-            target = _local(parameter)
-            generator = torch.Generator().manual_seed(seed)
-            values = torch.randn(parameter.shape, generator=generator, device="cpu") * std
-            values = values.to(target.device, target.dtype)
-            if isinstance(parameter, DTensor):
-                values = distribute_tensor(values, parameter.device_mesh, parameter.placements).to_local()
+        for stage in self.stages:
+            stage.attn_hc.init_weights(std)
+            stage.ffn_hc.init_weights(std)
             with torch.no_grad():
-                target.copy_(values)
-
-        for index, stage in enumerate(self.stages):
-            _fill(stage.attn_hc.fn, 0x44530100 + index)
-            _fill(stage.ffn_hc.fn, 0x44530200 + index)
-            with torch.no_grad():
-                _local(stage.attn_hc.base).zero_()
-                _local(stage.ffn_hc.base).zero_()
-                _local(stage.attn_hc.scale).fill_(1.0)
-                _local(stage.ffn_hc.scale).fill_(1.0)
-                _local(stage.self_attn.attn_sink).zero_()
+                stage.self_attn.attn_sink.zero_()
 
     def _teacher_forced_targets(self, input_ids, labels, token_mask, sequence_boundaries):
         """Align the released decode inputs and targets without crossing document or image spans."""

@@ -53,7 +53,9 @@ from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     sequence_load_balancing_loss,
     update_modality_bias,
 )
-from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark, DSparkTokenEmbedding
+from hyper_parallel.models.deepseek_v41.dspark import (
+    DeepseekV41DSpark, DSparkDraftAttention, DSparkTokenEmbedding, _DSparkHcCoefficients,
+)
 # pylint: disable=unused-import
 from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
     SharedCompressedAttentionCPContext as SharedAttentionCPContext,
@@ -608,8 +610,12 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         nn.init.normal_(module.fn, mean=0.0, std=std)
         module.base.zero_()
         module.scale.fill_(1.0)
-    elif isinstance(module, DeepseekV41DSpark):
+    elif isinstance(module, _DSparkHcCoefficients):
+        # HF custom-model initialization skips parameter-free containers.
+        # Initialize bare tensors at their owning modules instead.
         module.init_weights(std)
+    elif isinstance(module, DSparkDraftAttention):
+        module.attn_sink.zero_()
 
 
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
