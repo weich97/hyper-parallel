@@ -48,6 +48,7 @@ from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
 from hyper_parallel.components.modules.mhc import PipelinedMhcModule, pipelined_mhc_post
 from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
+from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import (
     accumulate_router_load,
     sequence_load_balancing_loss,
@@ -1416,8 +1417,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
         Args:
             input_ids: Input token ids forwarded to the V4 causal LM.
-            labels: Supervised labels; DSpark runs only when present.
-            **kwargs: Remaining Transformers forward arguments.
+            labels: Unshifted supervised labels, or text labels accompanied by
+                the explicit ``shift_labels`` forward argument.
+            **kwargs: Remaining Transformers forward arguments. ``shift_labels``
+                takes precedence for both the backbone and drafter objectives.
 
         Returns:
             The causal-LM output with the DSpark objective folded into
@@ -1430,8 +1433,14 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             targets = getattr(self.model, "dspark_target_hiddens", None)
             if not targets:
                 raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
+            # Omni labels are unshifted, while TextParallelBatch supplies an
+            # explicit shifted surface. Match the backbone loss convention so
+            # an ignored padding target cannot inherit its predecessor's mask.
+            dspark_labels = kwargs.get("shift_labels")
+            if dspark_labels is None and labels is not None:
+                dspark_labels = functional.pad(labels[..., 1:], (0, 1), value=IGNORE_INDEX)
             dspark_loss, dspark_metrics = self.dspark(
-                targets, input_ids, labels, self.model.dspark_inputs_embeds, self.lm_head,
+                targets, input_ids, dspark_labels, self.model.dspark_inputs_embeds, self.lm_head,
                 noise_embedding=self.model.dspark_noise_embedding,
                 token_mask=self.model.dspark_token_mask,
                 sequence_boundaries=self.model.dspark_sequence_boundaries,

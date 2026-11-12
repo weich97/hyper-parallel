@@ -690,9 +690,10 @@ class DeepseekV41DSpark(nn.Module):
             target_hiddens: Detached collapsed backbone hiddens, one per
                 configured target layer, each ``[batch, seq, hidden]``.
             input_ids: ``[batch, seq]`` backbone input tokens.
-            labels: Optional ``[batch, seq]`` supervised labels with
-                ``IGNORE_INDEX`` holes; ``None`` supervises every position
-                from ``input_ids`` (full LM-draft objective).
+            labels: Optional ``[batch, seq]`` next-token-shifted labels with
+                ``IGNORE_INDEX`` holes. The causal-LM entry point normalizes
+                unshifted Omni labels before this boundary. ``None`` supervises
+                every valid future token from ``input_ids``.
             inputs_embeds: Detached token embeddings before visual feature injection.
             lm_head: Backbone output head tied into the drafter.
             noise_embedding: Detached backbone embedding row of the configured noise token.

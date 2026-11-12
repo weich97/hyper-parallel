@@ -277,6 +277,55 @@ class DSparkComponentTest(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_causal_lm_normalizes_omni_and_text_supervision_masks(self) -> None:
+        """Feature: DSpark label alignment at the complete causal-LM boundary.
+
+        Description: Run unshifted Omni labels and explicitly shifted text labels with an ignored prefix and padding.
+        Expectation: Both paths supervise the same real target tokens and have equal losses and parameter gradients.
+        """
+        config = _config()
+        for name, value in vars(_small_config()).items():
+            if name.startswith("v41_dspark_"):
+                setattr(config, name, value)
+        config.v41_dspark_noise_token_id = config.vocab_size - 1
+        config.v41_dspark_target_layer_ids = [0]
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                   mock_open(read_data='{"layer_ids": []}')):
+            omni = DeepseekV41ForCausalLM(config)
+        text = copy.deepcopy(omni)
+        ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 30, 30, 30]])
+        labels = torch.full_like(ids, IGNORE_INDEX)
+        labels[:, 4:8] = ids[:, 4:8]
+        shifted = torch.cat((labels[:, 1:], torch.full_like(labels[:, :1], IGNORE_INDEX)), dim=-1)
+        expected = torch.full((1, ids.shape[1], config.v41_dspark_block_size), IGNORE_INDEX)
+        for anchor in range(ids.shape[1]):
+            for offset in range(config.v41_dspark_block_size):
+                target = anchor + offset + 2
+                if 4 <= target < 8:
+                    expected[0, anchor, offset] = ids[0, target]
+        losses = []
+        for model, arguments in ((omni, {"labels": labels}),
+                                 (text, {"labels": shifted, "shift_labels": shifted})):
+            captured = []
+            handle = model.dspark.register_forward_pre_hook(
+                lambda _module, args: captured.append(args[2]))
+            try:
+                loss = model(input_ids=ids, **arguments).loss
+            finally:
+                handle.remove()
+            _, targets = model.dspark._teacher_forced_targets(  # pylint: disable=protected-access
+                ids, captured[0], None, None)
+            torch.testing.assert_close(targets, expected, rtol=0, atol=0)
+            self.assertEqual(int(model.pending_extra_metrics["dspark_supervised_tokens"]), 12)
+            loss.backward()
+            losses.append(loss.detach())
+        torch.testing.assert_close(losses[0], losses[1], rtol=0, atol=0)
+        expected_gradients = dict(omni.named_parameters())
+        for name, parameter in text.named_parameters():
+            torch.testing.assert_close(parameter.grad, expected_gradients[name].grad, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dspark_taps_pre_attention_stream_mean_after_engram(self) -> None:
         """Feature: Published DSpark backbone feature taps.
 
