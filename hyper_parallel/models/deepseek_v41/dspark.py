@@ -133,6 +133,7 @@ class DSparkDraftAttention(nn.Module):
         self.head_dim = int(config.head_dim)
         self.rope_dim = int(round(self.head_dim * float(config.partial_rotary_factor)))
         self.window = int(config.v41_dspark_window)
+        self.attention_chunk_size = int(getattr(config, "v41_dspark_attention_chunk_size", 0))
         self.q_lora_rank = int(config.q_lora_rank)
         self.o_groups = int(config.o_groups)
         self.o_lora_rank = int(config.o_lora_rank)
@@ -167,24 +168,50 @@ class DSparkDraftAttention(nn.Module):
         Returns:
             ``[batch, seq, block, hidden]`` attention output.
         """
-        batch, seq, block, _ = draft_states.shape
-        query = self.wq_b(self.q_norm(self.wq_a(draft_states)))
-        query = query.view(batch, seq, block, self.num_heads, self.head_dim)
+        seq = draft_states.shape[1]
         key_value = self.kv_norm(self.wkv(main_states))
         rope = self.rope_dim
-        query_rot = _apply_rope(query[..., -rope:], rope_cos[:, :, None, None], rope_sin[:, :, None, None])
-        query = torch.cat([query[..., :-rope], query_rot], dim=-1)
         key = torch.cat(
             [key_value[..., :-rope], _apply_rope(key_value[..., -rope:], rope_cos, rope_sin)],
             dim=-1,
         )
+        chunk = self.attention_chunk_size
+        if chunk == 0 or seq <= chunk:
+            return self._attend_range(draft_states, key, key_value, rope_cos, rope_sin, 0)
+        outputs = []
+        for start in range(0, seq, chunk):
+            stop = min(start + chunk, seq)
+            arguments = (draft_states[:, start:stop], key, key_value,
+                         rope_cos[:, start:stop], rope_sin[:, start:stop], start)
+            if self.training and torch.is_grad_enabled():
+                outputs.append(_checkpoint(self._attend_range, *arguments))
+            else:
+                outputs.append(self._attend_range(*arguments))
+        return torch.cat(outputs, dim=1)
+
+    def _attend_range(
+            self,
+            draft_states: torch.Tensor,
+            key: torch.Tensor,
+            key_value: torch.Tensor,
+            rope_cos: torch.Tensor,
+            rope_sin: torch.Tensor,
+            start: int,
+    ) -> torch.Tensor:
+        """Run one sequence tile against the original absolute causal window."""
+        batch, seq, block, _ = draft_states.shape
+        rope = self.rope_dim
+        query = self.wq_b(self.q_norm(self.wq_a(draft_states)))
+        query = query.view(batch, seq, block, self.num_heads, self.head_dim)
+        query_rot = _apply_rope(query[..., -rope:], rope_cos[:, :, None, None], rope_sin[:, :, None, None])
+        query = torch.cat([query[..., :-rope], query_rot], dim=-1)
         # Windowed causal gather: position t sees backbone entries
         # [t-window+1, t].  Advanced indexing keeps the backward on the
         # mature gather/scatter kernels (``Tensor.unfold`` backward is
         # unreliable on the current CANN toolkit); clamped out-of-range
         # rows are masked below.
         window = self.window
-        positions = torch.arange(seq, device=draft_states.device)
+        positions = torch.arange(start, start + seq, device=draft_states.device)
         offsets_back = torch.arange(window - 1, -1, -1, device=draft_states.device)
         window_index = positions.unsqueeze(1) - offsets_back.unsqueeze(0)
         valid = window_index >= 0

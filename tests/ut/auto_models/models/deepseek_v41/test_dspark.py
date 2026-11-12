@@ -106,6 +106,21 @@ def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
 
+    def test_attention_query_tiles_keep_cross_tile_causal_context(self):
+        """Compare full drafter loss and gradients with an uneven query tiling."""
+        config = _small_config()
+        reference, head = _build(config)
+        config.v41_dspark_attention_chunk_size = 3
+        candidate, _ = _build(config)
+        ids, labels, hiddens, embeds = _batch(config)
+        expected, _ = reference(hiddens, ids, labels, embeds, head)
+        actual, _ = candidate(hiddens, ids, labels, embeds, head)
+        torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=1.0e-7)
+        expected.backward()
+        actual.backward()
+        for (name, left), (_, right) in zip(reference.named_parameters(), candidate.named_parameters(), strict=True):
+            torch.testing.assert_close(right.grad, left.grad, rtol=2.0e-5, atol=1.0e-7, msg=name)
+
     def test_forward_produces_finite_losses_and_metrics(self):
         """A full forward returns finite loss values and metric entries."""
         config = _small_config()
