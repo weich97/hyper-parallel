@@ -84,6 +84,7 @@ class GmmFillConfig(FillConfig):
     advance:        str      = "cube"   # "cube" | "cube_only" | "cube_custom"
     event_delta:    int      = 0        # only used when advance="cube_custom"
     num_cube_cores: int      = 24
+    defer_weight_grad: bool  = False
 
     def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Serialize operand interpretation and event dependencies.
@@ -153,6 +154,7 @@ class GmmFillConfig(FillConfig):
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.tiling_data_position = op.tiling_position
+            task.extra_value_0        = int(self.defer_weight_grad)
 
             cfg.all_tasks[tsv.pre_task_num + i]              = task
             cfg.cube_task_indices[tsv.pre_cube_task_num + i] = tsv.pre_task_num + i

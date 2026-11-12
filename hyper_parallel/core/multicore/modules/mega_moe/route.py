@@ -59,6 +59,7 @@ class RouteMetadata:
     plan_tokens: int | None = None
     max_source_expert_rows: int | None = None
     max_destination_expert_rows: int | None = None
+    expert_end_offsets: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ class _DynamicRouteSummary(NamedTuple):
     maximum_received_slots: int
     max_source_expert_rows: int
     max_destination_expert_rows: int
+    expert_end_offsets: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -556,6 +558,14 @@ def _dynamic_summary(payload: torch.Tensor, spec: MegaMoeSpec) -> _DynamicRouteS
     summary = torch.cat((payload[:, :3], counts.sum(1, keepdim=True),
                          counts.amin(1, keepdim=True), counts.amax(1, keepdim=True),
                          loads[:, None], maximum_expert_rows), dim=1)
+    if spec.use_matmul_weight_grad:
+        local_start = spec.rank_id * spec.local_experts
+        local_rows = destination_expert_rows[local_start:local_start + spec.local_experts]
+        wire = torch.cat((summary.flatten(), local_rows.cumsum(dim=0))).tolist()
+        row_count, row_width = summary.shape
+        values_end = row_count * row_width
+        rows = [wire[offset:offset + row_width] for offset in range(0, values_end, row_width)]
+        return _summarize_dynamic_rows(rows, spec)._replace(expert_end_offsets=tuple(wire[values_end:]))
     rows = summary.tolist()
     return _summarize_dynamic_rows(rows, spec)
 
@@ -599,7 +609,12 @@ def _summarize_host_route(raw: list[list[int]], spec: MegaMoeSpec) -> _DynamicRo
     maximum_expert_rows = max(destination_expert_rows)
     rows = [row[:3] + [sum(values), min(values), max(values), load, maximum_expert_rows]
             for row, values, load in zip(raw, counts, loads, strict=True)]
-    return _summarize_dynamic_rows(rows, spec)
+    summary = _summarize_dynamic_rows(rows, spec)
+    if spec.use_matmul_weight_grad:
+        local_start = spec.rank_id * local
+        expert_end_offsets = tuple(accumulate(destination_expert_rows[local_start:local_start + local]))
+        return summary._replace(expert_end_offsets=expert_end_offsets)
+    return summary
 
 
 def _route_cache_signature(spec: MegaMoeSpec, device: Any) -> tuple[Any, ...]:
@@ -805,7 +820,8 @@ def _prepare_dynamic_route(
         maximum_received_slots=summary.maximum_received_slots,
         metadata=replace(metadata, local_num_tokens=tokens, plan_tokens=summary.plan_tokens,
                          max_source_expert_rows=summary.max_source_expert_rows,
-                         max_destination_expert_rows=summary.max_destination_expert_rows),
+                         max_destination_expert_rows=summary.max_destination_expert_rows,
+                         expert_end_offsets=summary.expert_end_offsets),
     )
 
 

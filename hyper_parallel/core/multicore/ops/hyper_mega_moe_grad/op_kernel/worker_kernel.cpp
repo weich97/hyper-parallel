@@ -59,7 +59,11 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         ExecuteMatmul(task_desc);
         break;
       case TaskType::TASK_GROUPED_MATMUL:
-        ExecuteGroupedMatmul(task_desc);
+        // Separate weight-gradient GEMMs run after the fused data-gradient op.
+        // Retain the original event schedule for the other workers.
+        if (task_desc.extra_value_0 == 0) {
+          ExecuteGroupedMatmul(task_desc);
+        }
         break;
       case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);

@@ -269,7 +269,8 @@ class TestMegaMoeRoute(unittest.TestCase):
         payload = torch.cat((header, counts), dim=1)
         for rank in range(2):
             spec = replace(self._spec(ep_size=2, rank_id=rank), max_local_num_tokens=257)
-            capacity, plan_tokens, maximum, source_rows, destination_rows = route_module._dynamic_summary(payload, spec)
+            summary = route_module._dynamic_summary(payload, spec)
+            capacity, plan_tokens, maximum, source_rows, destination_rows = summary[:5]
             self.assertEqual((capacity, plan_tokens), ((4, 128) if rank == 0 else (2, 128)))
             self.assertEqual(maximum, 4)
             self.assertEqual((source_rows, destination_rows), (3, 3))
@@ -613,7 +614,7 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
                     spec = self._spec(experts, rank)
                     with self.subTest(experts=experts, dtype=dtype, rank=rank):
                         self.assertEqual(
-                            route_module._read_dynamic_route(payload, spec)[0], self._reference(payload, spec)
+                            route_module._read_dynamic_route(payload, spec)[0][:5], self._reference(payload, spec)
                         )
 
     @arg_mark(
@@ -637,7 +638,25 @@ class TestMegaMoeDynamicMetadata(unittest.TestCase):
             return original(tensor)
 
         with patch.object(torch.Tensor, "tolist", tolist):
-            self.assertEqual(route_module._read_dynamic_route(payload, spec)[0], expected)
+            self.assertEqual(route_module._read_dynamic_route(payload, spec)[0][:5], expected)
+
+    @arg_mark(
+        plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"
+    )
+    def test_separate_weight_grad_uses_exact_local_group_boundaries(self) -> None:
+        """Both readback paths produce the same boundaries as the native ABI."""
+        for experts in (24, 2048):
+            payload = self._payload(experts, torch.int64)
+            for rank in range(4):
+                with self.subTest(experts=experts, rank=rank):
+                    spec = replace(self._spec(experts, rank), use_matmul_weight_grad=True)
+                    summary, _ = route_module._read_dynamic_route(payload, spec)
+                    counts = payload[:, 3:]
+                    first = rank * spec.local_experts
+                    received = counts[:, first:first + spec.local_experts]
+                    metadata = route_module._compute_route_metadata(counts[rank], counts, received, spec,
+                                                                    summary.capacity)
+                    self.assertEqual(summary.expert_end_offsets, tuple(metadata.group_list.tolist()))
 
     @arg_mark(
         plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0", card_mark="allcards", essential_mark="essential"

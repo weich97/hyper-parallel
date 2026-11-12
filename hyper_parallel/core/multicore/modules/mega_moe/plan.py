@@ -166,6 +166,9 @@ def _build_runtime_artifacts(spec: MegaMoeSpec) -> tuple[Any, Any, Any, Any]:
         expert_weight_layout=spec.expert_weight_layout,
     )
     backward_graph.propagate_splits(task_values)
+    if spec.use_matmul_weight_grad:
+        for name in ("w1_grad", "w2_grad"):
+            backward_graph.get_op(name).fill_config.defer_weight_grad = True
     attach_mega_moe_l1_view_resolvers(backward_graph)
     backward_data = build_backward_config(
         backward_graph,
@@ -221,7 +224,7 @@ def build_mega_moe_plan(spec: MegaMoeSpec, device: Any) -> MegaMoePlan:
     }
     return MegaMoePlan(
         spec=spec,
-        reuse_backward_dispatch=can_reuse_backward_dispatch(
+        reuse_backward_dispatch=not spec.use_matmul_weight_grad and can_reuse_backward_dispatch(
             backward_config, spec.local_experts, spec.num_cube_cores,
         ),
         forward_graph=forward_graph,

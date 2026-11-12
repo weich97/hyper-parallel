@@ -152,7 +152,7 @@ replace:
                 expected_indices = torch.tensor([[0, 2], [4, 6], [1, 3], [5, 7]]) if fixed else expected_indices
                 torch.testing.assert_close(module.experts.call_args.args[1], expected_indices)
                 torch.testing.assert_close(module.experts.call_args.args[2], expected_weights)
-                module.experts.configure.assert_called_once_with(ep_mesh.get_group.return_value, 4, 2)
+                module.experts.configure.assert_called_once_with(ep_mesh.get_group.return_value, 4, 2, fix_router=fixed)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -202,7 +202,7 @@ replace:
                 module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=None, fix_router=fixed,
             )
             actual = compute(module, hidden, image_mask=images)
-        configure.assert_called_once_with(None, 1, 2)
+        configure.assert_called_once_with(None, 1, 2, fix_router=fixed)
         _, weights, indices = reference_gate(reference_states, image_mask=images)
         if fixed:
             indices = torch.arange(tokens * 2).view(tokens, 2) % 4
@@ -231,9 +231,10 @@ replace:
     @staticmethod
     def _execute_mega_experts(
             inputs: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
-            *, expert_weights: tuple[torch.Tensor, torch.Tensor],
+            *, expert_weights: tuple[torch.Tensor, torch.Tensor], fixed_route_tokens: int | None = None,
     ) -> torch.Tensor:
         """Execute the native packed parameter layout using CPU differentiable math."""
+        del fixed_route_tokens
         gate_up, down = expert_weights
         states = inputs.reshape(-1, inputs.shape[-1])
         output = torch.zeros_like(states)

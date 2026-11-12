@@ -157,6 +157,7 @@ plan_overrides:
         dispatch_mode: push  # Set to pull for GET dispatch.
         fixed_route_tokens: 16384
         combine_split: 256
+        use_matmul_weight_grad: true
   # HyperMegaMhc reuses the original fn/base/scale parameters.
   - match:
       - "model.layers.*.attn_hc"

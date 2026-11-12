@@ -107,6 +107,29 @@ class TestMegaMoeFunction(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_separate_weight_gradients_keep_empty_experts_and_weight_layout(self) -> None:
+        """Compute each expert's weight gradient using its own received row range."""
+        activations = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        projected = activations[:, :3].contiguous()
+        downstream = activations + 1
+        swiglu_grad = activations[:, :2].contiguous() - 2
+        saved = SimpleNamespace(dispatch=activations, activation=projected)
+        for output_first in (False, True):
+            with self.subTest(output_first=output_first):
+                w1 = torch.zeros((3, 2, 4) if output_first else (3, 4, 2))
+                w2 = torch.zeros((3, 4, 3) if output_first else (3, 3, 4))
+                intermediates = SimpleNamespace(grad_weight1=w1, grad_weight2=w2, swiglu_grad=swiglu_grad)
+                execution = SimpleNamespace(intermediates=intermediates, dispatch=downstream)
+                function_module._complete_matmul_weight_grads(saved, execution, (2, 2, 5), output_first=output_first)
+                expected_w1 = torch.stack((activations[:2].T @ swiglu_grad[:2], torch.zeros(4, 2),
+                                           activations[2:].T @ swiglu_grad[2:]))
+                expected_w2 = torch.stack((projected[:2].T @ downstream[:2], torch.zeros(3, 4),
+                                           projected[2:].T @ downstream[2:]))
+                torch.testing.assert_close(w1, expected_w1.transpose(1, 2) if output_first else expected_w1)
+                torch.testing.assert_close(w2, expected_w2.transpose(1, 2) if output_first else expected_w2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Feature: MegaKernel diagnostics.
         Description: Checkpoint unpack hooks must only be consumed once per backward call.
@@ -114,6 +137,7 @@ class TestMegaMoeFunction(unittest.TestCase):
         """
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
+        context.weight_grad_offsets = None
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         execution = function_module._BackwardExecution(
@@ -212,7 +236,8 @@ class TestMegaMoeFunction(unittest.TestCase):
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
                                ep_size=2, num_experts=4, local_num_tokens=2, top_k=2,
-                               dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False)
+                               dispatch_mode="push", expert_weight_layout="EIO", auto_tokens=False,
+                               use_matmul_weight_grad=False)
         plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):

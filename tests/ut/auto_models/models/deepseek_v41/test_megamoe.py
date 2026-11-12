@@ -130,8 +130,9 @@ def _source(limit=10.0):
     source.down_proj = nn.Parameter(torch.randn(4, 8, 4))
     return source
 
-def _native_reference(module, inputs, indices, weights, *, expert_weights=None):
+def _native_reference(module, inputs, indices, weights, *, expert_weights=None, fixed_route_tokens=None):
     """Differentiate the routed expert math independently of the native executor."""
+    del fixed_route_tokens
     gate_up, down_weight = expert_weights or (module.gate_up_weight, module.down_weight)
     original_shape = inputs.shape
     inputs = inputs.reshape(-1, inputs.shape[-1])

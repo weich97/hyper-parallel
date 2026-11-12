@@ -53,7 +53,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
                  context: Mapping[str, Any] | None = None,
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
                  capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
-                 fixed_route_tokens: int | None = None, combine_split: int = 128) -> None:
+                 fixed_route_tokens: int | None = None, combine_split: int = 128,
+                 use_matmul_weight_grad: bool = False) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -66,6 +67,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             initializer_range: Standard deviation used for meta-model random initialization.
             fixed_route_tokens: Reuse route metadata for this fixed benchmark shape.
             combine_split: Number of rows in each native token combine tile.
+            use_matmul_weight_grad: Use separate device GEMMs for expert weight gradients.
         """
         super().__init__()
         del module_fqn
@@ -84,6 +86,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise ValueError("fixed_route_tokens must be a positive integer")
         self.fixed_route_tokens = fixed_route_tokens
         self.combine_split = combine_split
+        self.use_matmul_weight_grad = use_matmul_weight_grad
         source_limit = _swiglu_limit(module.limit)
         if not isinstance(module.act_fn, (nn.SiLU, type(ACT2FN["silu"]))):
             raise ValueError("MegaMoe Trainer replacement requires SiLU")
@@ -134,6 +137,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             dispatch_mode=self.dispatch_mode, initial_capacity_factor=self.initial_capacity_factor,
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
             create_parameters=False, combine_split=self.combine_split,
+            use_matmul_weight_grad=self.use_matmul_weight_grad,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,

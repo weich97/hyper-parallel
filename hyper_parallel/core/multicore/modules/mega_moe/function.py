@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Any
 
 import torch
@@ -27,6 +28,9 @@ from hyper_parallel.core.multicore.torch import ops as multicore_ops
 from .plan import MegaMoePlan, record_plan_stream
 from .route import PreparedTopKRoute, RouteMetadata
 from .workspace import MegaMoeWorkspace
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -447,6 +451,36 @@ def _launch_backward_kernel(
         )
 
 
+def _write_weight_grad(
+    output: torch.Tensor, inputs: torch.Tensor, gradient: torch.Tensor, output_first: bool,
+) -> None:
+    """Write the BF16 weight gradient in the caller's expert layout."""
+    if output_first:
+        result = torch.mm(gradient.T, inputs)
+    else:
+        result = torch.mm(inputs.T, gradient)
+    output.copy_(result)
+
+
+def _complete_matmul_weight_grads(
+    saved: _SavedBackwardState,
+    execution: _BackwardExecution,
+    expert_end_offsets: tuple[int, ...],
+    *,
+    output_first: bool,
+) -> None:
+    """Finish weight gradients after the fused data-gradient kernel."""
+    gradients = execution.intermediates
+    for expert, end in enumerate(expert_end_offsets):
+        start = expert_end_offsets[expert - 1] if expert else 0
+        if start == end:
+            continue
+        _write_weight_grad(gradients.grad_weight1[expert], saved.dispatch[start:end],
+                           gradients.swiglu_grad[start:end], output_first)
+        _write_weight_grad(gradients.grad_weight2[expert], saved.activation[start:end],
+                           execution.dispatch[start:end], output_first)
+
+
 def _native_source(tensor: torch.Tensor) -> torch.Tensor:
     """Keep a non-null ABI pointer and preserve empty symmetric source storage."""
     if tensor.shape[0] == 0:
@@ -462,6 +496,8 @@ def _native_source(tensor: torch.Tensor) -> torch.Tensor:
 # Torch declares variadic autograd hooks; concrete functions use operator-specific signatures.
 class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ
     """Autograd bridge for the in-place forward/backward custom ops."""
+
+    _matmul_weight_grad_reported = False
 
     @staticmethod
     # pylint: disable-next=arguments-differ
@@ -496,6 +532,11 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
             Owned expert-major output rows.
         """
         spec = plan.spec
+        ctx.weight_grad_offsets = None
+        if spec.use_matmul_weight_grad:
+            if route.expert_end_offsets is None or len(route.expert_end_offsets) != spec.local_experts:
+                raise ValueError("Separate weight gradients require exact Host expert end offsets")
+            ctx.weight_grad_offsets = route.expert_end_offsets
         if topk_weights is not None and (spec.dispatch_mode != "pull" or permutation is None):
             raise ValueError("Integrated output unpermutation requires pull dispatch and an input permutation.")
         metadata = route
@@ -599,6 +640,12 @@ class _MegaMoeFunction(torch.autograd.Function):  # pylint: disable=abstract-met
                 source,
                 execution,
             )
+            if ctx.weight_grad_offsets is not None:
+                _complete_matmul_weight_grads(saved, execution, ctx.weight_grad_offsets,
+                                              output_first=plan.spec.expert_weight_layout == "EOI")
+                if not _MegaMoeFunction._matmul_weight_grad_reported:
+                    logger.info("MegaMoE separate expert weight-gradient matmuls engaged")
+                    _MegaMoeFunction._matmul_weight_grad_reported = True
             # Release ordinary scratch before allocating the owned token gradient;
             # SHMEM remains leased until the current-stream work is recorded.
             execution = replace(execution, dispatch=None, intermediates=_BackwardIntermediates(

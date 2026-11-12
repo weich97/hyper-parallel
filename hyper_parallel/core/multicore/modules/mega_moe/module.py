@@ -372,6 +372,7 @@ class MegaMoeExperts(MulticoreModule):
         capacity_growth_factor: float | None = None,
         dispatch_split: int = _COMMUNICATION_SPLIT,
         combine_split: int = _COMMUNICATION_SPLIT,
+        use_matmul_weight_grad: bool = False,
     ) -> None:
         """Initialize local expert parameters and a lazy execution owner.
 
@@ -391,6 +392,7 @@ class MegaMoeExperts(MulticoreModule):
                 Must be a positive multiple of 128.
             combine_split: Combine tile rows in forward and backward, with the same
                 constraints and default as dispatch_split. Sharing requires equal splits.
+            use_matmul_weight_grad: Use separate device GEMMs for expert weight gradients.
             swiglu_limit: Optional positive, finite float32-representable clamp
                 limit for SwiGLU. The gate branch uses ``min(gate, limit)`` and
                 the up branch is clamped to ``[-limit, limit]``. ``None``
@@ -420,6 +422,7 @@ class MegaMoeExperts(MulticoreModule):
             "capacity_growth_factor": capacity_growth_factor,
             "dispatch_split": dispatch_split,
             "combine_split": combine_split,
+            "use_matmul_weight_grad": use_matmul_weight_grad,
         }
         specification["auto_tokens"] = True
         specification = self._resolve_specification(specification)
@@ -461,6 +464,8 @@ class MegaMoeExperts(MulticoreModule):
     @classmethod
     def _resolve_specification(cls, specification: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize configuration before registering an execution owner."""
+        if not isinstance(specification.get("use_matmul_weight_grad", False), bool):
+            raise ValueError("use_matmul_weight_grad must be a bool")
         expert_weight_layout = specification["expert_weight_layout"]
         if expert_weight_layout not in _EXPERT_WEIGHT_LAYOUTS:
             raise ValueError(

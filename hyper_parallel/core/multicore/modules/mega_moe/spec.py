@@ -56,6 +56,7 @@ class MegaMoeSpec:
     auto_tokens: bool = False
     schedule_source_expert_rows: int | None = None
     schedule_destination_expert_rows: int | None = None
+    use_matmul_weight_grad: bool = False
 
     @property
     def dynamic_tokens(self) -> bool:
@@ -221,4 +222,5 @@ def bind_mega_moe_spec(
         combine_split=specification.get("combine_split", _COMMUNICATION_SPLIT),
         max_local_num_tokens=specification.get("max_local_num_tokens"),
         auto_tokens=specification.get("auto_tokens", False),
+        use_matmul_weight_grad=specification.get("use_matmul_weight_grad", False),
     )
