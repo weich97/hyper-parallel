@@ -395,6 +395,7 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
         dspark_attention_chunk_size: int = 0,
+        dspark_attention_backend: str = "reference",
         engram_storage_backend: str = "device",
         engram_max_pending_entries: int = 1000000,
         engram_max_sparse_rows_per_step: int = 1000000,
@@ -427,6 +428,7 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
+        dspark_attention_backend: Reference window gather or native ``flash_v3`` training attention.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -469,6 +471,9 @@ def build_deepseek_v41_validation_config(
     if type(dspark_attention_chunk_size) is not int or dspark_attention_chunk_size < 0:
         raise ValueError("dspark_attention_chunk_size must be a nonnegative integer")
     config.v41_dspark_attention_chunk_size = dspark_attention_chunk_size
+    if dspark_attention_backend not in ("reference", "flash_v3"):
+        raise ValueError("dspark_attention_backend must be reference or flash_v3")
+    config.v41_dspark_attention_backend = dspark_attention_backend
     _apply_engram_host_fields(
         config, engram_storage_backend, engram_max_pending_entries,
         engram_max_sparse_rows_per_step, engram_sparse_adam_config,
@@ -498,6 +503,7 @@ def build_cropped_deepseek_v41(
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
         dspark_attention_chunk_size: int = 0,
+        dspark_attention_backend: str = "reference",
         engram_storage_backend: str = "device",
         engram_max_pending_entries: int = 1000000,
         engram_max_sparse_rows_per_step: int = 1000000,
@@ -536,6 +542,7 @@ def build_cropped_deepseek_v41(
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
+        dspark_attention_backend: Reference window gather or native ``flash_v3`` training attention.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -564,6 +571,7 @@ def build_cropped_deepseek_v41(
         dspark_depth=dspark_depth, dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff, dspark_confidence_coeff=dspark_confidence_coeff,
         dspark_attention_chunk_size=dspark_attention_chunk_size,
+        dspark_attention_backend=dspark_attention_backend,
         engram_storage_backend=engram_storage_backend, engram_max_pending_entries=engram_max_pending_entries,
         engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
         engram_sparse_adam_config=engram_sparse_adam_config,

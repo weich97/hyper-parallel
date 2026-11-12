@@ -103,6 +103,25 @@ def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
     return input_ids, labels, targets, inputs_embeds
 
 
+def _flash_v3_torch_reference(query, key, value, sink, mask, query_lengths, kv_lengths, window, scale):
+    """Emulate right-aligned TND band attention with independent sequence matrices."""
+    del mask
+    outputs = []
+    q_start = k_start = 0
+    for q_end, k_end in zip(query_lengths.tolist(), kv_lengths.tolist(), strict=True):
+        q_rows, k_rows = q_end - q_start, k_end - k_start
+        position = torch.arange(q_rows) + k_rows - q_rows
+        distance = position[:, None] - torch.arange(k_rows)[None, :]
+        valid = (distance >= 0) & (distance < window)
+        scores = torch.einsum("thd,kd->thk", query[q_start:q_end], key[k_start:k_end, 0]) * scale
+        scores = scores.masked_fill(~valid[:, None], torch.finfo(scores.dtype).min)
+        logits = torch.cat((scores, sink[None, :, None].expand(q_rows, -1, 1)), dim=-1)
+        weights = logits.float().softmax(-1)[..., :-1].to(query.dtype)
+        outputs.append(torch.einsum("thk,kd->thd", weights, value[k_start:k_end, 0]))
+        q_start, k_start = q_end, k_end
+    return torch.cat(outputs)
+
+
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
 
@@ -120,6 +139,28 @@ class DSparkComponentTest(unittest.TestCase):
         actual.backward()
         for (name, left), (_, right) in zip(reference.named_parameters(), candidate.named_parameters(), strict=True):
             torch.testing.assert_close(right.grad, left.grad, rtol=2.0e-5, atol=1.0e-7, msg=name)
+
+    def test_flash_attention_adapter_preserves_draft_offsets_and_gradients(self):
+        """Validate batch isolation and nonzero tile starts against full reference attention."""
+        for chunk in (0, 3):
+            with self.subTest(chunk=chunk):
+                config = _small_config()
+                reference, head = _build(config)
+                config.v41_dspark_attention_backend = "flash_v3"
+                config.v41_dspark_attention_chunk_size = chunk
+                candidate, _ = _build(config)
+                ids, labels, hiddens, embeds = _batch(config)
+                expected, _ = reference(hiddens, ids, labels, embeds, head)
+                with patch("hyper_parallel.models.deepseek_v41.dspark._flash_attention_v3",
+                           side_effect=_flash_v3_torch_reference) as native:
+                    actual, _ = candidate(hiddens, ids, labels, embeds, head)
+                    actual.backward()
+                self.assertGreater(native.call_count, 0)
+                expected.backward()
+                torch.testing.assert_close(actual, expected, rtol=2.0e-6, atol=1.0e-7)
+                for (name, left), (_, right) in zip(
+                        reference.named_parameters(), candidate.named_parameters(), strict=True):
+                    torch.testing.assert_close(right.grad, left.grad, rtol=3.0e-5, atol=1.0e-7, msg=name)
 
     def test_forward_produces_finite_losses_and_metrics(self):
         """A full forward returns finite loss values and metric entries."""
@@ -509,6 +550,14 @@ class TestDSparkCropSwitches(unittest.TestCase):
         config = self._build()
         self.assertEqual(config.v41_dspark_depth, 0)
         self.assertEqual(config.v41_dspark_target_layer_ids, [])
+
+    def test_attention_backend_is_explicit_and_validated(self):
+        """Keep the reference default and reject unrecognized native backends."""
+        self.assertEqual(self._build().v41_dspark_attention_backend, "reference")
+        config = self._build(dspark_depth=1, dspark_attention_backend="flash_v3")
+        self.assertEqual(config.v41_dspark_attention_backend, "flash_v3")
+        with self.assertRaisesRegex(ValueError, "dspark_attention_backend"):
+            self._build(dspark_depth=1, dspark_attention_backend="typo")
 
     def test_depth_populates_the_released_layout(self):
         """A positive depth targets the last three layers, as released."""

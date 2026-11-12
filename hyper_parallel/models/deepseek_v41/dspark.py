@@ -48,6 +48,7 @@ runtime-semantic deltas to revisit):
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -55,6 +56,24 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.data.constants import IGNORE_INDEX
+
+logger = logging.getLogger(__name__)
+
+
+def _flash_attention_v3(query, key, value, sink, mask, query_lengths, kv_lengths, window, scale):
+    """Use the native training kernel with its scalar-sink backward."""
+    if query.device.type != "npu":
+        raise ValueError("DSpark flash_v3 attention requires an NPU")
+    # CPU-only model construction must not import the optional NPU runtime.
+    import torch_npu  # pylint: disable=import-outside-toplevel
+
+    if not hasattr(torch_npu, "npu_fusion_attention_v3"):
+        raise RuntimeError("DSpark flash_v3 attention requires npu_fusion_attention_v3")
+    return torch_npu.npu_fusion_attention_v3(
+        query, key, value, query.shape[1], "TND", sink=sink, atten_mask=mask,
+        actual_seq_qlen=query_lengths, actual_seq_kvlen=kv_lengths,
+        scale=scale, keep_prob=1.0, pre_tockens=window - 1, next_tockens=0, sparse_mode=4,
+    )[0]
 
 
 def _checkpoint(function, *args):
@@ -134,6 +153,11 @@ class DSparkDraftAttention(nn.Module):
         self.rope_dim = int(round(self.head_dim * float(config.partial_rotary_factor)))
         self.window = int(config.v41_dspark_window)
         self.attention_chunk_size = int(getattr(config, "v41_dspark_attention_chunk_size", 0))
+        self.attention_backend = getattr(config, "v41_dspark_attention_backend", "reference")
+        if self.attention_backend not in ("reference", "flash_v3"):
+            raise ValueError("DSpark attention backend must be reference or flash_v3")
+        self._flash_mask = None
+        self._flash_engaged = False
         self.q_lora_rank = int(config.q_lora_rank)
         self.o_groups = int(config.o_groups)
         self.o_lora_rank = int(config.o_lora_rank)
@@ -205,14 +229,52 @@ class DSparkDraftAttention(nn.Module):
         query = query.view(batch, seq, block, self.num_heads, self.head_dim)
         query_rot = _apply_rope(query[..., -rope:], rope_cos[:, :, None, None], rope_sin[:, :, None, None])
         query = torch.cat([query[..., :-rope], query_rot], dim=-1)
+        if self.attention_backend == "flash_v3":
+            context = self._flash_window_context(query, key, key_value, start)
+        else:
+            context = self._reference_window_context(query, key, key_value, start)
+        grouped = context.reshape(batch, seq, block, self.o_groups, -1)
+        wo_a = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
+        reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
+        return self.wo_b(reduced.flatten(3))
+
+    def _flash_window_context(self, query, key, value, start):
+        """Align each query tile to its causal KV suffix without expanding windows."""
+        batch, seq, block, heads, dim = query.shape
+        end = start + seq
+        key_start = max(0, start - self.window + 1)
+        kv_length = end - key_start
+        key = key[:, key_start:end].reshape(batch * kv_length, 1, dim).to(query.dtype).contiguous()
+        value = value[:, key_start:end].reshape(batch * kv_length, 1, dim).to(query.dtype).contiguous()
+        query_lengths = torch.arange(1, batch + 1, dtype=torch.int64) * seq
+        kv_lengths = torch.arange(1, batch + 1, dtype=torch.int64) * kv_length
+        if self._flash_mask is None or self._flash_mask.device != query.device:
+            self._flash_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=query.device), diagonal=1)
+        sink = self.attn_sink.to(query.dtype).float()
+        outputs = []
+        for offset in range(block):
+            draft_query = query[:, :, offset].reshape(batch * seq, heads, dim).contiguous()
+            output = _flash_attention_v3(
+                draft_query, key, value, sink, self._flash_mask, query_lengths, kv_lengths,
+                self.window, self.scaling,
+            )
+            outputs.append(output.view(batch, seq, heads, dim))
+        if not self._flash_engaged:
+            logger.info("DSpark native FlashAttention v3 training path engaged")
+            self._flash_engaged = True
+        return torch.stack(outputs, dim=2)
+
+    def _reference_window_context(self, query, key, key_value, start):
+        """Materialize the original causal windows for the reference path."""
+        batch, seq, block, _, _ = query.shape
         # Windowed causal gather: position t sees backbone entries
         # [t-window+1, t].  Advanced indexing keeps the backward on the
         # mature gather/scatter kernels (``Tensor.unfold`` backward is
         # unreliable on the current CANN toolkit); clamped out-of-range
         # rows are masked below.
         window = self.window
-        positions = torch.arange(start, start + seq, device=draft_states.device)
-        offsets_back = torch.arange(window - 1, -1, -1, device=draft_states.device)
+        positions = torch.arange(start, start + seq, device=query.device)
+        offsets_back = torch.arange(window - 1, -1, -1, device=query.device)
         window_index = positions.unsqueeze(1) - offsets_back.unsqueeze(0)
         valid = window_index >= 0
         window_index = window_index.clamp(min=0)
@@ -223,11 +285,7 @@ class DSparkDraftAttention(nn.Module):
         sink = self.attn_sink.view(1, 1, self.num_heads, 1, 1).to(scores.dtype)
         joined = torch.cat([scores, sink.expand(batch, seq, -1, block, 1)], dim=-1)
         weights = joined.float().softmax(dim=-1).to(query.dtype)[..., :-1]
-        context = torch.einsum("bshjw,bswd->bsjhd", weights, gathered_value.to(query.dtype))
-        grouped = context.reshape(batch, seq, block, self.o_groups, -1)
-        wo_a = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
-        reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
-        return self.wo_b(reduced.flatten(3))
+        return torch.einsum("bshjw,bswd->bsjhd", weights, gathered_value.to(query.dtype))
 
 
 class DSparkStage(nn.Module):
