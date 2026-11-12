@@ -174,7 +174,7 @@ def _build_text_config(
         routed_scaling_factor=text["routed_scaling_factor"],
         max_position_embeddings=text["max_position_embeddings"],
         rope_theta=text["rope_theta"],
-        rope_parameters=text["rope_scaling"],
+        rope_parameters=dict(text["rope_scaling"]) if text["rope_scaling"] else None,
         layer_types=["sliding_attention"] * resolved_hidden_layers,
         mlp_layer_types=["moe"] * resolved_hidden_layers,
         compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 2},
@@ -342,6 +342,9 @@ def _apply_v41_dspark_fields(
     default_targets = list(range(max(0, num_hidden_layers - 3), num_hidden_layers))
     config.v41_dspark_target_layer_ids = list(dspark_target_layer_ids or default_targets)
     config.v41_dspark_block_size = int(text.get("dspark_block_size", 5))
+    # V4's config translator moves YaRN to compressed attention. DSpark uses
+    # the released text YaRN settings with the main-attention rotary base.
+    config.v41_dspark_rope_scaling = dict(text.get("rope_scaling") or {})
     config.v41_dspark_markov_rank = int(text.get("dspark_markov_rank", 256))
     config.v41_dspark_noise_token_id = int(
         text.get("dspark_noise_token_id", source["pad_token_id"]))
@@ -468,7 +471,8 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff,
         dspark_confidence_coeff,
     )
-    if type(dspark_attention_chunk_size) is not int or dspark_attention_chunk_size < 0:
+    if (not isinstance(dspark_attention_chunk_size, int) or isinstance(dspark_attention_chunk_size, bool)
+            or dspark_attention_chunk_size < 0):
         raise ValueError("dspark_attention_chunk_size must be a nonnegative integer")
     config.v41_dspark_attention_chunk_size = dspark_attention_chunk_size
     if dspark_attention_backend not in ("reference", "flash_v3"):

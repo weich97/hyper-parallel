@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import json
+import math
 import re
 import tempfile
 import unittest
@@ -51,6 +53,7 @@ def _small_config() -> SimpleNamespace:
         o_lora_rank=8,
         rms_norm_eps=1.0e-6,
         rope_theta=10000.0,
+        v41_dspark_rope_scaling={},
         hc_mult=2,
         hc_sinkhorn_iters=4,
         hc_eps=1.0e-6,
@@ -105,23 +108,138 @@ def _batch(config: SimpleNamespace, batch: int = 2, seq: int = 10):
     return input_ids, labels, targets, inputs_embeds
 
 
-def _flash_v3_torch_reference(query, key, value, sink, mask, query_lengths, kv_lengths, window, scale):
-    """Emulate right-aligned TND band attention with independent sequence matrices."""
-    del mask
+def _flash_v3_torch_reference(query, key_value, sink, query_lengths, kv_lengths, scale):
+    """Emulate independent noncausal TND segments at the native API boundary."""
     outputs = []
     q_start = k_start = 0
     for q_end, k_end in zip(query_lengths.tolist(), kv_lengths.tolist(), strict=True):
-        q_rows, k_rows = q_end - q_start, k_end - k_start
-        position = torch.arange(q_rows) + k_rows - q_rows
-        distance = position[:, None] - torch.arange(k_rows)[None, :]
-        valid = (distance >= 0) & (distance < window)
-        scores = torch.einsum("thd,kd->thk", query[q_start:q_end], key[k_start:k_end, 0]) * scale
-        scores = scores.masked_fill(~valid[:, None], torch.finfo(scores.dtype).min)
+        q_rows = q_end - q_start
+        scores = torch.einsum("thd,kd->thk", query[q_start:q_end], key_value[k_start:k_end, 0]) * scale
         logits = torch.cat((scores, sink[None, :, None].expand(q_rows, -1, 1)), dim=-1)
         weights = logits.float().softmax(-1)[..., :-1].to(query.dtype)
-        outputs.append(torch.einsum("thk,kd->thd", weights, value[k_start:k_end, 0]))
+        outputs.append(torch.einsum("thk,kd->thd", weights, key_value[k_start:k_end, 0]))
         q_start, k_start = q_end, k_end
     return torch.cat(outputs)
+
+
+def _published_frequencies(config, positions):
+    """Use the release's complex-valued YaRN formula independently of the adapter."""
+    dim = int(config.head_dim * config.partial_rotary_factor)
+    frequencies = 1 / config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    settings = config.v41_dspark_rope_scaling
+    original = settings.get("original_max_position_embeddings", 0)
+    if original:
+        low = max(math.floor(dim * math.log(original / (settings["beta_fast"] * 2 * math.pi))
+                             / (2 * math.log(config.rope_theta))), 0)
+        high = min(math.ceil(dim * math.log(original / (settings["beta_slow"] * 2 * math.pi))
+                             / (2 * math.log(config.rope_theta))), dim - 1)
+        ramp = ((torch.arange(dim // 2) - low) / max(high - low, 0.001)).clamp(0, 1)
+        frequencies = frequencies / settings["factor"] * ramp + frequencies * (1 - ramp)
+    angles = torch.outer(torch.arange(positions), frequencies)
+    return torch.polar(torch.ones_like(angles), angles)
+
+
+def _published_rotation(tensor, frequencies, inverse=False):
+    """Apply adjacent complex-pair rotation, as in the publisher's inference code."""
+    complex_input = torch.view_as_complex(tensor.float().unflatten(-1, (-1, 2)).contiguous())
+    shape = (1, frequencies.shape[0], *([1] * (tensor.ndim - 3)), frequencies.shape[1])
+    rotation = frequencies.conj() if inverse else frequencies
+    return torch.view_as_real(complex_input * rotation.view(shape)).flatten(-2).to(tensor.dtype)
+
+
+def _published_draft_attention(module, draft, main, frequencies):
+    """Decode each anchor independently with its main window and complete draft block.
+
+    This uses the released DSparkAttention equations in FP32/BF16 training
+    precision; it does not import the production window or rotary helpers.
+    """
+    batch, sequence, block, _ = draft.shape
+    rope = module.rope_dim
+    main_kv = module.kv_norm(module.wkv(main))
+    main_kv = torch.cat((main_kv[..., :-rope],
+                         _published_rotation(main_kv[..., -rope:], frequencies[:sequence])), dim=-1)
+    outputs = []
+    for anchor in range(sequence):
+        states = draft[:, anchor]
+        positions = frequencies[anchor + 1:anchor + 1 + block]
+        query = module.wq_b(module.q_norm(module.wq_a(states))).view(
+            batch, block, module.num_heads, module.head_dim)
+        query = torch.cat((query[..., :-rope], _published_rotation(query[..., -rope:], positions)), dim=-1)
+        draft_kv = module.kv_norm(module.wkv(states))
+        draft_kv = torch.cat((draft_kv[..., :-rope],
+                              _published_rotation(draft_kv[..., -rope:], positions)), dim=-1)
+        keys = torch.cat((main_kv[:, max(0, anchor - module.window + 1):anchor + 1], draft_kv), dim=1)
+        logits = torch.einsum("bqhd,bkd->bhqk", query, keys) * module.scaling
+        sink = module.attn_sink.view(1, -1, 1, 1).expand(batch, -1, block, 1)
+        probabilities = torch.cat((logits, sink), dim=-1).float().softmax(-1)[..., :-1].to(query.dtype)
+        result = torch.einsum("bhqk,bkd->bqhd", probabilities, keys)
+        result = torch.cat((result[..., :-rope],
+                            _published_rotation(result[..., -rope:], positions, inverse=True)), dim=-1)
+        grouped = result.reshape(batch, block, module.o_groups, -1)
+        weight = module.wo_a.weight.view(module.o_groups, module.o_lora_rank, -1)
+        outputs.append(module.wo_b(torch.einsum("bqgd,grd->bqgr", grouped, weight).flatten(2)))
+    return torch.stack(outputs, dim=1)
+
+
+class DSparkPublishedAttentionTest(unittest.TestCase):
+    """Check the training adapter against independent released decode equations."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_draft_block_is_noncausal_but_main_context_is_causal(self) -> None:
+        """Feature: Distinct main-context and intra-draft visibility.
+
+        Description: Backpropagate from the first draft output at one anchor.
+        Expectation: Later draft KV receives gradients; future main tokens and other draft blocks do not.
+        """
+        config = _small_config()
+        drafter, _ = _build(config)
+        draft = torch.randn(1, 6, 3, config.hidden_size).requires_grad_()
+        main = torch.randn(1, 6, config.hidden_size).requires_grad_()
+        cos, sin = drafter._rope_tables(6, torch.device("cpu"), torch.bfloat16)
+        self.assertEqual(cos.dtype, torch.float32)
+        output = drafter.stages[0].self_attn(draft, main, cos, sin)
+        output[:, 2, 0].sum().backward()
+        self.assertGreater(draft.grad[:, 2, -1].abs().sum().item(), 0)
+        self.assertGreater(main.grad[:, :3].abs().sum().item(), 0)
+        torch.testing.assert_close(main.grad[:, 3:], torch.zeros_like(main.grad[:, 3:]), rtol=0, atol=0)
+        torch.testing.assert_close(draft.grad[:, :2], torch.zeros_like(draft.grad[:, :2]), rtol=0, atol=0)
+        torch.testing.assert_close(draft.grad[:, 3:], torch.zeros_like(draft.grad[:, 3:]), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_draft_context_rotary_positions_and_gradients_match_release(self) -> None:
+        """Feature: Published DSpark attention semantics.
+
+        Description: Compare outputs and all gradients across early windows and uneven query tiles.
+        Expectation: Draft KV, future positions, shared rotated values and inverse RoPE match the release.
+        """
+        for chunk in (0, 3):
+            with self.subTest(chunk=chunk):
+                config = _small_config()
+                config.v41_dspark_rope_scaling = {"factor": 4.0, "original_max_position_embeddings": 8,
+                                                 "beta_fast": 4.0, "beta_slow": 1.0}
+                config.v41_dspark_attention_chunk_size = chunk
+                drafter, _ = _build(config)
+                actual_module = drafter.stages[0].self_attn
+                expected_module = copy.deepcopy(actual_module)
+                draft = torch.randn(2, 7, config.v41_dspark_block_size, config.hidden_size).requires_grad_()
+                main = torch.randn(2, 7, config.hidden_size).requires_grad_()
+                expected_draft = draft.detach().clone().requires_grad_()
+                expected_main = main.detach().clone().requires_grad_()
+                frequencies = _published_frequencies(config, 7 + config.v41_dspark_block_size)
+                expected = _published_draft_attention(expected_module, expected_draft, expected_main, frequencies)
+                cos, sin = drafter._rope_tables(7, torch.device("cpu"), torch.float32)
+                actual = actual_module(draft, main, cos, sin)
+                torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-6)
+                cotangent = torch.randn_like(expected)
+                actual.backward(cotangent)
+                expected.backward(cotangent)
+                torch.testing.assert_close(draft.grad, expected_draft.grad, rtol=3.0e-5, atol=3.0e-6)
+                torch.testing.assert_close(main.grad, expected_main.grad, rtol=3.0e-5, atol=3.0e-6)
+                for (name, parameter), (_, reference) in zip(
+                        actual_module.named_parameters(), expected_module.named_parameters(), strict=True):
+                    torch.testing.assert_close(parameter.grad, reference.grad, rtol=5.0e-5, atol=5.0e-6, msg=name)
 
 
 class DSparkComponentTest(unittest.TestCase):
@@ -724,6 +842,35 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
 
 class TestDSparkCropSwitches(unittest.TestCase):
     """The crop entry carries the DSpark drafter switches into the config."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_released_yarn_settings_survive_the_v4_config_translation(self) -> None:
+        """Feature: Released drafter rotary configuration.
+
+        Description: Translate flat source YaRN parameters through V4's nested main/compress representation.
+        Expectation: DSpark retains the source YaRN settings independently of V4's default main branch.
+        """
+        from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import (  # pylint: disable=C0415
+            build_deepseek_v41_validation_config,
+        )
+        settings = {"rope_type": "yarn", "factor": 16, "original_max_position_embeddings": 65536,
+                    "beta_fast": 32, "beta_slow": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_released_config(directory)
+            source = json.loads(path.read_text(encoding="utf-8"))
+            source["text_config"]["rope_scaling"] = settings
+            source["text_config"]["max_position_embeddings"] = 1048576
+            path.write_text(json.dumps(source), encoding="utf-8")
+            assets = _write_engram_assets(directory, num_hidden_layers=40, head_dim=8)
+            config = build_deepseek_v41_validation_config(str(path.parent), str(assets), dspark_depth=1)
+        self.assertEqual(config.v41_dspark_rope_scaling, settings)
+        self.assertEqual(config.rope_parameters["main"]["rope_type"], "default")
+        drafter = DeepseekV41DSpark(config, lambda: _TinyMlp(config.hidden_size))
+        cos, sin = drafter._rope_tables(7, torch.device("cpu"), torch.bfloat16)
+        expected = _published_frequencies(config, 7 + config.v41_dspark_block_size)
+        torch.testing.assert_close(cos[0], expected.real, rtol=1.0e-7, atol=1.0e-7)
+        torch.testing.assert_close(sin[0], expected.imag, rtol=1.0e-7, atol=1.0e-7)
 
     @staticmethod
     def _build(**kwargs):

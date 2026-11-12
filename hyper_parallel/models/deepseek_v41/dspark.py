@@ -35,20 +35,18 @@ Training contract implemented here, following the report:
   The report does not disclose the production loss coefficients, so both are
   configuration values, mirroring the Indexer-KL precedent.
 
-Documented v1 simplifications (structure is kept checkpoint-shaped; these are
-runtime-semantic deltas to revisit):
-
-* Draft attention lets every draft position attend the sliding
-  ``dspark_window`` of backbone-projected KV entries only; intra-block
-  draft-to-draft KV visibility is omitted. This does not reproduce the
-  released attention contract; the Markov head is a separate computation.
-* The published FP4/FP8 ``.scale`` companions are not materialized; the crop
-  trains in BF16 like the rest of the validation model.
+The published FP4/FP8 ``.scale`` companions are not materialized: this adapter
+trains in BF16. Attention preserves the released main-plus-draft context,
+adjacent-pair rotary embedding and output inverse rotation. Feature-tap,
+shared-noise and teacher-forcing integration require their separate model-level
+acceptance; matching attention alone does not establish whole-model fidelity.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from functools import lru_cache
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -62,8 +60,8 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 logger = logging.getLogger(__name__)
 
 
-def _flash_attention_v3(query, key, value, sink, mask, query_lengths, kv_lengths, window, scale):
-    """Use the native training kernel with its scalar-sink backward."""
+def _flash_attention_v3(query, key_value, sink, query_lengths, kv_lengths, scale):
+    """Run independent noncausal draft blocks with the native scalar-sink backward."""
     if query.device.type != "npu":
         raise ValueError("DSpark flash_v3 attention requires an NPU")
     # CPU-only model construction must not import the optional NPU runtime.
@@ -72,9 +70,9 @@ def _flash_attention_v3(query, key, value, sink, mask, query_lengths, kv_lengths
     if not hasattr(torch_npu, "npu_fusion_attention_v3"):
         raise RuntimeError("DSpark flash_v3 attention requires npu_fusion_attention_v3")
     return torch_npu.npu_fusion_attention_v3(
-        query, key, value, query.shape[1], "TND", sink=sink, atten_mask=mask,
+        query, key_value, key_value, query.shape[1], "TND", sink=sink, atten_mask=None,
         actual_seq_qlen=query_lengths, actual_seq_kvlen=kv_lengths,
-        scale=scale, keep_prob=1.0, pre_tockens=window - 1, next_tockens=0, sparse_mode=4,
+        scale=scale, keep_prob=1.0, pre_tockens=2147483647, next_tockens=2147483647, sparse_mode=0,
     )[0]
 
 
@@ -95,15 +93,27 @@ def _checkpoint(function, *args):
     return function(*args)
 
 
-def _rotate_half(tensor: torch.Tensor) -> torch.Tensor:
-    """Rotate the last dimension halves for rotary embedding."""
-    half = tensor.shape[-1] // 2
-    return torch.cat((-tensor[..., half:], tensor[..., :half]), dim=-1)
+def _apply_rope(tensor, cos, sin, *, inverse=False):
+    """Rotate adjacent pairs in FP32, preserving the release's BF16 cast boundary."""
+    pairs = tensor.float().unflatten(-1, (-1, 2))
+    if inverse:
+        sin = -sin
+    real = pairs[..., 0] * cos - pairs[..., 1] * sin
+    imaginary = pairs[..., 0] * sin + pairs[..., 1] * cos
+    return torch.stack((real, imaginary), dim=-1).flatten(-2).to(tensor.dtype)
 
 
-def _apply_rope(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding on the trailing rope dimensions."""
-    return tensor * cos + _rotate_half(tensor) * sin
+@lru_cache(maxsize=64)
+def _draft_pack_metadata(batch, sequence, block, window, start, device):
+    """Build static TND metadata without synchronizing device-resident masks."""
+    row_width = window + block
+    lengths = [min(window, start + anchor + 1) + block for anchor in range(sequence)] * batch
+    indices = [row * row_width + offset
+               for row, length in enumerate(lengths)
+               for offset in range(row_width - length, row_width)]
+    query_lengths = torch.arange(1, batch * sequence + 1, dtype=torch.int64) * block
+    kv_lengths = torch.tensor(lengths, dtype=torch.int64).cumsum(0)
+    return torch.tensor(indices, device=device, dtype=torch.long), query_lengths, kv_lengths
 
 
 class DSparkMarkovHead(nn.Module):
@@ -151,14 +161,11 @@ class DSparkConfidenceHead(nn.Module):
 
 
 class DSparkDraftAttention(nn.Module):
-    """Sliding-window MQA over backbone-projected KV for draft positions.
+    """MQA over a causal main-context window and a noncausal draft block.
 
-    Queries come from the draft stream ``[batch, seq, block, dim]``; keys and
-    values come from one shared low-rank projection of the stage input stream
-    ``main_x`` (multi-query, matching the single ``wkv`` projection of the
-    ``mtp.K.attn`` checkpoint layout), windowed causally over the last
-    ``window`` backbone positions.  A learned per-head scalar sink joins the
-    softmax normalization, matching V4.1 scalar-sink attention.
+    Each anchor owns an independent draft block. Shared rotated KV includes
+    the main window ending at that anchor and every position in its block.
+    A learned per-head sink participates in softmax normalization.
     """
 
     def __init__(self, config: Any) -> None:
@@ -168,12 +175,13 @@ class DSparkDraftAttention(nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = int(config.head_dim)
         self.rope_dim = int(round(self.head_dim * float(config.partial_rotary_factor)))
+        if self.rope_dim <= 0 or self.rope_dim % 2 or self.rope_dim > self.head_dim:
+            raise ValueError("DSpark rotary width must be positive, even and no larger than head_dim")
         self.window = int(config.v41_dspark_window)
         self.attention_chunk_size = int(getattr(config, "v41_dspark_attention_chunk_size", 0))
         self.attention_backend = getattr(config, "v41_dspark_attention_backend", "reference")
         if self.attention_backend not in ("reference", "flash_v3"):
             raise ValueError("DSpark attention backend must be reference or flash_v3")
-        self._flash_mask = None
         self._flash_engaged = False
         self.q_lora_rank = int(config.q_lora_rank)
         self.o_groups = int(config.o_groups)
@@ -198,32 +206,33 @@ class DSparkDraftAttention(nn.Module):
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
     ) -> torch.Tensor:
-        """Attend draft queries over the windowed backbone KV stream.
+        """Attend each draft block to its main window and all of its draft KV.
 
         Args:
             draft_states: ``[batch, seq, block, hidden]`` collapsed draft input.
             main_states: ``[batch, seq, hidden]`` stage KV source stream.
-            rope_cos: ``[batch, seq, rope_dim]`` cosine table for positions.
-            rope_sin: ``[batch, seq, rope_dim]`` sine table for positions.
+            rope_cos: FP32 ``[1, seq + block, rope_dim / 2]`` cosine table.
+            rope_sin: FP32 ``[1, seq + block, rope_dim / 2]`` sine table.
 
         Returns:
             ``[batch, seq, block, hidden]`` attention output.
         """
-        seq = draft_states.shape[1]
+        seq, block = draft_states.shape[1:3]
+        if rope_cos.shape[1] < seq + block or rope_sin.shape != rope_cos.shape:
+            raise ValueError("DSpark rotary tables must cover the main context and every future draft position")
         key_value = self.kv_norm(self.wkv(main_states))
         rope = self.rope_dim
-        key = torch.cat(
-            [key_value[..., :-rope], _apply_rope(key_value[..., -rope:], rope_cos, rope_sin)],
+        key_value = torch.cat(
+            [key_value[..., :-rope], _apply_rope(key_value[..., -rope:], rope_cos[:, :seq], rope_sin[:, :seq])],
             dim=-1,
         )
         chunk = self.attention_chunk_size
         if chunk == 0 or seq <= chunk:
-            return self._attend_range(draft_states, key, key_value, rope_cos, rope_sin, 0)
+            return self._attend_range(draft_states, key_value, rope_cos, rope_sin, 0)
         outputs = []
         for start in range(0, seq, chunk):
             stop = min(start + chunk, seq)
-            arguments = (draft_states[:, start:stop], key, key_value,
-                         rope_cos[:, start:stop], rope_sin[:, start:stop], start)
+            arguments = (draft_states[:, start:stop], key_value, rope_cos, rope_sin, start)
             if self.training and torch.is_grad_enabled():
                 outputs.append(_checkpoint(self._attend_range, *arguments))
             else:
@@ -233,76 +242,76 @@ class DSparkDraftAttention(nn.Module):
     def _attend_range(
             self,
             draft_states: torch.Tensor,
-            key: torch.Tensor,
             key_value: torch.Tensor,
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
             start: int,
     ) -> torch.Tensor:
-        """Run one sequence tile against the original absolute causal window."""
+        """Run independent decode anchors at their absolute main and future positions."""
         batch, seq, block, _ = draft_states.shape
         rope = self.rope_dim
+        positions = (torch.arange(start + 1, start + seq + 1, device=draft_states.device)[:, None]
+                     + torch.arange(block, device=draft_states.device)[None, :])
+        draft_cos = rope_cos.index_select(1, positions.flatten()).view(1, seq, block, rope // 2)
+        draft_sin = rope_sin.index_select(1, positions.flatten()).view(1, seq, block, rope // 2)
         query = self.wq_b(self.q_norm(self.wq_a(draft_states)))
         query = query.view(batch, seq, block, self.num_heads, self.head_dim)
-        query_rot = _apply_rope(query[..., -rope:], rope_cos[:, :, None, None], rope_sin[:, :, None, None])
+        query_rot = _apply_rope(query[..., -rope:], draft_cos.unsqueeze(-2), draft_sin.unsqueeze(-2))
         query = torch.cat([query[..., :-rope], query_rot], dim=-1)
+        draft_kv = self.kv_norm(self.wkv(draft_states))
+        draft_kv = torch.cat((draft_kv[..., :-rope],
+                              _apply_rope(draft_kv[..., -rope:], draft_cos, draft_sin)), dim=-1)
+        combined_kv, valid = self._gather_context(key_value, draft_kv, start)
         if self.attention_backend == "flash_v3":
-            context = self._flash_window_context(query, key, key_value, start)
+            context = self._flash_window_context(query, combined_kv, start)
         else:
-            context = self._reference_window_context(query, key, key_value, start)
+            context = self._reference_window_context(query, combined_kv, valid)
+        context = torch.cat((context[..., :-rope], _apply_rope(
+            context[..., -rope:], draft_cos.unsqueeze(-2), draft_sin.unsqueeze(-2), inverse=True)), dim=-1)
         grouped = context.reshape(batch, seq, block, self.o_groups, -1)
         wo_a = self.wo_a.weight.view(self.o_groups, self.o_lora_rank, -1)
         reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
         return self.wo_b(reduced.flatten(3))
 
-    def _flash_window_context(self, query, key, value, start):
-        """Align each query tile to its causal KV suffix without expanding windows."""
-        batch, seq, block, heads, dim = query.shape
-        end = start + seq
-        key_start = max(0, start - self.window + 1)
-        kv_length = end - key_start
-        key = key[:, key_start:end].reshape(batch * kv_length, 1, dim).to(query.dtype).contiguous()
-        value = value[:, key_start:end].reshape(batch * kv_length, 1, dim).to(query.dtype).contiguous()
-        query_lengths = torch.arange(1, batch + 1, dtype=torch.int64) * seq
-        kv_lengths = torch.arange(1, batch + 1, dtype=torch.int64) * kv_length
-        if self._flash_mask is None or self._flash_mask.device != query.device:
-            self._flash_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=query.device), diagonal=1)
-        sink = self.attn_sink.to(query.dtype).float()
-        outputs = []
-        for offset in range(block):
-            draft_query = query[:, :, offset].reshape(batch * seq, heads, dim).contiguous()
-            output = _flash_attention_v3(
-                draft_query, key, value, sink, self._flash_mask, query_lengths, kv_lengths,
-                self.window, self.scaling,
-            )
-            outputs.append(output.view(batch, seq, heads, dim))
-        if not self._flash_engaged:
-            logger.info("DSpark native FlashAttention v3 training path engaged")
-            self._flash_engaged = True
-        return torch.stack(outputs, dim=2)
+    def _gather_context(self, main_kv, draft_kv, start):
+        """Gather bounded main windows on the device and append all draft keys/values."""
+        batch, seq, block, dim = draft_kv.shape
+        positions = torch.arange(start, start + seq, device=main_kv.device)
+        backwards = torch.arange(self.window - 1, -1, -1, device=main_kv.device)
+        indices = positions[:, None] - backwards[None, :]
+        valid_main = indices >= 0
+        # Flattened IndexSelect avoids the AI CPU advanced-indexing path and
+        # correctly sums gradients for keys shared by overlapping windows.
+        main_windows = main_kv.index_select(1, indices.clamp_min(0).flatten())
+        main_windows = main_windows.view(batch, seq, self.window, dim)
+        valid = torch.cat((valid_main, torch.ones(seq, block, device=main_kv.device, dtype=torch.bool)), dim=-1)
+        return torch.cat((main_windows, draft_kv), dim=2), valid
 
-    def _reference_window_context(self, query, key, key_value, start):
-        """Materialize the original causal windows for the reference path."""
+    def _flash_window_context(self, query, key_value, start):
+        """Pack each anchor as an independent noncausal TND segment."""
+        batch, seq, block, heads, dim = query.shape
+        indices, query_lengths, kv_lengths = _draft_pack_metadata(
+            batch, seq, block, self.window, start, query.device)
+        packed_kv = key_value.reshape(-1, dim).index_select(0, indices).unsqueeze(1).to(query.dtype).contiguous()
+        sink = self.attn_sink.to(query.dtype).float()
+        output = _flash_attention_v3(
+            query.reshape(batch * seq * block, heads, dim).contiguous(), packed_kv,
+            sink, query_lengths, kv_lengths, self.scaling,
+        )
+        if not self._flash_engaged:
+            logger.info("DSpark native FlashAttention v3 training path engaged with main and draft KV")
+            self._flash_engaged = True
+        return output.view(batch, seq, block, heads, dim)
+
+    def _reference_window_context(self, query, key_value, valid):
+        """Evaluate scalar-sink attention over each anchor's complete context."""
         batch, seq, block, _, _ = query.shape
-        # Windowed causal gather: position t sees backbone entries
-        # [t-window+1, t].  Advanced indexing keeps the backward on the
-        # mature gather/scatter kernels (``Tensor.unfold`` backward is
-        # unreliable on the current CANN toolkit); clamped out-of-range
-        # rows are masked below.
-        window = self.window
-        positions = torch.arange(start, start + seq, device=query.device)
-        offsets_back = torch.arange(window - 1, -1, -1, device=query.device)
-        window_index = positions.unsqueeze(1) - offsets_back.unsqueeze(0)
-        valid = window_index >= 0
-        window_index = window_index.clamp(min=0)
-        gathered_key = key[:, window_index]
-        gathered_value = key_value[:, window_index]
-        scores = torch.einsum("bsjhd,bswd->bshjw", query, gathered_key.to(query.dtype)) * self.scaling
+        scores = torch.einsum("bsjhd,bswd->bshjw", query, key_value.to(query.dtype)) * self.scaling
         scores = scores.masked_fill(~valid[None, :, None, None, :], torch.finfo(scores.dtype).min)
         sink = self.attn_sink.view(1, 1, self.num_heads, 1, 1).to(scores.dtype)
         joined = torch.cat([scores, sink.expand(batch, seq, -1, block, 1)], dim=-1)
         weights = joined.float().softmax(dim=-1).to(query.dtype)[..., :-1]
-        return torch.einsum("bshjw,bswd->bsjhd", weights, gathered_value.to(query.dtype))
+        return torch.einsum("bshjw,bswd->bsjhd", weights, key_value.to(query.dtype))
 
 
 class DSparkStage(nn.Module):
@@ -459,6 +468,10 @@ class DeepseekV41DSpark(nn.Module):
         self.num_targets = len(tuple(config.v41_dspark_target_layer_ids))
         self.hc_mult = int(config.hc_mult)
         self.rope_theta = float(config.rope_theta)
+        if not hasattr(config, "v41_dspark_rope_scaling"):
+            raise ValueError("DSpark requires v41_dspark_rope_scaling copied from the released text configuration")
+        self.rope_scaling = dict(config.v41_dspark_rope_scaling or {})
+        self._validate_rotary_settings()
         self.head_dim = int(config.head_dim)
         self.rope_dim = int(round(self.head_dim * float(config.partial_rotary_factor)))
         self.confidence_coeff = float(config.v41_dspark_confidence_coeff)
@@ -485,15 +498,35 @@ class DeepseekV41DSpark(nn.Module):
         self.markov_head = DSparkMarkovHead(int(config.vocab_size), int(config.v41_dspark_markov_rank))
         self.confidence_head = DSparkConfidenceHead(hidden + int(config.v41_dspark_markov_rank))
 
+    def _validate_rotary_settings(self):
+        """Reject unsupported rotary variants instead of silently dropping release settings."""
+        if self.rope_theta <= 1:
+            raise ValueError("DSpark rope_theta must exceed one")
+        if self.rope_scaling.get("rope_type", "default") not in ("default", "yarn"):
+            raise ValueError("DSpark supports the released default and YaRN rotary settings")
+        if any(float(self.rope_scaling.get(key, default)) <= 0
+               for key, default in (("factor", 1), ("beta_fast", 32), ("beta_slow", 1))):
+            raise ValueError("DSpark YaRN factor and beta values must be positive")
+
     def _rope_tables(self, seq: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build cosine/sine tables over backbone positions."""
-        half = self.rope_dim // 2
-        inv_freq = 1.0 / (
-            self.rope_theta ** (torch.arange(0, half, device=device, dtype=torch.float32) / half)
-        )
-        angles = torch.arange(seq, device=device, dtype=torch.float32)[:, None] * inv_freq[None, :]
-        emb = torch.cat([angles, angles], dim=-1)
-        return emb.cos()[None].to(dtype), emb.sin()[None].to(dtype)
+        """Build FP32 adjacent-pair YaRN tables including every future draft offset."""
+        del dtype
+        dim = self.rope_dim
+        inv_freq = 1.0 / self.rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        original = int(self.rope_scaling.get("original_max_position_embeddings", 0))
+        if original > 0:
+            beta_fast = float(self.rope_scaling.get("beta_fast", 32))
+            beta_slow = float(self.rope_scaling.get("beta_slow", 1))
+            low = max(math.floor(dim * math.log(original / (beta_fast * 2 * math.pi))
+                                 / (2 * math.log(self.rope_theta))), 0)
+            high = min(math.ceil(dim * math.log(original / (beta_slow * 2 * math.pi))
+                                 / (2 * math.log(self.rope_theta))), dim - 1)
+            ramp = ((torch.arange(dim // 2, device=device, dtype=torch.float32) - low)
+                    / max(high - low, 0.001)).clamp(0, 1)
+            factor = float(self.rope_scaling.get("factor", 1))
+            inv_freq = inv_freq / factor * ramp + inv_freq * (1 - ramp)
+        angles = torch.arange(seq + self.block_size, device=device, dtype=torch.float32)[:, None] * inv_freq[None, :]
+        return angles.cos()[None], angles.sin()[None]
 
     def init_weights(self, std: float) -> None:
         """Deterministically initialize drafter-owned bare parameters.
