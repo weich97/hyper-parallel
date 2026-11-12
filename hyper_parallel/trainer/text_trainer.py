@@ -274,7 +274,7 @@ class TextTrainer:
         num_micro_steps = self.base.num_micro_batches
         trace_first_update = (
             self.base.state.global_step == 0 and self.base.global_rank in (0, 36)
-            and self.base.config.accelerator.cp_size == 1 and self.base.config.training.global_batch_size == 128
+            and self.base.config.accelerator.cp_size == 1 and self.base.config.training.global_batch_size in (128, 256)
         )
         if trace_first_update:
             faulthandler.dump_traceback_later(90, repeat=True)
@@ -305,9 +305,11 @@ class TextTrainer:
                 total_loss_dict[loss_name] += loss_value.item()
             if expert_staging is not None and micro_step == 0:
                 expert_staging.pack()
+                if trace_first_update:
+                    logger.info("First CP1 expert gradient partials staged")
 
         if expert_staging is not None:
-            expert_staging.restore()
+            expert_staging.finish()
         if trace_first_update:
             logger.info("First CP1 backward completed")
         total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)

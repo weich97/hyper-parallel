@@ -646,6 +646,21 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         torch.testing.assert_close(hsdp_param.sharded_param.main_grad._local_tensor, torch.tensor([3.0, 4.0]))
         self.assertIsNone(hsdp_param.sharded_param.grad)
 
+    def test_apply_reduced_grad_consumes_compact_expert_partial_in_fp32(self):
+        """Consume the first partial without rounding the second partial or sum to BF16."""
+        hsdp_param = _new_param()
+        hsdp_param.apply_grad_on_fp32_main_grad = True
+        hsdp_param.to_sharded_dtensor = MagicMock(side_effect=lambda value: SimpleNamespace(_local_tensor=value))
+        first = torch.tensor([0.5, -2.0], dtype=torch.bfloat16)
+        second = torch.tensor([0.00123, 3.14159], dtype=torch.float32)
+        expected = first.float() + second
+        hsdp_param.sharded_param._hp_staged_main_grad = (first, None)
+
+        self.assertFalse(hsdp_param.apply_reduced_grad(second))
+
+        self.assertFalse(hasattr(hsdp_param.sharded_param, "_hp_staged_main_grad"))
+        torch.testing.assert_close(hsdp_param.sharded_param.main_grad._local_tensor, expected, rtol=0, atol=0)
+
     @patch("hyper_parallel.core.fully_shard.hsdp_param.dist.all_reduce")
     def test_all_reduce_grad_single_rank_and_mocked_multi_rank(self, mock_all_reduce):
         """All-reduce should skip single-rank groups and launch for multi-rank groups."""

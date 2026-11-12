@@ -487,6 +487,13 @@ class HSDPStateV2:
                 reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
                 pre_hsdp_param.reduce_partial_output = None
 
+            if self.requires_all_reduce and hasattr(pre_hsdp_param.sharded_param, "_hp_staged_main_grad"):
+                # Consume the compact partial while this layer's reduced gradient is live.
+                pre_hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, self.reduce_op_type)
+                need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad)
+                pre_hsdp_param.clear_reduce_scatter_output()
+                self._sync_current_stream_if_needed(need_synchronize)
+
             if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
                 pre_hsdp_param.unsharded_accumulated_grad = None
             elif pre_hsdp_param.unsharded_param.grad is not None:

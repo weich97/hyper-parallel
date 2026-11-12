@@ -450,6 +450,25 @@ class TestHSDPStateV2(unittest.TestCase):
                 )
                 param.apply_reduced_grad.assert_called_once_with(current_output)
 
+    def test_final_size_one_expert_gradient_with_compact_partial_applies_early(self):
+        """Consume the staged partial before the root finalizes other parameters."""
+        gradient = torch.ones(2)
+        param = _FakeHSDPParam(dp_size=1)
+        param.sharded_param._hp_staged_main_grad = (gradient.bfloat16(), None)
+        param.reduce_scatter_output.return_value = gradient
+        param.reduce_scatter_comm_ctx.reduce_scatter_output = gradient
+        state = _new_state([param])
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        _new_root_scheduler(state).launch_tp_replicate_reduce_and_apply()
+
+        param.all_reduce_source_replicate_grad_inplace.assert_called_once_with(
+            gradient, torch.distributed.ReduceOp.AVG,
+        )
+        param.apply_reduced_grad.assert_called_once_with(gradient)
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+
     def test_all_reduce_group_consumes_partial_output_in_reduce_dtype(self):
         """The final HSDP AR buffer should consume partial RS output, not parameter grad."""
         param = _FakeHSDPParam(dp_size=2)

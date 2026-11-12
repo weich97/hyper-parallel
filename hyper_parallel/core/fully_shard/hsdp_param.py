@@ -496,6 +496,17 @@ class HSDPParamV2:
                 torch.device("cpu"), non_blocking=non_blocking
             )
             need_synchronize = True
+        staged = getattr(self.sharded_param, "_hp_staged_main_grad", None)
+        if staged is not None:
+            compact, ready = staged
+            if (not self.apply_grad_on_fp32_main_grad or self.offload_to_cpu
+                    or sharded_grad is not None or reduced_grad.dtype != torch.float32):
+                raise RuntimeError("A compact expert gradient requires an empty FP32 accumulator")
+            if ready is not None:
+                torch.npu.current_stream(reduced_grad.device).wait_event(ready)
+                compact = compact.to(reduced_grad.device, non_blocking=True)
+            torch.add(compact, reduced_grad, out=reduced_grad)
+            del self.sharded_param._hp_staged_main_grad  # pylint: disable=protected-access
         if sharded_grad is None:
             if not self.apply_grad_on_fp32_main_grad:
                 self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)

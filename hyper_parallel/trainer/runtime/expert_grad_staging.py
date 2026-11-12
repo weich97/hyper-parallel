@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Lossless device staging of local expert gradients between two microbatches."""
+"""Lossless staging of local expert gradients between two microbatches."""
 
 from typing import Any
 
@@ -29,9 +29,10 @@ logger = create_logger(__name__)
 class ExpertGradientStaging:
     """Keep exactly representable BF16 partials and accumulate into FP32."""
 
-    def __init__(self, parameters: tuple[torch.nn.Parameter, ...]) -> None:
+    def __init__(self, parameters: tuple[torch.nn.Parameter, ...], host_count: int = 0) -> None:
         self.parameters = parameters
-        self.packed: tuple[torch.Tensor, ...] | None = None
+        self.host_count = host_count
+        self.active = False
 
     def _local_gradients(self) -> tuple[torch.Tensor, ...]:
         """Fetch the sharded FP32 accumulator for each participating expert weight."""
@@ -44,7 +45,7 @@ class ExpertGradientStaging:
     @torch.no_grad()
     def pack(self) -> None:
         """Check the first partials before releasing their original FP32 storage."""
-        if self.packed is not None:
+        if self.active:
             raise RuntimeError("Expert gradient staging already owns the first microbatch")
         gradients = self._local_gradients()
         packed = tuple(gradient.to(dtype=torch.bfloat16) for gradient in gradients)
@@ -55,18 +56,28 @@ class ExpertGradientStaging:
             dist.all_reduce(lossless, op=dist.ReduceOp.MIN)
         if not lossless.item():
             raise RuntimeError("First expert gradient partial has values outside the BF16 format")
-        for parameter in self.parameters:
+        staged = list(packed)
+        ready = None
+        if self.host_count:
+            for index, compact in enumerate(packed[:self.host_count]):
+                host = torch.empty_like(compact, device="cpu", pin_memory=True)
+                host.copy_(compact, non_blocking=True)
+                staged[index] = host
+            ready = torch.npu.Event()
+            ready.record(torch.npu.current_stream(packed[0].device))
+        for parameter, compact in zip(self.parameters, staged, strict=True):
+            parameter._hp_staged_main_grad = (compact, ready if compact.device.type == "cpu" else None)
             parameter.main_grad = None
-        self.packed = packed
+        self.active = True
 
-    @torch.no_grad()
-    def restore(self) -> None:
-        """Apply the original first-plus-second FP32 addition before clipping."""
-        if self.packed is None:
+    def finish(self) -> None:
+        """Require the FSDP reduction path to have consumed all staged partials."""
+        if not self.active:
             raise RuntimeError("Expert gradient staging has no first microbatch")
-        for first, second in zip(self.packed, self._local_gradients(), strict=True):
-            torch.add(first, second, out=second)
-        self.packed = None
+        if any(hasattr(parameter, "_hp_staged_main_grad") for parameter in self.parameters):
+            raise RuntimeError("Expert gradients were not consumed during the second backward")
+        self._local_gradients()
+        self.active = False
 
 
 def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
@@ -75,7 +86,8 @@ def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
     model_type = (getattr(base.model_config, "v41_source_model_type", None)
                   or getattr(base.model_config, "model_type", ""))
     if (base.num_micro_batches != 2 or model_type != "deepseek_v41"
-            or config.accelerator.ep_size != 128 or config.fsdp_config.edp_shard_size != 1
+            or config.accelerator.ep_size != 128 or config.accelerator.cp_size != 1 or config.accelerator.tp_size != 1
+            or config.fsdp_config.edp_shard_size != 1 or config.fsdp_config.comm_fusion
             or config.fsdp_config.dp_shard_size != 128 or not config.fsdp_config.requires_grad_sync
             or not config.optimizer.fp32_main_params):
         return None
@@ -88,7 +100,9 @@ def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
     if not experts or not all(isinstance(module, DeepseekV41MegaMoeExperts) for module in experts):
         return None
     parameters = tuple(weight for module in experts for weight in (module.gate_up_proj, module.down_proj))
+    host_count = 2 * min(16, len(experts)) if base.device.type == "npu" else 0
     if base.global_rank == 0:
         elements = sum(to_local_if_dtensor(parameter).numel() for parameter in parameters)
-        logger.info("V4.1 lossless device gradient staging weights=%d saved_bytes=%d", len(parameters), 2 * elements)
-    return ExpertGradientStaging(parameters)
+        logger.info("V4.1 lossless streaming gradient staging weights=%d host_weights=%d compact_bytes=%d",
+                    len(parameters), host_count, 2 * elements)
+    return ExpertGradientStaging(parameters, host_count)
