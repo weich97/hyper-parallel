@@ -30,7 +30,9 @@ from torch import nn
 
 from tests.common.mark_utils import arg_mark
 
-from hyper_parallel import init_empty_weights
+from hyper_parallel import DeviceMesh, Replicate, Shard, init_empty_weights
+from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
@@ -124,6 +126,48 @@ def _flash_v3_torch_reference(query, key, value, sink, mask, query_lengths, kv_l
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    def test_initialization_preserves_logical_weights_across_shards_and_replicas(self):
+        """Initialize the same global parameters under replicated and uneven layouts.
+
+        Feature: DSpark bare-parameter initialization after FSDP wrapping.
+        Description: Compare every local shard with its independently initialized global tensor.
+        Expectation: Changing the shard count or replica rank preserves all logical parameter values.
+        """
+        clear_device_mesh_cache()
+        self.addCleanup(clear_device_mesh_cache)
+        config = _small_config()
+        reference, _ = _build(config)
+        reference.init_weights(config.initializer_range)
+        parameter_names = ("noise_embedding", "stages.0.attn_hc.fn", "stages.0.ffn_hc.fn")
+        for shards in (1, 2, 3, 16):
+            for rank in range(2 * shards):
+                with self.subTest(shards=shards, rank=rank), \
+                        patch.dict("hyper_parallel.core.dtensor.dtensor._LAYOUT_CACHE", {}, clear=True), \
+                        patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=rank), \
+                        patch("hyper_parallel.models.deepseek_v41.dspark.torch.distributed.is_initialized",
+                              return_value=True):
+                    clear_device_mesh_cache()
+                    mesh = DeviceMesh("cpu", torch.arange(2 * shards).reshape(2, shards),
+                                      mesh_dim_names=("replicate", "shard"), _init_backend=False)
+                    candidate, _ = _build(config)
+                    for name in parameter_names:
+                        parameter = candidate.get_parameter(name)
+                        placement = Shard(0, uneven_shard=parameter.shape[0] % shards != 0)
+                        distributed = distribute_tensor(torch.empty_like(parameter), mesh, (Replicate(), placement))
+                        module_name, _, field = name.rpartition(".")
+                        setattr(candidate.get_submodule(module_name), field, nn.Parameter(distributed))
+
+                    candidate.init_weights(config.initializer_range)
+
+                    for name in parameter_names:
+                        full = reference.get_parameter(name)
+                        chunks = torch.chunk(full, shards, dim=0)
+                        shard_index = rank % shards
+                        expected = chunks[shard_index] if shard_index < len(chunks) else full[:0]
+                        actual = candidate.get_parameter(name).to_local()
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0,
+                                                   msg=f"Parameter {name}, shards={shards}, rank={rank}")
 
     def test_attention_query_tiles_keep_cross_tile_causal_context(self):
         """Compare full drafter loss and gradients with an uneven query tiling."""

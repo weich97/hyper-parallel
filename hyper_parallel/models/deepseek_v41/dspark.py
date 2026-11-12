@@ -55,6 +55,7 @@ import torch  # pylint: disable=forbidden-backend-import
 from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
@@ -473,10 +474,10 @@ class DeepseekV41DSpark(nn.Module):
     def init_weights(self, std: float) -> None:
         """Deterministically initialize drafter-owned bare parameters.
 
-        Meta-device construction discards __init__-time values, and these
-        parameters are replicated across data-parallel ranks, so every
-        rank must draw identical values; fixed-seed CPU generators
-        provide that.
+        Meta-device construction discards __init__-time values. Draw each
+        small owned parameter as a canonical full CPU tensor, then select
+        its local shard. Replica ranks and different FSDP layouts must
+        represent the same logical weights.
 
         Args:
             std: Backbone initializer range for the random draws.
@@ -486,17 +487,13 @@ class DeepseekV41DSpark(nn.Module):
 
         def _fill(parameter: torch.Tensor, seed: int) -> None:
             target = _local(parameter)
-            # A replicated local equals the full shape and must draw the
-            # same values on every rank; a dp-sharded local holds a
-            # distinct slice, so an independent per-rank stream is valid.
-            if tuple(target.shape) != tuple(parameter.shape):
-                rank = (torch.distributed.get_rank()
-                        if torch.distributed.is_initialized() else 0)
-                seed = seed + 7919 * (rank + 1)
             generator = torch.Generator().manual_seed(seed)
-            values = torch.randn(target.shape, generator=generator) * std
+            values = torch.randn(parameter.shape, generator=generator, device="cpu") * std
+            values = values.to(target.device, target.dtype)
+            if isinstance(parameter, DTensor):
+                values = distribute_tensor(values, parameter.device_mesh, parameter.placements).to_local()
             with torch.no_grad():
-                target.copy_(values.to(target.device, target.dtype))
+                target.copy_(values)
 
         _fill(self.noise_embedding, 0x44530001)
         for index, stage in enumerate(self.stages):
