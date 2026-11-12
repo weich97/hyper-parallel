@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from hyper_parallel.components.functional import sparse_flash_mla as attention_ops
 from hyper_parallel.distributed.context_parallel.compressed_document import document_compression_plan
@@ -28,6 +29,15 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import re
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
+
+
+class _RejectAdvancedIndex(TorchDispatchMode):
+    """Model a device runtime where multidimensional Index cannot execute reliably."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.index.Tensor:
+            raise RuntimeError("Multidimensional Index is unavailable in the candidate-key path")
+        return func(*args, **(kwargs or {}))
 
 
 def _source(index_source=False):
@@ -100,6 +110,34 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
             with self.subTest(options=options), self.assertRaisesRegex(error, message):
                 attention.compressed_causal_topk(self.query, self.key, self.weights,
                                                 use_fused=True, **kwargs, **options)
+
+    def test_candidate_reindex_preserves_batch_mask_and_duplicate_selection(self):
+        """Flattened gathering preserves hierarchical candidates, masks and tail chunks."""
+        generator = torch.Generator().manual_seed(61)
+        query = torch.randn(2, 7, 3, 4, generator=generator)
+        key = torch.randn(2, 4, 11, generator=generator).transpose(1, 2)
+        weights = torch.randn(2, 7, 3, generator=generator)
+        candidates = torch.tensor([[[0, 0, -1], [1, 2, 9], [2, 1, 0], [-1, -1, -1],
+                                    [3, 0, 2], [1, 1, 0], [2, 0, 1]],
+                                   [[1, 0, -1], [2, 0, 9], [0, 1, 2], [-1, -1, -1],
+                                    [3, 1, 0], [0, 0, 1], [1, 2, 0]]])
+        minimum = torch.tensor([[0, 1, 2, 0, 3, 1, 2], [1, 0, 2, 0, 1, 2, 3]])
+
+        def advanced_index_reference(bank, indices):
+            return bank[torch.arange(bank.shape[0]).view(-1, 1, 1), indices]
+
+        for tied in (False, True):
+            current_weights = torch.zeros_like(weights) if tied else weights
+            for chunk in (1, 3, 7):
+                with self.subTest(tied=tied, chunk=chunk):
+                    kwargs = dict(compress_ratio=2, sparse_count=5, block_size=3, query_offset=4,
+                                  query_chunk_size=chunk, minimum_key_indices=minimum)
+                    with patch.object(attention, "gather_selected_keys", side_effect=advanced_index_reference):
+                        expected = attention.compressed_candidate_topk(query, key, current_weights, candidates, **kwargs)
+                    with _RejectAdvancedIndex():
+                        actual = attention.compressed_candidate_topk(query, key, current_weights, candidates, **kwargs)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertTrue(torch.all(actual[:, 3] == -1))
 
     def test_kl_required_mode_never_invokes_reference(self):
         """Reject unsupported active KL before entering the reference function."""

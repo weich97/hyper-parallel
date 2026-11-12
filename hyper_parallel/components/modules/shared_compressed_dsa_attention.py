@@ -992,7 +992,6 @@ def compressed_candidate_topk(
         )
 
     block_offsets = torch.arange(block_size, device=query.device)
-    batch_indices = torch.arange(batch_size, device=query.device).view(-1, 1, 1)
     selected_chunks = []
     for start in range(0, sequence_length, query_chunk_size):
         end = min(start + query_chunk_size, sequence_length)
@@ -1007,7 +1006,7 @@ def compressed_candidate_topk(
         if minimum_key_indices is not None:
             valid = valid & (positions >= minimum_key_indices[:, start:end].unsqueeze(-1))
         safe_positions = positions.clamp(min=0, max=max(compressed_length - 1, 0))
-        selected_key = key[batch_indices, safe_positions].float()
+        selected_key = gather_selected_keys(key, safe_positions).float()
         dots = torch.einsum(
             "bchd,bckd->bchk",
             query[:, start:end].float(),
