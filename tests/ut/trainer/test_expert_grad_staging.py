@@ -48,16 +48,18 @@ class TestExpertGradientStagingSelection(unittest.TestCase):
 
     def test_dense_hybrid_layout_retains_local_expert_staging(self):
         """Changing only dense sharding must not disable lossless expert staging."""
-        for dense_shards in (64, 128):
+        for dense_shards in (32, 64, 128):
             with self.subTest(dense_shards=dense_shards):
                 staging = build_expert_gradient_staging(self._base(dense_shards))
                 self.assertIsNotNone(staging)
                 self.assertEqual(len(staging.parameters), 2)
                 for parameter in staging.parameters:
                     self.assertEqual(
-                        getattr(parameter, "_hp_stage_local_main_grad", False), dense_shards == 64,
+                        getattr(parameter, "_hp_stage_local_main_grad", False), dense_shards != 128,
                     )
 
     def test_expert_sharding_remains_outside_the_local_staging_contract(self):
         """A sharded expert gradient cannot use a single-owner shortcut."""
-        self.assertIsNone(build_expert_gradient_staging(self._base(64, expert_shards=2)))
+        for dense_shards in (32, 64, 128):
+            with self.subTest(dense_shards=dense_shards):
+                self.assertIsNone(build_expert_gradient_staging(self._base(dense_shards, expert_shards=2)))
