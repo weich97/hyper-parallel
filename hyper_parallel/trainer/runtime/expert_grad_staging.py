@@ -88,7 +88,7 @@ def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
     if (base.num_micro_batches != 2 or model_type != "deepseek_v41"
             or config.accelerator.ep_size != 128 or config.accelerator.cp_size != 1 or config.accelerator.tp_size != 1
             or config.fsdp_config.edp_shard_size != 1 or config.fsdp_config.comm_fusion
-            or config.fsdp_config.dp_shard_size != 128 or not config.fsdp_config.requires_grad_sync
+            or config.fsdp_config.dp_shard_size not in (64, 128) or not config.fsdp_config.requires_grad_sync
             or not config.optimizer.fp32_main_params):
         return None
     # Import the model adapter only for the optional V4.1 execution path.
@@ -100,6 +100,10 @@ def build_expert_gradient_staging(base: Any) -> ExpertGradientStaging | None:
     if not experts or not all(isinstance(module, DeepseekV41MegaMoeExperts) for module in experts):
         return None
     parameters = tuple(weight for module in experts for weight in (module.gate_up_proj, module.down_proj))
+    if config.fsdp_config.dp_shard_size == 64:
+        # Dense HSDP delays its replica all-reduce. EDP=1 expert weights have one owner and can stage now.
+        for parameter in parameters:
+            parameter._hp_stage_local_main_grad = True
     host_count = 2 * min(16, len(experts)) if base.device.type == "npu" else 0
     if base.global_rank == 0:
         elements = sum(to_local_if_dtensor(parameter).numel() for parameter in parameters)

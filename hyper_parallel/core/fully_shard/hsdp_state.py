@@ -477,7 +477,13 @@ class HSDPStateV2:
                 pre_hsdp_param,
             )
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
-            if not self.requires_all_reduce:
+            parameter = pre_hsdp_param.sharded_param
+            stage_local_first = (
+                not self.requires_all_reduce and getattr(parameter, "_hp_stage_local_main_grad", False) is True
+            )
+            if stage_local_first and pre_hsdp_param.replicate_world_size != 1:
+                raise RuntimeError("Expert gradient staging requires one owner without dense replicas")
+            if not self.requires_all_reduce and not stage_local_first:
                 if pre_hsdp_param.reduce_partial_output is None:
                     pre_hsdp_param.reduce_partial_output = reduced_grad
                 else:
@@ -487,8 +493,8 @@ class HSDPStateV2:
                 reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
                 pre_hsdp_param.reduce_partial_output = None
 
-            if self.requires_all_reduce and hasattr(pre_hsdp_param.sharded_param, "_hp_staged_main_grad"):
-                # Consume the compact partial while this layer's reduced gradient is live.
+            if stage_local_first or (self.requires_all_reduce and hasattr(parameter, "_hp_staged_main_grad")):
+                # Expose the local first partial or consume it during this layer's second reduction.
                 pre_hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, self.reduce_op_type)
                 need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad)
                 pre_hsdp_param.clear_reduce_scatter_output()

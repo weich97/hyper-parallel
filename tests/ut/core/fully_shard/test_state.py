@@ -469,6 +469,23 @@ class TestHSDPStateV2(unittest.TestCase):
         param.apply_reduced_grad.assert_called_once_with(gradient)
         self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
 
+    def test_no_sync_size_one_expert_gradient_can_be_staged_during_dense_hsdp(self):
+        """Expose the first local gradient without changing dense deferred reduction."""
+        gradient = torch.ones(2)
+        param = _FakeHSDPParam(dp_size=1)
+        param.sharded_param._hp_stage_local_main_grad = True
+        param.reduce_scatter_output.return_value = gradient
+        param.reduce_scatter_comm_ctx.reduce_scatter_output = gradient
+        state = _new_state([param])
+        state.requires_all_reduce = False
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+
+        state._wait_prev_reduce_scatter_without_all_reduce()
+
+        self.assertIsNone(param.reduce_partial_output)
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+        param.apply_reduced_grad.assert_called_once_with(gradient)
+
     def test_all_reduce_group_consumes_partial_output_in_reduce_dtype(self):
         """The final HSDP AR buffer should consume partial RS output, not parameter grad."""
         param = _FakeHSDPParam(dp_size=2)
@@ -490,6 +507,21 @@ class TestHSDPStateV2(unittest.TestCase):
             param.sharded_param.grad,
             torch.tensor([100.0, 100.0], dtype=torch.bfloat16),
         )
+
+    def test_local_staging_rejects_a_parameter_with_replicas(self):
+        """The local staging hint cannot bypass a required replica reduction."""
+        param = _FakeHSDPParam(dp_size=2)
+        param.replicate_world_size = 2
+        param.sharded_param._hp_stage_local_main_grad = True
+        param.reduce_scatter_output.return_value = torch.ones(2)
+        state = _new_state([param])
+        state.requires_all_reduce = False
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+
+        with self.assertRaisesRegex(RuntimeError, "one owner"):
+            state._wait_prev_reduce_scatter_without_all_reduce()
+
+        param.apply_reduced_grad.assert_not_called()
 
     def test_root_finalization_applies_reduced_grad_only_once(self):
         """Repeated root finalization should not accumulate the same reduced gradient twice."""
