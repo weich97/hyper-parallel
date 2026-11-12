@@ -1,0 +1,2 @@
+timestamp	commit	metric	status	description
+2026-11-12T15:53:34-05:00	aa789d67	2.344	keep	Published full multimodal baseline: 32 nodes, fixed routing, 2K; matched external S3 gate and clean performance run [tokens_per_second_per_die=52.5276921559]
