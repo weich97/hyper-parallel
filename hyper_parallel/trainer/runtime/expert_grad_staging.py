@@ -83,6 +83,9 @@ class ExpertGradientStaging:
             for index, compact in enumerate(packed[:host_count]):
                 host = torch.empty_like(compact, device="cpu", pin_memory=True)
                 host.copy_(compact, non_blocking=True)
+                # Later FP32 partials may have been allocated on the reduction
+                # stream. Keep their storage alive until this D2H copy finishes.
+                compact.record_stream(torch.npu.current_stream(compact.device))
                 staged[index] = host
             ready = torch.npu.Event()
             ready.record(torch.npu.current_stream(packed[0].device))
