@@ -15,7 +15,8 @@
 """Independent sink attention and explicit fused-operator selection checks."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -29,6 +30,99 @@ from hyper_parallel.components.modules.shared_compressed_dsa_attention import re
 from hyper_parallel.distributed.context_parallel.indexer_balance import indexer_task_plan, indexer_route
 from hyper_parallel.distributed.context_parallel.sequence_dispatch import document_prefix_route, sliding_window_route
 from hyper_parallel.trainer.config import PlanOverride, ReplaceAction, Target, entries_to_module_replacements
+from tests.common.mark_utils import arg_mark
+
+
+class TestCompleteCandidatePool(unittest.TestCase):
+    """Check nonbinding candidate pools against the existing block-score oracle."""
+
+    def setUp(self) -> None:
+        """Use finite independent scores with nonaligned final key blocks."""
+        torch.manual_seed(42716)
+        self.query = torch.randn(2, 17, 4, 8)
+        self.key = torch.randn(2, 17, 8)
+        self.weight = torch.randn(2, 17, 4)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_complete_block_set_matches_released_selector(self):
+        """Feature: Complete candidate block construction.
+
+        Description: Compare partial blocks, empty prefixes, offsets, and document bounds.
+        Expectation: The same block IDs survive, independent of their storage order.
+        """
+        for ratio, offset, bounded in ((1, 0, False), (2, 0, False), (2, 3, True), (1, 0, True)):
+            with self.subTest(ratio=ratio, offset=offset, bounded=bounded):
+                minimum = torch.full((2, 17), 4) if bounded else None
+                _, expected = attention.compressed_causal_topk_and_candidates(
+                    self.query, self.key, self.weight, compress_ratio=ratio, sparse_count=8,
+                    topk_blocks=5, block_size=4, query_offset=offset,
+                    minimum_key_indices=minimum,
+                )
+                actual = attention.complete_candidate_block_indices(
+                    self.query, 17, ratio, 4, offset, minimum,
+                )
+                torch.testing.assert_close(actual.sort(dim=-1).values, expected.sort(dim=-1).values, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fused_source_and_reindex_preserve_nonbinding_selection(self):
+        """Feature: Native selection for a complete candidate pool.
+
+        Description: Run source and consumer dispatch with the causal CPU oracle substituted for LI.
+        Expectation: Both retain the prior Top-K and pass the explicit native dispatch flag.
+        """
+        original = attention.compressed_causal_topk
+        expected_topk, expected_blocks = attention.compressed_causal_topk_and_candidates(
+            self.query, self.key, self.weight, compress_ratio=1, sparse_count=8, topk_blocks=5, block_size=4,
+        )
+
+        def selection(*args: Any, **kwargs: Any) -> torch.Tensor:
+            """Substitute the causal arithmetic oracle while requiring native dispatch."""
+            self.assertTrue(kwargs.pop("use_fused"))
+            return original(*args, **kwargs)
+
+        indexer = SimpleNamespace(use_fused=True, is_candidate_source=True, uses_candidates=False,
+                                  candidate_topk_blocks=5, candidate_block_size=4, compress_ratio=1,
+                                  index_topk=8, query_chunk_size=16)
+        indexer._select_complete_pool = MethodType(attention.SharedCompressedDSAIndexer._select_complete_pool, indexer)
+        with patch.object(attention, "compressed_causal_topk", side_effect=selection) as native:
+            actual, blocks, scores = attention.SharedCompressedDSAIndexer._select_indices(
+                indexer, self.query, self.key, self.weight, None, 0, None, None, None,
+            )
+            torch.testing.assert_close(actual, expected_topk, rtol=0, atol=0)
+            torch.testing.assert_close(blocks.sort(dim=-1).values, expected_blocks.sort(dim=-1).values, rtol=0, atol=0)
+            self.assertIsNone(scores)
+            indexer.is_candidate_source, indexer.uses_candidates = False, True
+            actual, _, _ = attention.SharedCompressedDSAIndexer._select_indices(
+                indexer, self.query, self.key, self.weight, blocks, 0, None, None, None,
+            )
+            expected = attention.compressed_candidate_topk(
+                self.query, self.key, self.weight, blocks, compress_ratio=1, sparse_count=8, block_size=4,
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertEqual(native.call_count, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_binding_pool_and_missing_state_remain_errors(self):
+        """Feature: Candidate-pool native capability boundary.
+
+        Description: Request native execution when a pool is selective or its state is missing.
+        Expectation: Both requests fail before issuing a native selection.
+        """
+        indexer = SimpleNamespace(use_fused=True, is_candidate_source=False, uses_candidates=True,
+                                  candidate_topk_blocks=4, candidate_block_size=4)
+        indexer._select_complete_pool = MethodType(attention.SharedCompressedDSAIndexer._select_complete_pool, indexer)
+        with self.assertRaisesRegex(NotImplementedError, "complete key bank"):
+            attention.SharedCompressedDSAIndexer._select_indices(
+                indexer, self.query, self.key, self.weight, None, 0, None, None, None,
+            )
+        indexer.candidate_topk_blocks = 5
+        with self.assertRaisesRegex(RuntimeError, "candidate block ids"):
+            attention.SharedCompressedDSAIndexer._select_indices(
+                indexer, self.query, self.key, self.weight, None, 0, None, None, None,
+            )
 
 
 class _RejectAdvancedIndex(TorchDispatchMode):
@@ -76,15 +170,23 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
         self.weights = torch.ones(1, 2, 8)
         self.indices = torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_grouped_output_projection_preserves_weight_and_input_gradients(self):
-        """Use the same grouped projection and VJP with token-major native output."""
+        """Feature: Grouped output projection.
+
+        Description: Compare native token-major output with independent grouped contractions.
+        Expectation: Forward values and all input and weight gradients agree exactly.
+        """
         generator = torch.Generator().manual_seed(41)
         inputs = torch.randn(9, 3, 4, generator=generator).requires_grad_()
         weights = torch.randn(3, 5, 4, generator=generator).requires_grad_()
         upstream = torch.randn(9, 3, 5, generator=generator)
         reference = torch.bmm(inputs.transpose(0, 1), weights.transpose(1, 2)).transpose(0, 1)
 
-        def native_projection(grouped, packed_weight, *, perm_x1):
+        def native_projection(grouped: torch.Tensor, packed_weight: torch.Tensor,
+                              *, perm_x1: list[int]) -> torch.Tensor:
+            """Model native token-major output with ordinary grouped contractions."""
             self.assertEqual(perm_x1, [1, 0, 2])
             self.assertTrue(packed_weight.is_contiguous())
             return torch.bmm(grouped.permute(perm_x1), packed_weight).transpose(0, 1).contiguous()
@@ -111,8 +213,14 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                 attention.compressed_causal_topk(self.query, self.key, self.weights,
                                                 use_fused=True, **kwargs, **options)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_candidate_reindex_preserves_batch_mask_and_duplicate_selection(self):
-        """Flattened gathering preserves hierarchical candidates, masks and tail chunks."""
+        """Feature: Flattened candidate gathering.
+
+        Description: Compare repeated candidates, masked batches, and partial query chunks.
+        Expectation: Reindex selects exactly the same positions without multidimensional Index.
+        """
         generator = torch.Generator().manual_seed(61)
         query = torch.randn(2, 7, 3, 4, generator=generator)
         key = torch.randn(2, 4, 11, generator=generator).transpose(1, 2)
@@ -123,17 +231,20 @@ class TestSharedCompressedFusionPolicy(unittest.TestCase):
                                     [3, 1, 0], [0, 0, 1], [1, 2, 0]]])
         minimum = torch.tensor([[0, 1, 2, 0, 3, 1, 2], [1, 0, 2, 0, 1, 2, 3]])
 
-        def advanced_index_reference(bank, indices):
+        def advanced_index_reference(bank: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            """Retain the former gather expression as an independent regression oracle."""
             return bank[torch.arange(bank.shape[0]).view(-1, 1, 1), indices]
 
         for tied in (False, True):
             current_weights = torch.zeros_like(weights) if tied else weights
             for chunk in (1, 3, 7):
                 with self.subTest(tied=tied, chunk=chunk):
-                    kwargs = dict(compress_ratio=2, sparse_count=5, block_size=3, query_offset=4,
-                                  query_chunk_size=chunk, minimum_key_indices=minimum)
+                    kwargs = {"compress_ratio": 2, "sparse_count": 5, "block_size": 3, "query_offset": 4,
+                              "query_chunk_size": chunk, "minimum_key_indices": minimum}
                     with patch.object(attention, "gather_selected_keys", side_effect=advanced_index_reference):
-                        expected = attention.compressed_candidate_topk(query, key, current_weights, candidates, **kwargs)
+                        expected = attention.compressed_candidate_topk(
+                            query, key, current_weights, candidates, **kwargs,
+                        )
                     with _RejectAdvancedIndex():
                         actual = attention.compressed_candidate_topk(query, key, current_weights, candidates, **kwargs)
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
