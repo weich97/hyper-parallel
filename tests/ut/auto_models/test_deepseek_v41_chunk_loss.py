@@ -192,6 +192,32 @@ class TestDeepseekV41ChunkLoss(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_sequential_schedule_rejects_missing_drafter_and_stale_phase(self) -> None:
+        """Feature: Sequential objective schedule identity.
+        Description: Request an absent drafter or a phase without its matching backbone.
+        Expectation: Fail before constructing or backpropagating an invalid objective.
+        """
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            DeepseekV41ChunkedCausalLMLoss(sequential_dspark=1)
+        loss = DeepseekV41ChunkedCausalLMLoss(sequential_dspark=True)
+        with self.assertRaisesRegex(ValueError, "enabled drafter"):
+            loss.bind_model(_CausalLM())
+        model = _CausalLM()
+        bind_chunk_loss(model)
+        inputs = dict(input_ids=torch.tensor([[1, 2]]), chunk_loss_targets=torch.tensor([[2, -100]]),
+                      chunk_loss_mask=None, chunk_loss_chunk_size=1, chunk_loss_ignore_index=-100)
+        with self.assertRaisesRegex(ValueError, "schedule identity"):
+            model(**inputs, chunk_loss_phase="backbone")
+        with self.assertRaisesRegex(RuntimeError, "pending backbone"):
+            model(**inputs, chunk_loss_phase="dspark", chunk_loss_schedule=object())
+        model._hp_pending_dspark_schedule = (object(), inputs["input_ids"], inputs["chunk_loss_targets"])
+        with self.assertRaisesRegex(RuntimeError, "has not completed"):
+            model(**inputs)
+        with self.assertRaisesRegex(RuntimeError, "pending backbone"):
+            model(**inputs, chunk_loss_phase="dspark", chunk_loss_schedule=object())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_omni_chunk_loss_rejects_unverified_cp_boundary(self) -> None:
         """Feature: Context-parallel boundary guard.
 

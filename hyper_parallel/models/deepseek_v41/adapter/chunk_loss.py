@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 # This model-family adapter follows the PyTorch-native V4.1 facade.
@@ -26,6 +26,7 @@ from typing import Any
 import torch
 from torch import nn
 from torch.nn import functional
+from hyper_parallel.data.constants import IGNORE_INDEX
 
 from hyper_parallel.components.losses.chunked_cross_entropy import (
     ChunkedCausalLMLoss,
@@ -49,6 +50,30 @@ class DeepseekV41ChunkedCausalLMLoss(ChunkedCausalLMLoss):
     target. Explicit ``shift_labels`` retain precedence for text batches.
     """
 
+    def __init__(self, chunk_size: int = 1024, ignore_index: int = -100,
+                 sequential_dspark: bool = False) -> None:
+        """Optionally finish backbone backward before building the detached drafter graph."""
+        super().__init__(chunk_size, ignore_index)
+        if not isinstance(sequential_dspark, bool):
+            raise ValueError("sequential_dspark must be a boolean")
+        self.requires_sequential_backward = sequential_dspark
+
+    def forward_backward_phases(self, model_inputs: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Yield independent objectives with a shared, single-use schedule identity.
+
+        The Trainer consumes each yield through backward before requesting
+        the next. DSpark uses frozen backbone features and does not replay it.
+
+        Args:
+            model_inputs: Prepared Chunk Loss inputs for one microbatch.
+        """
+        if not self.requires_sequential_backward:
+            yield model_inputs
+            return
+        schedule = object()
+        for phase in ("backbone", "dspark"):
+            yield dict(model_inputs, chunk_loss_phase=phase, chunk_loss_schedule=schedule)
+
     def bind_model(self, model: nn.Module, distributed_setup: Any = None) -> None:
         """Bind a supported complete-sequence V4.1 training model.
 
@@ -58,6 +83,8 @@ class DeepseekV41ChunkedCausalLMLoss(ChunkedCausalLMLoss):
         """
         if self._parallel_size(distributed_setup, "cp_size") != 1:
             raise NotImplementedError("V4.1 Omni Chunk Loss currently requires cp_size=1")
+        if self.requires_sequential_backward and getattr(model, "dspark", None) is None:
+            raise ValueError("Sequential DSpark training requires an enabled drafter")
         super().bind_model(model, distributed_setup)
         logger.info("V4.1 chunked backbone CE enabled; chunk_size=%d; DSpark=%s",
                     self.chunk_size, getattr(model, "dspark", None) is not None)
@@ -97,9 +124,14 @@ def _chunk_loss_forward(
     chunk_loss_mask: torch.Tensor | None,
     chunk_loss_chunk_size: int,
     chunk_loss_ignore_index: int,
+    chunk_loss_phase: str = "combined",
+    chunk_loss_schedule: object | None = None,
     **model_inputs: Any,
 ) -> ChunkedCausalLMOutput:
     """Run the V4.1 backbone and calculate CE without full-sequence logits."""
+    _validate_objective_phase(model, chunk_loss_phase, chunk_loss_schedule)
+    if chunk_loss_phase == "dspark":
+        return _deferred_dspark_forward(model, chunk_loss_schedule)
     if model_inputs.get("past_key_values") is not None or model_inputs.get("use_cache"):
         raise ValueError("DeepSeek-V4.1 Chunk Loss does not support KV cache")
     if model_inputs.pop("return_dict", True) is False:
@@ -142,14 +174,51 @@ def _chunk_loss_forward(
         attentions=getattr(outputs, "attentions", None),
     )
     if getattr(model, "dspark", None) is not None:
-        input_ids = model_inputs.get("input_ids")
-        if not isinstance(input_ids, torch.Tensor):
-            raise ValueError("V4.1 DSpark Chunk Loss requires input_ids")
-        dspark_loss, metrics = model.compute_dspark_loss(input_ids, chunk_loss_targets)
+        _attach_dspark_objective(model, result, model_inputs.get("input_ids"), chunk_loss_targets,
+                                 chunk_loss_phase, chunk_loss_schedule)
+    return result
+
+
+def _validate_objective_phase(model: nn.Module, phase: str, schedule: object | None) -> None:
+    """Reject incomplete or interleaved two-phase training schedules."""
+    if phase not in ("combined", "backbone", "dspark"):
+        raise ValueError("Invalid V4.1 Chunk Loss objective phase")
+    if phase != "combined" and schedule is None:
+        raise ValueError("Sequential objectives require a schedule identity")
+    if phase != "dspark" and getattr(model, "_hp_pending_dspark_schedule", None) is not None:
+        raise RuntimeError("The previous DSpark objective has not completed")
+
+
+def _attach_dspark_objective(model: nn.Module, result: ChunkedCausalLMOutput, input_ids: Any,
+                            targets: torch.Tensor, phase: str, schedule: object | None) -> None:
+    """Attach the original drafter objective or retain its detached input contract."""
+    if not isinstance(input_ids, torch.Tensor):
+        raise ValueError("V4.1 DSpark Chunk Loss requires input_ids")
+    if phase == "backbone":
+        model._hp_pending_dspark_schedule = (schedule, input_ids, targets)
+    else:
+        dspark_loss, metrics = model.compute_dspark_loss(input_ids, targets)
         result.aux_loss = dspark_loss
         result.aux_loss_coef = 1.0
         result.extra_metrics = metrics
-    return result
+
+
+def _deferred_dspark_forward(model: nn.Module, schedule: object) -> ChunkedCausalLMOutput:
+    """Evaluate the original drafter objective after its backbone graph is released."""
+    pending = getattr(model, "_hp_pending_dspark_schedule", None)
+    if pending is None or pending[0] is not schedule:
+        raise RuntimeError("DSpark objective does not match a pending backbone schedule")
+    _, input_ids, targets = pending
+    try:
+        loss, metrics = model.compute_dspark_loss(input_ids, targets)
+        result = ChunkedCausalLMOutput(
+            loss_sum=loss.new_zeros(()), valid_token_count=targets.ne(IGNORE_INDEX).sum(),
+            logits=None, aux_loss=loss, aux_loss_coef=1.0,
+        )
+        result.extra_metrics = metrics
+        return result
+    finally:
+        model._hp_pending_dspark_schedule = None
 
 
 def bind_chunk_loss(model: nn.Module) -> None:

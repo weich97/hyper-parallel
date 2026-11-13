@@ -23,9 +23,10 @@ import math
 import re
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import mock_open, patch
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock, mock_open, patch
 
 import torch
 from torch import nn
@@ -47,6 +48,8 @@ from hyper_parallel.models.deepseek_v41.dspark import (
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM, DeepseekV41Model
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.chunk_loss import DeepseekV41ChunkedCausalLMLoss
+from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.runtime.eager_phases import eager_forward_backward
 
 
 def _small_config() -> SimpleNamespace:
@@ -375,6 +378,68 @@ class DSparkComponentTest(unittest.TestCase):
             torch.testing.assert_close(parameter.grad, references[name].grad,
                                        rtol=2e-5, atol=2e-6, msg=name)
         self.assertGreater(float(candidate.dspark.main_proj.weight.grad.abs().sum()), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_sequential_dspark_preserves_complete_weighted_training_gradients(self) -> None:
+        """Feature: Sequential independent training objectives.
+        Description: Accumulate two complete model microbatches with masked or empty supervision.
+        Expectation: Match every parameter gradient and loss; build DSpark after backbone backward.
+        """
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                torch.manual_seed(119)
+                config = _config()
+                for name, value in vars(_small_config()).items():
+                    if name.startswith("v41_dspark_"):
+                        setattr(config, name, value)
+                config.architectures = ["DeepseekV41ForCausalLM"]
+                config.v41_dspark_noise_token_id = config.vocab_size - 1
+                config.v41_dspark_target_layer_ids = [0]
+                config.v41_dspark_loss_coeff = 0.37
+                with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                           mock_open(read_data='{"layer_ids": []}')):
+                    reference = DeepseekV41ForCausalLM(config)
+                candidate = copy.deepcopy(reference)
+                ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 30, 30, 30]])
+                labels = torch.full_like(ids, IGNORE_INDEX)
+                if not empty:
+                    labels[:, 4:8] = ids[:, 4:8]
+                results = []
+                phases_observed = []
+
+                def observe_drafter(_module: nn.Module, _inputs: tuple) -> None:
+                    """Require backbone gradients before constructing the drafter graph."""
+                    phases_observed.append(candidate.lm_head.weight.grad is not None)
+
+                handle = candidate.dspark.register_forward_pre_hook(observe_drafter)
+                try:
+                    for model, sequential in ((reference, False), (candidate, True)):
+                        loss_fn = DeepseekV41ChunkedCausalLMLoss(chunk_size=3, sequential_dspark=sequential)
+                        loss_fn.bind_model(model)
+                        inputs = loss_fn.prepare_model_inputs(
+                            {"input_ids": ids}, {"labels": labels, "loss_mask": labels.ne(IGNORE_INDEX)})
+                        trainer = SimpleNamespace(
+                            model=model, loss_fn=loss_fn,
+                            current_token_counts={"foundation_tokens": labels.ne(IGNORE_INDEX).sum()},
+                            model_fwd_context=nullcontext, model_bwd_context=nullcontext(),
+                            train_dataloader=SimpleNamespace(prefetch_plan=Mock()),
+                            config=SimpleNamespace(training=SimpleNamespace(empty_cache_before_backward=False)),
+                            mesh=SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False, dp_size=1, cp_size=1),
+                        )
+                        trainer.postforward = MethodType(BaseTrainer.postforward, trainer)
+                        losses = [eager_forward_backward(trainer, inputs, labels)[0].detach() for _ in range(2)]
+                        self.assertEqual(trainer.train_dataloader.prefetch_plan.call_count, 2)
+                        results.append(sum(losses))
+                    torch.testing.assert_close(results[0], results[1], rtol=2e-6, atol=2e-6)
+                    self.assertEqual(phases_observed, [True, True])
+                    self.assertIsNone(candidate._hp_pending_dspark_schedule)
+                    parameters = dict(reference.named_parameters())
+                    for name, parameter in candidate.named_parameters():
+                        torch.testing.assert_close(parameter.grad, parameters[name].grad,
+                                                   rtol=2e-5, atol=2e-6, msg=name)
+                finally:
+                    handle.remove()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

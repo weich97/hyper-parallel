@@ -93,6 +93,7 @@ from hyper_parallel.components.optim.mixed_precision_optimizer import (
 from hyper_parallel.trainer.runtime import fsdp as fsdp_runtime
 from hyper_parallel.trainer.runtime import model_integration as model_integration_runtime
 from hyper_parallel.trainer.runtime.data_iterator import HyperIter
+from hyper_parallel.trainer.runtime.eager_phases import eager_forward_backward
 from hyper_parallel.trainer.runtime.logging import enable_third_party_logging
 from hyper_parallel.trainer.runtime.memory import empty_cache, print_device_mem_info
 from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
@@ -881,6 +882,8 @@ class BaseTrainer(Stateful, ABC):
             self.model_integration.record_batch(micro_batch, loss_inputs)
 
             if self.graph_compiler is not None:
+                if getattr(self.loss_fn, "requires_sequential_backward", False):
+                    raise ValueError("Sequential objective backward requires eager training")
                 runtime_adapter = getattr(getattr(self, "get_batch", None), "runtime_input_adapter", None)
                 if runtime_adapter is not None:
                     micro_batch = runtime_adapter.prepare_graph_inputs(micro_batch)
@@ -898,32 +901,7 @@ class BaseTrainer(Stateful, ABC):
                     current_token_counts=self.current_token_counts,
                 )
             else:
-                model_fwd_context = (
-                    self.model_fwd_context()
-                    if callable(self.model_fwd_context)
-                    else self.model_fwd_context
-                )
-                with model_fwd_context:
-                    outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
-
-                # with use_parallel_state("base"):
-                loss, loss_dict = self.postforward(
-                    outputs, labels,
-                    current_token_counts=self.current_token_counts,
-                )
-                prefetch_plan = getattr(self.train_dataloader, "prefetch_plan", None)
-                if callable(prefetch_plan):
-                    prefetch_plan()  # pylint: disable=not-callable  # Guarded dynamic hook.
-                # The loss graph owns everything required for backward. Releasing
-                # the model output here avoids retaining large vocabulary logits
-                # until the whole backward pass finishes.
-                del outputs
-                if self.config.training.empty_cache_before_backward:
-                    empty_cache()
-
-                # Backward pass
-                with self.model_bwd_context:
-                    loss.backward()
+                loss, loss_dict = eager_forward_backward(self, micro_batch, labels)
             prefetch = getattr(self.train_dataloader, "prefetch", None)
             if callable(prefetch):
                 prefetch()  # pylint: disable=not-callable  # Guarded dynamic hook.
@@ -1000,6 +978,11 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Accumulated token-weighted objective for the optimizer step.
+            loss_dict: Accumulated metrics, normalized in place for loss entries.
+            denominator: Optional shared optimizer-step token count.
         """
         if denominator is None:
             denominator = self._loss_denominator()
@@ -1021,7 +1004,12 @@ class BaseTrainer(Stateful, ABC):
         return loss / denominator
 
     def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
-        """Normalize the step objective before clipping and optimizer preparation."""
+        """Normalize the step objective before clipping and optimizer preparation.
+
+        Args:
+            loss: Accumulated token-weighted objective for the optimizer step.
+            loss_dict: Named accumulated losses and diagnostic metrics.
+        """
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)
