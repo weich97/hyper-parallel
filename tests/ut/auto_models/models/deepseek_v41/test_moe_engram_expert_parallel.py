@@ -140,12 +140,26 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 with self.subTest(dtype=dtype, limit=limit):
                     self._check_grouped_parity(dtype, limit)
 
-    def _check_grouped_parity(self, dtype: torch.dtype, limit: float) -> None:
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_packed_grouped_forward_and_backward_match_oracle(self) -> None:
+        """
+        Feature: Packed activation in the grouped expert adapter.
+        Description: Enable bounded activation between the grouped GEMMs.
+        Expectation: Input and expert parameter gradients match the ordinary clamped path.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            for limit in (-1.0, 1.5, 10.0):
+                with self.subTest(dtype=dtype, limit=limit):
+                    self._check_grouped_parity(dtype, limit, fused=True)
+
+    def _check_grouped_parity(self, dtype: torch.dtype, limit: float, fused: bool = False) -> None:
         """Compare packed projections around the official FP32 activation formula."""
         torch.manual_seed(83)
         config = _expert_config()
         config.swiglu_limit = limit
         experts = DeepseekV4Experts(config).to(dtype=dtype)
+        experts.use_fused_swiglu = fused
         for parameter in experts.parameters():
             torch.nn.init.normal_(parameter)
         reference = copy.deepcopy(experts)

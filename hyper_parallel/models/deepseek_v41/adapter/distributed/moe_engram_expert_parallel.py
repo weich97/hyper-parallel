@@ -30,6 +30,7 @@ from hyper_parallel.distributed.expert_parallel.experts import (
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.adapter.clipped_swiglu import deepseek_v41_packed_swiglu
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
@@ -69,9 +70,12 @@ def _deepseek_v41_grouped_expert_forward(
         group_type=0,
         group_list_type=0,
     )
-    # Cast the packed projections once; the shared helper's casts are then no-ops.
-    gate, up = gate_up.float().chunk(2, dim=-1)
-    intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
+    if getattr(experts, "use_fused_swiglu", False):
+        intermediate = deepseek_v41_packed_swiglu(gate_up, experts.limit)
+    else:
+        # Cast the packed projections once; the shared helper's casts are then no-ops.
+        gate, up = gate_up.float().chunk(2, dim=-1)
+        intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
     return grouped_matmul(  # pylint: disable=not-callable
         intermediate.to(hidden_states.dtype),
         experts.down_proj.transpose(1, 2),
@@ -142,7 +146,12 @@ def _routed_and_shared_forward(
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route with statistics over the current token partitions."""
+        """Route with statistics over the current token partitions.
+
+        Args:
+            target: MoE block owning the router.
+            states: Token activations in the current sequence partition.
+        """
         return _router(
             target, states, image_mask, router_token_mask, router_sequence_ids,
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
@@ -197,6 +206,7 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
+        use_fused_swiglu: bool = False,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -212,6 +222,8 @@ def deepseek_v41_ep_compute_fn(
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
+        use_fused_swiglu: Use native packed SwiGLU with bounded training backward.
+            Requires grouped GEMM and a runtime providing ClippedSwiglu forward.
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
@@ -226,6 +238,8 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
     if not isinstance(fix_router, bool):
         raise ValueError("fix_router must be a boolean")
+    if not isinstance(use_fused_swiglu, bool) or (use_fused_swiglu and not use_grouped_gemm):
+        raise ValueError("use_fused_swiglu must be boolean and requires use_grouped_gemm=true")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
     ep_group = ep_mesh.get_group("ep")
     ep_size = ep_mesh["ep"].size()
@@ -236,6 +250,7 @@ def deepseek_v41_ep_compute_fn(
         if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
     )
     if use_grouped_gemm:
+        module.experts.use_fused_swiglu = use_fused_swiglu
         module.experts.forward_expert_major = MethodType(
             _deepseek_v41_grouped_expert_forward, module.experts,
         )
@@ -395,7 +410,12 @@ def deepseek_v41_megamoe_compute_fn(
             local_image_mask = local_image_mask.contiguous()
 
         def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Keep training metadata attached to the learned gate before balancing."""
+            """Keep training metadata attached to the learned gate before balancing.
+
+            Args:
+                target: MoE block owning the learned gate.
+                states: Local token activations before expert dispatch.
+            """
             return _router(
                 target, states, local_image_mask,
                 router_token_mask=_local_router_metadata(router_token_mask, states, tp_mesh),
