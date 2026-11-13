@@ -43,6 +43,23 @@ def _swiglu_limit(value: float) -> float:
     return float(value)
 
 
+def _validate_execution_layout(fixed_route_tokens: int | None, token_chunk_size: int | None,
+                               expert_weight_layout: str) -> None:
+    """Validate layout and equal per-rank token chunks before allocating parameters."""
+    if fixed_route_tokens is not None and (
+            not isinstance(fixed_route_tokens, int) or isinstance(fixed_route_tokens, bool) or fixed_route_tokens < 1):
+        raise ValueError("fixed_route_tokens must be a positive integer")
+    if expert_weight_layout not in ("EIO", "EOI"):
+        raise ValueError("expert_weight_layout must be EIO or EOI")
+    if token_chunk_size is None:
+        return
+    if (not isinstance(token_chunk_size, int) or isinstance(token_chunk_size, bool)
+            or token_chunk_size < 128 or token_chunk_size % 128):
+        raise ValueError("token_chunk_size must be a positive multiple of 128")
+    if fixed_route_tokens is None or fixed_route_tokens % token_chunk_size:
+        raise ValueError("token_chunk_size requires evenly divisible fixed_route_tokens")
+
+
 @module_replacement
 class DeepseekV41MegaMoeExperts(nn.Module):
     """Own native-layout parameters while retaining the HF checkpoint names."""
@@ -54,7 +71,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
                  dispatch_mode: str = "push", initial_capacity_factor: float | None = None,
                  capacity_growth_factor: float | None = None, initializer_range: float = 0.02,
                  fixed_route_tokens: int | None = None, combine_split: int = 128,
-                 use_matmul_weight_grad: bool = False) -> None:
+                 use_matmul_weight_grad: bool = False, expert_weight_layout: str = "EIO",
+                 token_chunk_size: int | None = None) -> None:
         """Convert a full HF holder before EP partitioning and FSDP construction.
 
         Args:
@@ -68,6 +86,9 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             fixed_route_tokens: Reuse route metadata for this fixed benchmark shape.
             combine_split: Number of rows in each native token combine tile.
             use_matmul_weight_grad: Use separate device GEMMs for expert weight gradients.
+            expert_weight_layout: EIO native layout or EOI to retain the source parameter layout.
+            token_chunk_size: Bound native workspace with equal fixed-routing token chunks.
+                Requires fixed_route_tokens divisible by this positive multiple of 128.
         """
         super().__init__()
         del module_fqn
@@ -82,9 +103,10 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.dispatch_mode = dispatch_mode
         self.initial_capacity_factor = initial_capacity_factor
         self.capacity_growth_factor = capacity_growth_factor
-        if fixed_route_tokens is not None and (type(fixed_route_tokens) is not int or fixed_route_tokens < 1):
-            raise ValueError("fixed_route_tokens must be a positive integer")
+        _validate_execution_layout(fixed_route_tokens, token_chunk_size, expert_weight_layout)
         self.fixed_route_tokens = fixed_route_tokens
+        self.token_chunk_size = token_chunk_size
+        self.expert_weight_layout = expert_weight_layout
         self.combine_split = combine_split
         self.use_matmul_weight_grad = use_matmul_weight_grad
         source_limit = _swiglu_limit(module.limit)
@@ -93,13 +115,18 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         self.global_experts = self.num_experts = module.num_experts
         self.hidden_size = module.hidden_dim
         self.intermediate_size = module.intermediate_dim
-        self.is_transposed = True
+        self.is_transposed = expert_weight_layout == "EIO"
         self.initializer_range = initializer_range
         self.swiglu_limit = source_limit
-        self.gate_up_proj = nn.Parameter(module.gate_up_proj.detach().transpose(1, 2).contiguous(),
-                                         requires_grad=module.gate_up_proj.requires_grad)
-        self.down_proj = nn.Parameter(module.down_proj.detach().transpose(1, 2).contiguous(),
-                                      requires_grad=module.down_proj.requires_grad)
+        if not self.is_transposed:
+            # Identity-layout replacements retain the registered source contract.
+            self.act_fn = module.act_fn
+        for name in ("gate_up_proj", "down_proj"):
+            source = getattr(module, name)
+            parameter = (nn.Parameter(source.detach().transpose(1, 2).contiguous(),
+                                      requires_grad=source.requires_grad)
+                         if self.is_transposed else source)
+            setattr(self, name, parameter)
         self._executor: MegaMoeExperts | None = None
         self.train(module.training)
 
@@ -110,6 +137,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe the reversible HF-to-native checkpoint layout conversion."""
+        if not self.is_transposed:
+            return []
         return [WeightConverter(source_patterns=name, target_patterns=name,
                                 operations=[Transpose(dim0=-2, dim1=-1)])
                 for name in ("gate_up_proj", "down_proj")]
@@ -127,6 +156,8 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise RuntimeError("Cannot reconfigure an active MegaMoe expert executor")
         if self.fixed_route_tokens is not None and not fix_router:
             raise ValueError("Static MegaMoe routes require explicit fixed expert destinations")
+        if self.token_chunk_size is not None and self.token_chunk_size * top_k % self.global_experts:
+            raise ValueError("Every fixed-routing token chunk must contain complete expert-assignment cycles")
         # Multicore is optional for the default native-EP replacement provider.
         from hyper_parallel.core.multicore import MegaMoeExperts  # pylint: disable=C0415
 
@@ -138,6 +169,7 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             capacity_growth_factor=self.capacity_growth_factor, swiglu_limit=self.swiglu_limit,
             create_parameters=False, combine_split=self.combine_split,
             use_matmul_weight_grad=self.use_matmul_weight_grad,
+            expert_weight_layout=self.expert_weight_layout,
         )
 
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
@@ -156,13 +188,35 @@ class DeepseekV41MegaMoeExperts(nn.Module):
             raise RuntimeError("Configure MegaMoe EP execution before forward")
         weights = tuple(parameter.to_local() if isinstance(parameter, DTensor) else parameter
                         for parameter in (self.gate_up_proj, self.down_proj))
-        output = self._executor(
-            hidden_states, top_k_index, top_k_weights, expert_weights=weights, fixed_route_tokens=self.fixed_route_tokens,
-        )
+        if self.token_chunk_size is None:
+            output = self._executor(
+                hidden_states, top_k_index, top_k_weights,
+                expert_weights=weights, fixed_route_tokens=self.fixed_route_tokens,
+            )
+        else:
+            output = self._forward_chunks(hidden_states, top_k_index, top_k_weights, weights)
         if not DeepseekV41MegaMoeExperts._native_forward_reported:
             logger.info_rank0("DeepSeek-V4.1 native MegaMoE engaged")
             DeepseekV41MegaMoeExperts._native_forward_reported = True
         return output
+
+    def _forward_chunks(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+                        top_k_weights: torch.Tensor, weights: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Bound each fused dispatch/compute/combine call inside one FSDP expert boundary."""
+        states = hidden_states.reshape(-1, self.hidden_size)
+        if states.shape[0] != self.fixed_route_tokens:
+            raise ValueError("Chunked MegaMoe requires the declared fixed total token count on every EP rank")
+        expected = (self.fixed_route_tokens, self._executor.top_k)
+        if tuple(top_k_index.shape) != expected or tuple(top_k_weights.shape) != expected:
+            raise ValueError("Chunked MegaMoe requires one routing row per flattened input token")
+        outputs = []
+        for start in range(0, self.fixed_route_tokens, self.token_chunk_size):
+            end = start + self.token_chunk_size
+            outputs.append(self._executor(
+                states[start:end], top_k_index[start:end], top_k_weights[start:end],
+                expert_weights=weights, fixed_route_tokens=self.token_chunk_size,
+            ))
+        return torch.cat(outputs, dim=0).reshape_as(hidden_states)
 
     @staticmethod
     def prepare_runtime_group(experts: list[DeepseekV41MegaMoeExperts]) -> None:

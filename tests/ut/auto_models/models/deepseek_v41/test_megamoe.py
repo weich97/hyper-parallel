@@ -45,7 +45,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
-    DeepseekV41TopKRouter, _v41_sparse_moe_forward,
+    DeepseekV41TopKRouter, _v41_sparse_moe_forward, _dspark_sparse_moe_forward,
 )
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from tests.common.mark_utils import arg_mark
@@ -134,6 +134,8 @@ def _native_reference(module, inputs, indices, weights, *, expert_weights=None, 
     """Differentiate the routed expert math independently of the native executor."""
     del fixed_route_tokens
     gate_up, down_weight = expert_weights or (module.gate_up_weight, module.down_weight)
+    if getattr(module, "expert_weight_layout", "EIO") == "EOI":
+        gate_up, down_weight = gate_up.transpose(1, 2), down_weight.transpose(1, 2)
     original_shape = inputs.shape
     inputs = inputs.reshape(-1, inputs.shape[-1])
     result = torch.zeros_like(inputs)
@@ -155,6 +157,97 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
 
     # White-box assertions verify executor ownership and parameter lifetimes.
     # pylint: disable=protected-access
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_chunked_source_layout_preserves_outputs_and_all_gradients(self) -> None:
+        """Feature: Fixed-route token chunking.
+        Description: Compare chunked and unchunked expert math in source layout.
+        Expectation: Preserve outputs, all four gradients and checkpoint tensors.
+        """
+        torch.manual_seed(19)
+        source = _source()
+        reference = DeepseekV41MegaMoeExperts(module=source, expert_weight_layout="EOI")
+        candidate = DeepseekV41MegaMoeExperts(module=source, expert_weight_layout="EOI",
+                                             fixed_route_tokens=256, token_chunk_size=128)
+        for experts in (reference, candidate):
+            experts.configure(None, 1, 2, fix_router=True)
+            self.addCleanup(experts.close_runtime)
+        inputs = torch.randn(2, 128, 8, requires_grad=True)
+        indices = (torch.arange(512) % 4).reshape(256, 2)
+        weights = torch.rand(256, 2, requires_grad=True)
+        with patch.object(MegaMoeExperts, "forward", autospec=True, side_effect=_native_reference) as kernel:
+            expected = reference(inputs, indices, weights)
+            actual = candidate(inputs, indices, weights)
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        derivative = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, (inputs, weights, *candidate.parameters()), derivative,
+                                           retain_graph=True)
+        expected_grads = torch.autograd.grad(expected, (inputs, weights, *reference.parameters()), derivative)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=2e-4)
+        self.assertEqual([call.args[1].numel() // 8 for call in kernel.call_args_list], [256, 128, 128])
+        self.assertEqual(candidate.make_transforms(), [])
+        self.assertFalse(candidate.is_transposed)
+        for name, tensor in source.state_dict().items():
+            torch.testing.assert_close(candidate.state_dict()[name], tensor, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_source_layout_passes_declarative_replacement_contract(self) -> None:
+        """Feature: Source-layout module replacement.
+        Description: Install the EOI provider through the production replacement executor.
+        Expectation: Preserve source parameter identities and registered activation modules.
+        """
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "train.yaml"
+            path.write_text(_RECIPE_YAML.replace("dispatch_mode: push", "dispatch_mode: push\n"
+                                                "        expert_weight_layout: EOI"), encoding="utf-8")
+            config = parse_training_args([str(path)])
+        entry = next(entry for entry in config.plan_overrides
+                     if entry.replace is not None and entry.replace.kind == "module"
+                     and entry.replace.implementation.callable is DeepseekV41MegaMoeExperts)
+        model = nn.Module()
+        model.model = nn.Module()
+        model.model.layers = nn.ModuleList([nn.Module()])
+        model.model.layers[0].mlp = nn.Module()
+        source = DeepseekV4Experts(DeepseekV4Config.from_dict({
+            "hidden_size": 32, "moe_intermediate_size": 16,
+            "num_local_experts": 4, "num_experts_per_tok": 2, "swiglu_limit": 10.,
+        }))
+        model.model.layers[0].mlp.experts = source
+        parameters = dict(source.named_parameters())
+        rules = entries_to_module_replacements([entry])
+        conversions = []
+        apply_module_replacements(model, compile_module_replacements(model, rules),
+                                  weights_mapping=conversions)
+        replacement = model.model.layers[0].mlp.experts
+        self.assertIsInstance(replacement, DeepseekV41MegaMoeExperts)
+        self.assertIs(replacement.act_fn, source.act_fn)
+        self.assertEqual(conversions, [])
+        for name, parameter in replacement.named_parameters():
+            self.assertIs(parameter, parameters[name])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_chunked_routes_reject_incompatible_shape_before_execution(self) -> None:
+        """Feature: Fixed-route token chunking.
+        Description: Exercise invalid layouts, schedules and input shapes.
+        Expectation: Reject invalid contracts before entering native collectives.
+        """
+        for options in ({"token_chunk_size": 127}, {"token_chunk_size": 128},
+                        {"token_chunk_size": 128, "fixed_route_tokens": 129},
+                        {"expert_weight_layout": "invalid"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                DeepseekV41MegaMoeExperts(module=_source(), **options)
+        candidate = DeepseekV41MegaMoeExperts(module=_source(), fixed_route_tokens=256, token_chunk_size=128)
+        with self.assertRaisesRegex(ValueError, "explicit fixed"):
+            candidate.configure(None, 1, 2)
+        candidate.configure(None, 1, 2, fix_router=True)
+        self.addCleanup(candidate.close_runtime)
+        with patch.object(MegaMoeExperts, "forward") as kernel:
+            with self.assertRaisesRegex(ValueError, "fixed total token"):
+                candidate(torch.zeros(128, 8), torch.zeros(128, 2), torch.ones(128, 2))
+            with self.assertRaisesRegex(ValueError, "routing row"):
+                candidate(torch.zeros(256, 8), torch.zeros(128, 2), torch.ones(128, 2))
+        kernel.assert_not_called()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -184,8 +277,12 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.assertIs(experts._executor._ep_group, group)
         self.assertTrue(experts._executor._resource_group.specification["auto_tokens"])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_declared_replacements_preserve_base_modules_and_precision(self) -> None:
-        """Resolve text/VLM YAML fixtures with paired expert and compute targets."""
+        """Feature: Declarative expert replacement.
+        Description: Resolve text/VLM fixtures with paired expert and compute targets.
+        Expectation: Preserve base-module selection and precision configuration.
+        """
         for multimodal in (False, True):
             with self.subTest(multimodal=multimodal):
                 mega = _parse_recipe(multimodal)
@@ -292,8 +389,12 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "TP>1 requires EP>1"):
             deepseek_v41_megamoe_compute_fn(**args)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_disabled_ep_retains_native_dispatch_and_router(self) -> None:
-        """The original compute target retains the existing EP helpers."""
+        """Feature: Generic expert-parallel execution.
+        Description: Bind the original compute target without native MegaMoe.
+        Expectation: Retain the existing dispatch helpers and learned router.
+        """
         experts = SimpleNamespace(_apply_gate=object(), limit=10.0)
         module = SimpleNamespace(is_hash=False, gate=Mock(), experts=experts,
                                  shared_experts=lambda value: value + 1,
@@ -357,6 +458,41 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for left, right in zip(actual_grads, expected_grads):
             torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-5)
         self.assertGreater(actual_grads[0][image_mask].abs().sum().item(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dspark_forward_signature_preserves_routed_and_shared_gradients(self) -> None:
+        """Feature: DSpark native expert integration.
+        Description: Bind the actual DSpark signature without packed-router arguments.
+        Expectation: Preserve DSpark outputs and routed, shared and input gradients.
+        """
+        torch.manual_seed(83)
+        gate = DeepseekV41TopKRouter(SimpleNamespace(
+            hidden_size=8, num_local_experts=4, num_experts_per_tok=2, scoring_func="sigmoid",
+            routed_scaling_factor=1.0, v41_vision_enabled=False,
+        ))
+        nn.init.normal_(gate.weight, std=0.1)
+        experts = DeepseekV41MegaMoeExperts(module=_source(), expert_weight_layout="EOI")
+        self.addCleanup(experts.close_runtime)
+        shared = nn.Linear(8, 8)
+        shared.limit = 10.0
+        module = SimpleNamespace(experts=experts, shared_experts=shared, gate=gate, is_hash=False)
+        module.forward = MethodType(_dspark_sparse_moe_forward, module)
+        compute = deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None,
+                                                 cp_mesh=None, ep_mesh=None)
+        validate_local_compute_signature(compute, module.forward, owner="DSpark MegaMoe")
+        hidden = torch.randn(1, 7, 8, requires_grad=True)
+        _, weights, ids = gate(hidden)
+        expected = _native_reference(experts._executor, hidden, ids, weights,
+                                     expert_weights=(experts.gate_up_proj, experts.down_proj)) + shared(hidden)
+        with patch.object(MegaMoeExperts, "forward", _native_reference):
+            actual = compute(module, hidden, input_ids=torch.arange(7).unsqueeze(0), image_mask=None)
+        torch.testing.assert_close(actual, expected)
+        targets = (hidden, gate.weight, experts.gate_up_proj, experts.down_proj, shared.weight)
+        derivative = torch.randn_like(actual)
+        for actual_grad, expected_grad in zip(torch.autograd.grad(actual, targets, derivative),
+                                              torch.autograd.grad(expected, targets, derivative)):
+            torch.testing.assert_close(actual_grad, expected_grad)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -429,8 +565,12 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
                 for left, right in zip(actual_grads, expected_grads):
                     torch.testing.assert_close(left, right)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_declarative_config_and_checkpoint_roundtrip(self) -> None:
-        """Resolve both fixtures through the actual YAML Target replacement executor."""
+        """Feature: Expert checkpoint conversion.
+        Description: Resolve both fixtures through the YAML Target replacement executor.
+        Expectation: Convert expert layouts reversibly without changing checkpoint values.
+        """
         for multimodal in (False, True):
             with self.subTest(multimodal=multimodal):
                 config = _parse_recipe(multimodal)

@@ -460,8 +460,33 @@ def deepseek_v41_megamoe_compute_fn(
         indices, weights = _resolve_router(router_fn, fix_router=fix_router, ep_size=ep_size)(module, hidden_states)
         return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
 
-    if "image_mask" in inspect.signature(module.forward).parameters:
+    return _megamoe_source_callable(module, compute_fn)
+
+
+def _megamoe_source_callable(module: Any, compute_fn: Callable) -> Callable:
+    """Retain only the routing arguments exposed by the source MoE forward."""
+    source_parameters = inspect.signature(module.forward).parameters
+    if "router_token_mask" in source_parameters:
         return compute_fn
+
+    if "image_mask" in source_parameters:
+        def multimodal_compute_fn(
+                module: Any,
+                hidden_states: torch.Tensor,
+                input_ids: torch.Tensor | None = None,
+                image_mask: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            """Match source blocks without packed-router metadata, including DSpark.
+
+            Args:
+                module: MoE block owning the configured expert executor.
+                hidden_states: Local token activations before expert dispatch.
+                input_ids: Unused token IDs from the source call contract.
+                image_mask: Optional image-token mask from the source contract.
+            """
+            return compute_fn(module, hidden_states, input_ids=input_ids, image_mask=image_mask)
+
+        return multimodal_compute_fn
 
     def text_compute_fn(
             module: Any,
