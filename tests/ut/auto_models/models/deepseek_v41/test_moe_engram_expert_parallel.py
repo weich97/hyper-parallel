@@ -18,7 +18,7 @@
 import copy
 import unittest
 from itertools import product
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -33,8 +33,11 @@ except ImportError as exc:
 
 from hyper_parallel.components import functional as hp_functional
 from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.distributed.expert_parallel.experts import _local_swiglu_expert_forward
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+    _checkpointed_grouped_expert_forward,
     _deepseek_v41_grouped_expert_forward,
+    _routed_and_shared_forward,
     deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
@@ -85,6 +88,81 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
             outputs.append(inputs[group_start:group_end] @ weight[expert_id])
             group_start = group_end
         return torch.cat(outputs, dim=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_single_local_expert_avoids_permutation_and_recomputes_math(self) -> None:
+        """
+        Feature: Single-expert dispatch and bounded local recomputation.
+        Description: Run the actual local EP entry with one expert and checkpointed grouped math.
+        Expectation: No permutation occurs and all outputs and gradients match the uncheckpointed oracle.
+        """
+        torch.manual_seed(87)
+        for rows in (0, 7):
+            with self.subTest(rows=rows):
+                config = _expert_config()
+                config.n_routed_experts = config.num_local_experts = 1
+                experts = DeepseekV4Experts(config)
+                for parameter in experts.parameters():
+                    torch.nn.init.normal_(parameter)
+                reference = copy.deepcopy(experts)
+                experts.local_expert_count = 1
+                experts._ep_use_grouped_gemm = True
+                experts.use_fused_swiglu = True
+                experts.forward_expert_major = MethodType(_checkpointed_grouped_expert_forward, experts)
+                inputs = torch.randn(rows, config.hidden_size, requires_grad=True)
+                oracle_inputs = inputs.detach().clone().requires_grad_()
+                indices = torch.zeros(rows, dtype=torch.long)
+                grouped = Mock(side_effect=self._cpu_grouped_matmul)
+                with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}), patch(
+                        "hyper_parallel.distributed.expert_parallel.experts._argsort_keys",
+                        side_effect=AssertionError("Single local expert must not sort")):
+                    actual = _local_swiglu_expert_forward(experts, inputs, indices)
+                    self.assertEqual(grouped.call_args_list[0].args[0].data_ptr(), inputs.data_ptr())
+                    actual.sum().backward()
+                gate, up = functional.linear(  # pylint: disable=not-callable
+                    oracle_inputs, reference.gate_up_proj[0],
+                ).chunk(2, dim=-1)
+                expected = functional.linear(  # pylint: disable=not-callable
+                    functional.silu(gate.clamp(max=experts.limit)) * up.clamp(-experts.limit, experts.limit),
+                    reference.down_proj[0],
+                )
+                expected.sum().backward()
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(inputs.grad, oracle_inputs.grad)
+                for parameter, oracle in zip(experts.parameters(), reference.parameters()):
+                    torch.testing.assert_close(parameter.grad, oracle.grad)
+                self.assertGreater(grouped.call_count, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ep_preserves_shared_checkpoint_without_replaying_dispatch(self) -> None:
+        """
+        Feature: DSpark shared-expert checkpoint policy after EP replacement.
+        Description: Recompute the shared branch while keeping routed communication outside its region.
+        Expectation: Dispatch runs once and shared expert values and gradients match direct execution.
+        """
+        module = torch.nn.Module()
+        module.shared_experts = torch.nn.Sequential(torch.nn.Linear(6, 12), torch.nn.SiLU(), torch.nn.Linear(12, 6))
+        module.recompute_shared_experts = True
+        oracle = copy.deepcopy(module)
+        inputs = torch.randn(1, 4, 6, requires_grad=True)
+        oracle_inputs = inputs.detach().clone().requires_grad_()
+        shared_calls = []
+        handle = module.shared_experts.register_forward_pre_hook(lambda *_args: shared_calls.append(True))
+        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        with patch(prefix + ".ep_routed_forward", side_effect=lambda _module, states, **_kwargs: states * .25) as route:
+            actual = _routed_and_shared_forward(module, inputs, None, None, ep_size=1)
+            actual.sum().backward()
+        handle.remove()
+        expected = oracle_inputs * .25 + oracle.shared_experts(oracle_inputs)
+        expected.sum().backward()
+        self.assertEqual(route.call_count, 1)
+        self.assertEqual(len(shared_calls), 2)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(inputs.grad, oracle_inputs.grad)
+        for parameter, reference in zip(module.parameters(), oracle.parameters()):
+            torch.testing.assert_close(parameter.grad, reference.grad)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
@@ -317,7 +395,7 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 ep_mesh=ep_mesh, use_grouped_gemm=True,
             )
         self.assertTrue(callable(compute))
-        self.assertIs(experts.forward_expert_major.__func__, _deepseek_v41_grouped_expert_forward)
+        self.assertEqual(experts.forward_expert_major, MethodType(_deepseek_v41_grouped_expert_forward, experts))
         bind.assert_called_once_with(module, 2, use_grouped_gemm=True, apply_gate=None)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

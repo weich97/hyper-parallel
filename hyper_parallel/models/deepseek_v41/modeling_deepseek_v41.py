@@ -1368,6 +1368,9 @@ def _build_dspark_mlp(config: Any) -> nn.Module:
     dspark_config.num_experts_per_tok = int(getattr(config, "v41_dspark_top_k", config.num_experts_per_tok))
     mlp = DeepseekV4DecoderLayer(dspark_config, 0).mlp
     mlp.gate = DeepseekV41TopKRouter(dspark_config)
+    # The EP method replacement must preserve the drafter's shared-branch
+    # checkpoint policy as well as its routing and activation semantics.
+    mlp.recompute_shared_experts = True
     mlp.forward = MethodType(_dspark_sparse_moe_forward, mlp)
     return mlp
 

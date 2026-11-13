@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.distributed.expert_parallel.experts import (
@@ -84,6 +85,22 @@ def _deepseek_v41_grouped_expert_forward(
         group_type=0,
         group_list_type=0,
     )
+
+
+def _checkpointed_grouped_expert_forward(
+        experts: torch.nn.Module, hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Recompute only local expert math inside the expert's FSDP boundary.
+
+    Args:
+        experts: Already unsharded local expert module.
+        hidden_states: Expert-major activations after EP dispatch.
+        tokens_per_expert: Local expert row counts.
+    """
+    if torch.is_grad_enabled() and experts.training:
+        return checkpoint(_deepseek_v41_grouped_expert_forward, experts, hidden_states,
+                          tokens_per_expert, use_reentrant=False)
+    return _deepseek_v41_grouped_expert_forward(experts, hidden_states, tokens_per_expert)
 
 
 def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any) -> torch.Tensor | None:
@@ -161,7 +178,11 @@ def _routed_and_shared_forward(
         module, hidden_states,
         router_fn=_resolve_router(router_fn, ep_size=ep_size, fix_router=fix_router), ep_group=ep_group,
     )
-    return routed + module.shared_experts(hidden_states)
+    if getattr(module, "recompute_shared_experts", False) and torch.is_grad_enabled() and module.training:
+        shared = checkpoint(module.shared_experts, hidden_states, use_reentrant=False)
+    else:
+        shared = module.shared_experts(hidden_states)
+    return routed + shared
 
 
 def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False) -> Callable:
@@ -196,6 +217,18 @@ def _resolve_router(router_fn: Callable, ep_size: int, fix_router: bool = False)
     return balanced_router
 
 
+def _validate_ep_execution_options(
+        use_grouped_gemm: bool, fix_router: bool, use_fused_swiglu: bool, recompute_local_experts: bool,
+) -> None:
+    """Validate explicit grouped execution features before mutating module bindings."""
+    if not isinstance(fix_router, bool):
+        raise ValueError("fix_router must be a boolean")
+    for name, enabled in (("use_fused_swiglu", use_fused_swiglu),
+                          ("recompute_local_experts", recompute_local_experts)):
+        if not isinstance(enabled, bool) or (enabled and not use_grouped_gemm):
+            raise ValueError(f"{name} must be boolean and requires use_grouped_gemm=true")
+
+
 @local_compute
 def deepseek_v41_ep_compute_fn(
         *,
@@ -207,6 +240,7 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: bool = False,
         fix_router: bool = False,
         use_fused_swiglu: bool = False,
+        recompute_local_experts: bool = False,
 ) -> Callable:
     """Build V4.1 routed/shared computation with training-aware routing.
 
@@ -224,6 +258,8 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: Use the existing V4.1 clamped grouped-GEMM expert path.
         use_fused_swiglu: Use native packed SwiGLU with bounded training backward.
             Requires grouped GEMM and a runtime providing ClippedSwiglu forward.
+        recompute_local_experts: Checkpoint grouped expert math without replaying
+            EP dispatch or combine collectives. Requires grouped GEMM.
         fix_router: Enable benchmark-only balanced destinations while retaining
             learned Top-K weights and their gradients. Normal training and
             correctness runs keep this disabled.
@@ -236,10 +272,7 @@ def deepseek_v41_ep_compute_fn(
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
-    if not isinstance(fix_router, bool):
-        raise ValueError("fix_router must be a boolean")
-    if not isinstance(use_fused_swiglu, bool) or (use_fused_swiglu and not use_grouped_gemm):
-        raise ValueError("use_fused_swiglu must be boolean and requires use_grouped_gemm=true")
+    _validate_ep_execution_options(use_grouped_gemm, fix_router, use_fused_swiglu, recompute_local_experts)
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
     ep_group = ep_mesh.get_group("ep")
     ep_size = ep_mesh["ep"].size()
@@ -252,7 +285,8 @@ def deepseek_v41_ep_compute_fn(
     if use_grouped_gemm:
         module.experts.use_fused_swiglu = use_fused_swiglu
         module.experts.forward_expert_major = MethodType(
-            _deepseek_v41_grouped_expert_forward, module.experts,
+            _checkpointed_grouped_expert_forward if recompute_local_experts
+            else _deepseek_v41_grouped_expert_forward, module.experts,
         )
     bind_local_expert_forward(
         module, ep_size, use_grouped_gemm=use_grouped_gemm,

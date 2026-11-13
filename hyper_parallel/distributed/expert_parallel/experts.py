@@ -89,6 +89,9 @@ def resolve_swiglu_weights(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Resolve SwiGLU weights from the stacked holder (three layouts).
 
+    Args:
+        experts: Module exposing packed or separate expert projection weights.
+
     Returns (w_gate, w_up, w_down):
     - Separate naming: gate_proj/up_proj/down_proj or w1/w3/w2 (all
       [E, I, H]/[E, H, I]);
@@ -220,13 +223,19 @@ def _local_swiglu_expert_forward(experts, dispatched_states, local_expert_indice
     the parent MoE forward, allows nested FSDP forward hooks to unshard and
     reshard expert parameters around the local computation.
     """
+    grouped_forward = getattr(experts, "forward_expert_major", None)
+    if (experts.local_expert_count == 1 and getattr(experts, "_ep_use_grouped_gemm", False)
+            and callable(grouped_forward)):
+        # Every row already belongs to the only local expert. Retain index/count
+        # validation but avoid full activation copies for sorting and its inverse.
+        counts = _expert_token_counts(local_expert_indices, 1)
+        return grouped_forward(dispatched_states, counts)
     token_order = _argsort_keys(
         local_expert_indices, bound=experts.local_expert_count)
     sorted_states = dispatched_states[token_order]
     local_expert_counts = _expert_token_counts(
         local_expert_indices, experts.local_expert_count)
     if getattr(experts, "_ep_use_grouped_gemm", False):
-        grouped_forward = getattr(experts, "forward_expert_major", None)
         if callable(grouped_forward):
             sorted_output = grouped_forward(sorted_states, local_expert_counts)
         else:
@@ -311,6 +320,12 @@ def bind_local_expert_forward(
     apply_gate: Optional[Callable] = None,
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
+
+    Args:
+        module: Parent MoE module owning the local expert container.
+        ep_size: Number of ranks partitioning the global experts.
+        use_grouped_gemm: Enable grouped matrix multiplication for local experts.
+        apply_gate: Optional model-specific activation for the ungrouped path.
 
     Called by the EP compute factory (archetype or user-written) at apply
     time: sets ``module.experts.local_expert_count`` and installs
@@ -1049,6 +1064,14 @@ def ep_routed_forward(
     """Routed-experts pipeline: SP-in (local chunk) -> all communication
     inside -> SP-out. **Routed branch only.**
 
+    Args:
+        module: Parent MoE module owning the router and expert container.
+        hidden_states: Local input tokens before expert dispatch.
+        router_fn: Model-owned expert indices and routing-weight computation.
+        ep_group: Expert-parallel process group.
+        use_fused_moe_token_permute_and_unpermute: Use native NPU routing permutations
+            when compatible with the selected dispatch configuration.
+
     This primitive deliberately does NOT handle shared experts / scalar
     gates / branch merging — that composition is model semantics and belongs
     to the caller (an ep_compute.py archetype or a user-written factory,
@@ -1448,6 +1471,11 @@ def require_attrs(module: Any, *names: str, owner: str = "") -> None:
     The check is structural (the names the implementation will call exist);
     it does not prove semantic correctness — that is vouched by numeric
     verification.
+
+    Args:
+        module: MoE module whose interface is being checked.
+        names: Required attribute names.
+        owner: Optional implementation label included in diagnostics.
     """
     missing = [n for n in names if not hasattr(module, n)]
     if not missing:
@@ -1469,7 +1497,11 @@ def describe_moe_module(module: Any) -> str:
     """Structural diagnostic for a MoE module: child submodules, direct
     parameter shapes, and expert-related attributes — the facts needed to
     pick an EP archetype or write a custom factory. Returns the report;
-    also logged at INFO."""
+    also logged at INFO.
+
+    Args:
+        module: MoE module whose structure is described.
+    """
     lines = [f"MoE module: {type(module).__name__}"]
     children = list(module.named_children())
     lines.append(f"children ({len(children)}):")
