@@ -54,6 +54,8 @@ def build_mega_mhc_grad_plan(
     num_cube_cores: int,
     num_vector_cores: int,
     token_tile: int = DEFAULT_GRAD_TOKEN_TILE,
+    *,
+    parallel_previous_x: bool = False,
 ) -> MegaMhcGradPlan:
     """Build and materialize the token-tiled fused backward schedule.
 
@@ -64,6 +66,7 @@ def build_mega_mhc_grad_plan(
         num_cube_cores: Number of physical AIC cores.
         num_vector_cores: Number of physical AIV cores.
         token_tile: Requested AIV token tile.
+        parallel_previous_x: Parallelize independent final-stage activation gradients.
 
     Returns:
         Reusable backward plan bound to the requested shape and device.
@@ -74,6 +77,7 @@ def build_mega_mhc_grad_plan(
         hidden_size,
         token_tile,
         num_vector_cores=num_vector_cores,
+        parallel_previous_x=parallel_previous_x,
     )
     runtime_config = build_runtime_config(
         graph, topology, rank_id=0, num_cube_cores=num_cube_cores

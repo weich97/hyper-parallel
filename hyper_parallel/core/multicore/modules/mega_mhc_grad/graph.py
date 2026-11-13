@@ -340,6 +340,7 @@ class _PreviousXFillConfig(FillConfig):
     """Emit fused ComputeGradX1 and MhcPost backward tasks."""
 
     tiling: MegaMhcGradTiling
+    output_token_tile: int
 
     def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
         """Append fused previous-X and MhcPost gradient tasks.
@@ -357,11 +358,13 @@ class _PreviousXFillConfig(FillConfig):
                 tsv,
                 task_type=TaskType.TASK_MHC_GRAD_PREV_X_AND_POST,
                 core_type=TaskAiCoreType.TASK_AICORE_VECTOR,
-                dependent_event=(layout.phi_rms_base + self.tiling.macro_for_tile(task_index)),
+                dependent_event=(
+                    layout.phi_rms_base + task_index * self.output_token_tile // self.tiling.cube_tile
+                ),
                 trigger_event=layout.final,
                 task_index=task_index,
                 task_num=op.task_num,
-                split_value=self.tiling.token_tile,
+                split_value=self.output_token_tile,
             )
 
 
@@ -403,6 +406,7 @@ def build_mega_mhc_grad_graph(
     token_tile: int = DEFAULT_GRAD_TOKEN_TILE,
     *,
     num_vector_cores: int,
+    parallel_previous_x: bool = False,
 ) -> tuple[ComputeGraph, TaskSplitValue]:
     """Build the RMS -> PrevAAndMapping -> PhiRms -> PrevXAndPost token pipeline.
 
@@ -411,6 +415,8 @@ def build_mega_mhc_grad_graph(
         hidden_size: Hidden dimension of every token.
         token_tile: Requested AIV token tile.
         num_vector_cores: Physical AIV count reported for the target device.
+        parallel_previous_x: Split independent activation-gradient work after a
+            single ordered projection tile. Parameter reductions stay unchanged.
 
     Returns:
         Compute graph and its single-rank topology description.
@@ -420,8 +426,20 @@ def build_mega_mhc_grad_graph(
             "token_count, hidden_size, and num_vector_cores must be positive, "
             f"got {(token_count, hidden_size, num_vector_cores)}."
         )
+    if not isinstance(parallel_previous_x, bool):
+        raise TypeError("parallel_previous_x must be a boolean")
     token_tile = resolve_grad_token_tile(token_count, token_tile)
     tiling = make_grad_tiling(token_count, token_tile)
+    output_token_tile = token_tile
+    if parallel_previous_x and tiling.macro_count == 1:
+        # Each final task reads the completed projection workspace and writes a
+        # disjoint token interval; none accumulates shared parameter gradients.
+        rows_per_core = (token_count + num_vector_cores - 1) // num_vector_cores
+        output_token_tile = (
+            (rows_per_core + NATIVE_GRAD_VECTOR_TILE - 1)
+            // NATIVE_GRAD_VECTOR_TILE * NATIVE_GRAD_VECTOR_TILE
+        )
+    output_tile_count = (token_count + output_token_tile - 1) // output_token_tile
     build_event_layout(tiling.tile_count, tiling.macro_count)
     topology = TaskSplitValue(tp=1, ep=1, seq_size=token_count, all_expert_num=1, top_k=1)
     data = TensorSpec("grad_data", [token_count, hidden_size], 0)
@@ -488,9 +506,9 @@ def build_mega_mhc_grad_graph(
     )
     prev_x_and_post = make_op(
         "mhc_grad_prev_x_and_post",
-        tiling.tile_count,
-        token_tile,
-        _PreviousXFillConfig(tiling),
+        output_tile_count,
+        output_token_tile,
+        _PreviousXFillConfig(tiling, output_token_tile),
         "MhcGradPrevXAndPost",
     )
 

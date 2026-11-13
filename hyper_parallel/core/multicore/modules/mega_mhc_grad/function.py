@@ -60,6 +60,8 @@ def _get_cached_plan(
     num_cube_cores: int,
     num_vector_cores: int,
     token_tile: int,
+    *,
+    parallel_previous_x: bool = True,
 ) -> MegaMhcGradPlan:
     """Reuse immutable RuntimeConfig tensors for recurring static shapes."""
     return build_mega_mhc_grad_plan(
@@ -69,6 +71,7 @@ def _get_cached_plan(
         num_cube_cores,
         num_vector_cores,
         token_tile,
+        parallel_previous_x=parallel_previous_x,
     )
 
 
@@ -77,6 +80,8 @@ def _get_plan_for_shape(
     hidden_size: int,
     device: torch.device,
     token_tile: int,
+    *,
+    parallel_previous_x: bool = True,
 ) -> MegaMhcGradPlan:
     """Resolve physical cores and retrieve the immutable plan for this shape."""
     device_index = device.index
@@ -91,6 +96,7 @@ def _get_plan_for_shape(
         num_cube_cores,
         num_vector_cores,
         token_tile,
+        parallel_previous_x=parallel_previous_x,
     )
 
 
@@ -152,6 +158,7 @@ def hyper_mega_mhc_grad(
     *,
     hc_eps: float = 1e-6,
     token_tile: int = DEFAULT_GRAD_TOKEN_TILE,
+    parallel_previous_x: bool = True,
 ) -> MegaMhcGradOutputs:
     """Execute the fused Prepare/PhiRms/PrevXPost backward pipeline.
 
@@ -174,10 +181,14 @@ def hyper_mega_mhc_grad(
         hc_eps: RMSNorm epsilon.
         token_tile: Number of tokens assigned to each AIV task. Global deterministic
             mode overrides this with one full-token tile to order parameter reductions.
+        parallel_previous_x: Parallelize the independent final activation-gradient
+            stage without changing parameter-gradient accumulation order.
 
     Returns:
         Gradients for the five block inputs and four trainable tensors.
     """
+    if not isinstance(parallel_previous_x, bool):
+        raise TypeError("parallel_previous_x must be a boolean")
     validate_mega_mhc_native_inputs(
         previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix,
         phi, alpha, bias, norm_weight, need_backward=True, token_tile=token_tile,
@@ -193,7 +204,10 @@ def hyper_mega_mhc_grad(
     # order. A single task removes that source of variation, at a performance cost.
     if torch.are_deterministic_algorithms_enabled():
         token_tile = token_count
-    plan = _get_plan_for_shape(token_count, hidden_size, residual.device, token_tile)
+    plan = _get_plan_for_shape(
+        token_count, hidden_size, residual.device, token_tile,
+        parallel_previous_x=parallel_previous_x,
+    )
     events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
     kernel_inputs = (
         grad_block_input.reshape(1, token_count, hidden_size).contiguous(),

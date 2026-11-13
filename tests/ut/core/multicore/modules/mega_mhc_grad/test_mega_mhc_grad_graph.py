@@ -47,6 +47,67 @@ class TestMegaMhcGradGraph(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_ordered_reductions_allow_disjoint_parallel_activation_outputs(self) -> None:
+        """Feature: Deterministic mHC final-stage parallelism.
+
+        Description: Compare ordered graphs with independent output tiling.
+        Expectation: Reduction tasks are identical and outputs cover each token once.
+        """
+        for tokens in (40, 65, 2048, 16384):
+            with self.subTest(tokens=tokens):
+                configs = []
+                for enabled in (False, True):
+                    graph, topology = build_mega_mhc_grad_graph(
+                        tokens, 5120, token_tile=tokens, num_vector_cores=NUM_VECTOR_CORES,
+                        parallel_previous_x=enabled,
+                    )
+                    config = build_runtime_config(graph, topology, num_cube_cores=NUM_CUBE_CORES)
+                    order_vector_tasks_by_stage(config)
+                    _validate_runtime_task_queues(config, config.event_capacity)
+                    configs.append(config)
+                reduction_tasks = []
+                for config in configs:
+                    reduction_tasks.append([
+                        bytes(task) for task in config.all_tasks[:config.task_num]
+                        if task.task_type != TaskType.TASK_MHC_GRAD_PREV_X_AND_POST
+                    ])
+                self.assertEqual(reduction_tasks[0], reduction_tasks[1])
+                output_tasks = [
+                    task for task in configs[1].all_tasks[:configs[1].task_num]
+                    if task.task_type == TaskType.TASK_MHC_GRAD_PREV_X_AND_POST
+                ]
+                layout = build_event_layout(1, 1)
+                self.assertGreater(len(output_tasks), 1)
+                self.assertLessEqual(len(output_tasks), NUM_VECTOR_CORES)
+                cursor = 0
+                for task in output_tasks:
+                    self.assertEqual(task.task_index * task.task_split_value, cursor)
+                    self.assertEqual(task.dependent_event, layout.phi_rms_base)
+                    self.assertEqual(task.trigger_event, layout.final)
+                    cursor += min(task.task_split_value, tokens - cursor)
+                self.assertEqual(cursor, tokens)
+                self.assertEqual(configs[1].all_event_num_triggers[layout.final], len(output_tasks))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_parallel_output_option_preserves_multi_macro_dependencies(self) -> None:
+        """Feature: Existing multi-tile scheduling.
+
+        Description: Enable output parallelism with several projection producers.
+        Expectation: The existing per-macro dependencies remain byte-identical.
+        """
+        task_arrays = []
+        for enabled in (False, True):
+            graph, topology = build_mega_mhc_grad_graph(
+                2048, 5120, token_tile=32, num_vector_cores=NUM_VECTOR_CORES,
+                parallel_previous_x=enabled,
+            )
+            config = build_runtime_config(graph, topology, num_cube_cores=NUM_CUBE_CORES)
+            task_arrays.append([bytes(task) for task in config.all_tasks[:config.task_num]])
+        self.assertEqual(task_arrays[0], task_arrays[1])
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     @patch("hyper_parallel.core.multicore.modules.mega_mhc_grad.function.torch.npu", create=True)
     def test_resolve_core_counts_uses_device_vector_count(self, mock_npu) -> None:
         """Feature: HyperMegaMhcGrad device core discovery.
