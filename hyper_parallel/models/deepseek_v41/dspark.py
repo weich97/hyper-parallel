@@ -497,6 +497,9 @@ class DSparkStage(nn.Module):
         self.activation_offload = getattr(config, "v41_dspark_activation_offload", False)
         if not isinstance(self.activation_offload, bool):
             raise ValueError("v41_dspark_activation_offload must be a boolean")
+        self.offload_pin_memory = getattr(config, "v41_dspark_offload_pin_memory", True)
+        if not isinstance(self.offload_pin_memory, bool):
+            raise ValueError("v41_dspark_offload_pin_memory must be a boolean")
         self.attn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530100 + stage_index)
         self.ffn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530200 + stage_index)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -583,7 +586,8 @@ class DSparkStage(nn.Module):
         # existing local checkpoints still bound temporary activations; their
         # saved inputs now release device storage between draft stages.
         storage = (torch.autograd.graph.save_on_cpu(
-            pin_memory=hidden_streams.device.type != "cpu", device_type=hidden_streams.device.type,
+            pin_memory=self.offload_pin_memory and hidden_streams.device.type != "cpu",
+            device_type=hidden_streams.device.type,
         ) if offload else nullcontext())
         with storage:
             if use_checkpoint:

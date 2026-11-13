@@ -289,9 +289,11 @@ class DSparkComponentTest(unittest.TestCase):
         config = _small_config()
         config.v41_dspark_depth = 3
         reference, head = _build(config)
-        candidate = copy.deepcopy(reference)
-        for stage in candidate.stages:
-            stage.activation_offload = True
+        config.v41_dspark_activation_offload = True
+        config.v41_dspark_offload_pin_memory = False
+        candidate, _ = _build(config)
+        candidate.load_state_dict(reference.state_dict())
+        self.assertTrue(all(not stage.offload_pin_memory for stage in candidate.stages))
         input_ids, labels, targets, embeddings = _batch(config)
         expected, expected_metrics = reference(
             targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
@@ -1326,6 +1328,12 @@ class TestDSparkCropSwitches(unittest.TestCase):
         self.assertTrue(self._build(dspark_activation_offload=True).v41_dspark_activation_offload)
         with self.assertRaisesRegex(ValueError, "dspark_activation_offload must be a boolean"):
             self._build(dspark_activation_offload="false")
+        self.assertTrue(self._build().v41_dspark_offload_pin_memory)
+        pageable = self._build(dspark_activation_offload=True, dspark_offload_pin_memory=False)
+        self.assertTrue(pageable.v41_dspark_activation_offload)
+        self.assertFalse(pageable.v41_dspark_offload_pin_memory)
+        with self.assertRaisesRegex(ValueError, "dspark_offload_pin_memory must be a boolean"):
+            self._build(dspark_offload_pin_memory="false")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
