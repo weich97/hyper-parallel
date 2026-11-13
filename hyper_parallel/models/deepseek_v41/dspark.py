@@ -61,6 +61,10 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 
 logger = logging.getLogger(__name__)
 
+# Draft positions multiply the backbone token count. Bound FP32 mHC
+# intermediates by independent rows without changing a row's reduction order.
+_MHC_ROW_CHUNK = 1024
+
 
 def _flash_attention_v3(query, key_value, sink, query_lengths, kv_lengths, scale):
     """Run independent noncausal draft blocks with the native scalar-sink backward."""
@@ -93,6 +97,80 @@ def _checkpoint(function, *args):
     if on_device:
         return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False)
     return function(*args)
+
+
+class _StreamCollapse(torch.autograd.Function):
+    """Bound both passes without per-chunk full-input slice-gradient allocations."""
+
+    @staticmethod
+    def forward(ctx, hidden_streams, pre_mix):
+        """Keep the release's FP32 stream reduction and BF16 output boundary."""
+        streams, hidden = hidden_streams.shape[-2:]
+        rows = hidden_streams.reshape(-1, streams, hidden)
+        weights = pre_mix.reshape(-1, streams)
+        output = rows.new_empty(rows.shape[0], hidden)
+        for start in range(0, rows.shape[0], _MHC_ROW_CHUNK):
+            stop = start + _MHC_ROW_CHUNK
+            output[start:stop] = (weights[start:stop, :, None] * rows[start:stop].float()).sum(-2)
+        ctx.save_for_backward(hidden_streams, pre_mix)
+        return output.view(*hidden_streams.shape[:-2], hidden)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Allocate each destination gradient once and fill independent rows."""
+        hidden_streams, pre_mix = ctx.saved_tensors
+        streams, hidden = hidden_streams.shape[-2:]
+        rows = hidden_streams.reshape(-1, streams, hidden)
+        weights = pre_mix.reshape(-1, streams)
+        grad = grad_output.reshape(-1, hidden)
+        grad_rows, grad_weights = torch.empty_like(rows), torch.empty_like(weights)
+        for start in range(0, rows.shape[0], _MHC_ROW_CHUNK):
+            stop = start + _MHC_ROW_CHUNK
+            upstream = grad[start:stop].float().unsqueeze(-2)
+            grad_rows[start:stop] = upstream * weights[start:stop, :, None]
+            grad_weights[start:stop] = (upstream * rows[start:stop].float()).sum(-1)
+        return grad_rows.view_as(hidden_streams), grad_weights.view_as(pre_mix)
+
+
+def _collapse_streams(hidden_streams, pre_mix):
+    """Collapse independent residual rows without a full draft-sized FP32 buffer."""
+    return _StreamCollapse.apply(hidden_streams, pre_mix)
+
+
+class _NormalizedHcProjection(torch.autograd.Function):
+    """Stream the weightless RMS/projection boundary in forward and backward."""
+
+    @staticmethod
+    def forward(ctx, hidden_streams, weight, epsilon):
+        """Project first, then apply the exact per-row reciprocal RMS."""
+        rows = hidden_streams.flatten(2).reshape(-1, weight.shape[-1])
+        output = torch.empty(rows.shape[0], weight.shape[0], device=rows.device, dtype=torch.float32)
+        for start in range(0, rows.shape[0], _MHC_ROW_CHUNK):
+            stop = start + _MHC_ROW_CHUNK
+            values = rows[start:stop].float()
+            inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + epsilon)
+            output[start:stop] = functional.linear(values, weight) * inverse_rms  # pylint: disable=not-callable
+        ctx.save_for_backward(hidden_streams, weight)
+        ctx.epsilon = epsilon
+        return output.view(*hidden_streams.shape[:2], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Recompute small FP32 tiles and accumulate the shared projection gradient."""
+        hidden_streams, weight = ctx.saved_tensors
+        rows = hidden_streams.flatten(2).reshape(-1, weight.shape[-1])
+        grad = grad_output.reshape(-1, weight.shape[0])
+        grad_rows, grad_weight = torch.empty_like(rows), torch.zeros_like(weight)
+        for start in range(0, rows.shape[0], _MHC_ROW_CHUNK):
+            stop = start + _MHC_ROW_CHUNK
+            values, upstream = rows[start:stop].float(), grad[start:stop].float()
+            inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + ctx.epsilon)
+            projected = functional.linear(values, weight)  # pylint: disable=not-callable
+            scaled = upstream * inverse_rms
+            grad_weight.add_(scaled.T @ values)
+            rms_gradient = (upstream * projected).sum(-1, keepdim=True) * inverse_rms.pow(3) / values.shape[-1]
+            grad_rows[start:stop] = scaled @ weight - values * rms_gradient
+        return grad_rows.view_as(hidden_streams), grad_weight, None
 
 
 def _apply_rope(tensor, cos, sin, *, inverse=False):
@@ -433,13 +511,13 @@ class DSparkStage(nn.Module):
         flat = hidden_streams.reshape(batch, seq * block, streams, hidden)
         residual = flat
         attn_pre, attn_post, attn_comb = self.attn_hc(flat)
-        collapsed = (pre_mix.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
+        collapsed = _collapse_streams(flat, pre_mix)
         attn_input = self.input_layernorm(collapsed).view(batch, seq, block, hidden)
         attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin,
                                     sequence_boundaries=sequence_boundaries)
         flat = pipelined_mhc_post(attn_output.reshape(batch, seq * block, hidden), residual, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(flat)
-        collapsed = (attn_pre.unsqueeze(-1) * flat.float()).sum(dim=2).to(flat.dtype)
+        collapsed = _collapse_streams(flat, attn_pre)
         ffn_input = self.post_attention_layernorm(collapsed)
         return flat, ffn_input, ffn_pre, ffn_post, ffn_comb
 
@@ -533,10 +611,7 @@ class _DSparkHcCoefficients(nn.Module):
         """
         # The released coefficient path has no trainable RMSNorm weight. Keep its
         # statistic epsilon separate from the Sinkhorn/coefficient epsilon.
-        flattened = hidden_streams.flatten(start_dim=2).float()
-        inverse_rms = torch.rsqrt(flattened.square().mean(-1, keepdim=True) + self.norm_eps)
-        mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
-        mix = mix * inverse_rms
+        mix = _NormalizedHcProjection.apply(hidden_streams, self.fn.float(), self.norm_eps)
         streams = self.hc_mult
         pre, post, comb = mix.split([streams, streams, streams * streams], dim=-1)
         pre_bias, post_bias, comb_bias = self.base.split([streams, streams, streams * streams])
@@ -745,10 +820,7 @@ class DeepseekV41DSpark(nn.Module):
                                      rope_sin, draft_ids, use_checkpoint=gradient_active,
                                      sequence_boundaries=sequence_boundaries)
         def _collapse(streams_in: torch.Tensor, pre_mix_in: torch.Tensor) -> torch.Tensor:
-            merged = (pre_mix_in.unsqueeze(-1)
-                      * streams_in.reshape(batch, seq * block, self.hc_mult, -1).float())
-            merged = merged.sum(dim=2).to(streams_in.dtype).view(batch, seq, block, -1)
-            return merged
+            return _collapse_streams(streams_in, pre_mix_in)
 
         # The FP32 merge buffer otherwise stays resident for backward;
         # recomputing it is cheap and communication-free.

@@ -38,10 +38,11 @@ from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.models._transformers.model_builder import _initialize_model_weights
 from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
 from hyper_parallel.models.deepseek_v41.dspark import (
-    DeepseekV41DSpark, DSparkTokenEmbedding, _DSparkHcCoefficients,
+    DeepseekV41DSpark, DSparkTokenEmbedding, _DSparkHcCoefficients, _collapse_streams,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM, DeepseekV41Model
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
@@ -548,6 +549,72 @@ class DSparkComponentTest(unittest.TestCase):
                 torch.testing.assert_close(hidden.grad, reference.grad, rtol=2.0e-4, atol=2.0e-4)
                 torch.testing.assert_close(module.fn.grad, weight.grad, rtol=2.0e-4, atol=2.0e-5)
                 self.assertEqual(set(dict(module.named_parameters())), {"fn", "base", "scale"})
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_chunked_hc_preserves_all_outputs_and_parameter_gradients(self) -> None:
+        """Feature: Bounded DSpark hyper-connection intermediates.
+
+        Description: Cross partial row chunks with nonzero biases and compare an independent dense formula.
+        Expectation: All coefficient branches, input gradients and parameter gradients preserve the reference.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(71)
+                config = _small_config()
+                config.hc_mult = 4
+                module = _DSparkHcCoefficients(config)
+                with torch.no_grad():
+                    module.base.uniform_(-0.1, 0.1)
+                    module.scale.copy_(torch.tensor([0.7, 1.1, 0.8]))
+                reference = copy.deepcopy(module)
+                hidden = torch.randn(2, 11, 4, 32).to(dtype).requires_grad_()
+                ref_hidden = hidden.detach().clone().requires_grad_()
+                flat = ref_hidden.flatten(2).float()
+                mix = (flat @ reference.fn.float().T) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
+                pre, post, comb = mix.split([4, 4, 16], -1)
+                expected = (
+                    torch.sigmoid(pre * reference.scale[0] + reference.base[:4]) + config.hc_eps,
+                    2 * torch.sigmoid(post * reference.scale[1] + reference.base[4:8]),
+                    sinkhorn_knopps(comb.view(2, 11, 4, 4) * reference.scale[2]
+                                    + reference.base[8:].view(4, 4), config.hc_sinkhorn_iters, config.hc_eps),
+                )
+                with patch("hyper_parallel.models.deepseek_v41.dspark._MHC_ROW_CHUNK", 5):
+                    actual = module(hidden)
+                seeds = [torch.randn_like(value) for value in expected]
+                for result, oracle in zip(actual, expected, strict=True):
+                    torch.testing.assert_close(result, oracle, rtol=2e-6, atol=2e-7)
+                sum((value * seed).sum() for value, seed in zip(actual, seeds, strict=True)).backward()
+                sum((value * seed).sum() for value, seed in zip(expected, seeds, strict=True)).backward()
+                torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=2e-5, atol=2e-6)
+                for name, parameter in module.named_parameters():
+                    torch.testing.assert_close(parameter.grad, reference.get_parameter(name).grad,
+                                               rtol=3e-5, atol=3e-6)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_chunked_stream_collapse_preserves_layout_and_gradients(self) -> None:
+        """Feature: Bounded DSpark residual collapse.
+
+        Description: Compare noncontiguous batched draft streams and a partial final chunk with dense collapse.
+        Expectation: The BF16 cast boundary, every draft row and both input gradients are preserved.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                torch.manual_seed(73)
+                hidden = torch.randn(2, 5, 3, 16, 4).to(dtype).transpose(-1, -2).requires_grad_()
+                weights = torch.randn(2, 15, 4, requires_grad=True)
+                ref_hidden = hidden.detach().clone().requires_grad_()
+                ref_weights = weights.detach().clone().requires_grad_()
+                expected = (ref_hidden.float() * ref_weights.view(2, 5, 3, 4, 1)).sum(-2).to(dtype)
+                with patch("hyper_parallel.models.deepseek_v41.dspark._MHC_ROW_CHUNK", 7):
+                    actual = _collapse_streams(hidden, weights)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                seed = torch.randn_like(expected)
+                (actual * seed).sum().backward()
+                (expected * seed).sum().backward()
+                torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0, atol=0)
+                torch.testing.assert_close(weights.grad, ref_weights.grad, rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
