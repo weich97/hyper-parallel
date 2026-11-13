@@ -28,8 +28,10 @@ from torch.nn import functional  # pylint: disable=wrong-import-position
 from hyper_parallel.components.losses import ChunkedCausalLMLoss  # pylint: disable=wrong-import-position
 from hyper_parallel.data.constants import IGNORE_INDEX  # pylint: disable=wrong-import-position
 from hyper_parallel.models.deepseek_v41.adapter.chunk_loss import (  # pylint: disable=wrong-import-position
+    DeepseekV41ChunkedCausalLMLoss,
     bind_chunk_loss,
 )
+from tests.common.mark_utils import arg_mark  # pylint: disable=wrong-import-position
 
 
 class _Backbone(nn.Module):
@@ -68,8 +70,14 @@ class _CausalLM(nn.Module):
 class TestDeepseekV41ChunkLoss(unittest.TestCase):
     """Check adapter lookup, loss parity, and unchanged ordinary forwards."""
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_chunk_loss_matches_full_logits_and_gradients(self) -> None:
-        """Pre-shifted masked targets give the eager CE loss and gradients."""
+        """Feature: Bounded vocabulary projection.
+
+        Description: Compare masked chunk-loss targets with eager full logits.
+        Expectation: Loss and input/head gradients agree without a full head forward.
+        """
         torch.manual_seed(31)
         model = _CausalLM()
         reference = _CausalLM()
@@ -111,8 +119,14 @@ class TestDeepseekV41ChunkLoss(unittest.TestCase):
             reference.model.embed_tokens.weight.grad,
         )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_binding_preserves_ordinary_forward(self) -> None:
-        """Without Chunk Loss targets the original logits path still runs."""
+        """Feature: Ordinary inference compatibility.
+
+        Description: Bind twice and forward without Chunk Loss targets.
+        Expectation: The original logits path and idempotent wrapper are preserved.
+        """
         model = _CausalLM()
         input_ids = torch.tensor([[1, 2, 3]])
         expected = model(input_ids=input_ids).logits
@@ -124,12 +138,73 @@ class TestDeepseekV41ChunkLoss(unittest.TestCase):
         self.assertIs(model.forward, bound_forward)
         torch.testing.assert_close(model(input_ids=input_ids).logits, expected)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_binding_rejects_other_architecture(self) -> None:
-        """A native V4 facade cannot receive V4.1's training override."""
+        """Feature: Model identity validation.
+
+        Description: Request the V4.1 override for another architecture.
+        Expectation: Reject the incompatible facade before rewriting forward.
+        """
         model = _CausalLM()
         model.config.architectures = ["DeepseekV4ForCausalLM"]
         with self.assertRaises(TypeError):
             bind_chunk_loss(model)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_omni_target_and_mask_alignment(self) -> None:
+        """Feature: Omni causal target alignment.
+
+        Description: Prepare ignored visual/padding targets and an explicit mask.
+        Expectation: Shift targets and masks together without mutating source inputs.
+        """
+        labels = torch.tensor([[-100, 3, 4, -100, 6, -100]])
+        mask = torch.tensor([[0, 1, 0, 0, 1, 0]], dtype=torch.bool)
+        inputs = {"input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]), "labels": labels}
+        loss = DeepseekV41ChunkedCausalLMLoss(chunk_size=2)
+        loss.bind_model(_CausalLM())
+        prepared = loss.prepare_model_inputs(inputs, {"labels": labels, "loss_mask": mask})
+        torch.testing.assert_close(prepared["chunk_loss_targets"], torch.tensor([[3, 4, -100, 6, -100, -100]]))
+        torch.testing.assert_close(prepared["chunk_loss_mask"], torch.tensor([[1, 0, 0, 1, 0, 0]], dtype=torch.bool))
+        self.assertNotIn("labels", prepared)
+        self.assertIs(inputs["labels"], labels)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_explicit_shifted_targets_keep_precedence(self) -> None:
+        """Feature: Pre-shifted text targets.
+
+        Description: Provide both original labels and explicit shifted targets.
+        Expectation: Preserve the shifted tensors without a second causal shift.
+        """
+        loss = DeepseekV41ChunkedCausalLMLoss(chunk_size=2)
+        loss.bind_model(_CausalLM())
+        labels = torch.tensor([[1, 2, 3]])
+        shifted = torch.tensor([[2, 3, -100]])
+        mask = torch.tensor([[1, 1, 0]])
+        prepared = loss.prepare_model_inputs(
+            {"input_ids": labels, "labels": labels},
+            {"labels": labels, "shift_labels": shifted, "loss_mask": mask},
+        )
+        self.assertIs(prepared["chunk_loss_targets"], shifted)
+        self.assertIs(prepared["chunk_loss_mask"], mask)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_omni_chunk_loss_rejects_unverified_cp_boundary(self) -> None:
+        """Feature: Context-parallel boundary guard.
+
+        Description: Request Omni local shifting with two CP shards.
+        Expectation: Reject the unverified boundary and leave forward unchanged.
+        """
+        model = _CausalLM()
+        original = model.forward
+        loss = DeepseekV41ChunkedCausalLMLoss(chunk_size=2)
+        setup = SimpleNamespace(mesh_context=SimpleNamespace(cp_size=2))
+        with self.assertRaisesRegex(NotImplementedError, "cp_size=1"):
+            loss.bind_model(model, setup)
+        self.assertEqual(model.forward, original)
 
 
 if __name__ == "__main__":

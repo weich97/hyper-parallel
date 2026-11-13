@@ -46,6 +46,7 @@ from hyper_parallel.models.deepseek_v41.dspark import (
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM, DeepseekV41Model
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.adapter.chunk_loss import DeepseekV41ChunkedCausalLMLoss
 
 
 def _small_config() -> SimpleNamespace:
@@ -275,6 +276,51 @@ class _TokenInjection(torch.nn.Module):
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_chunked_backbone_loss_preserves_dspark_objective_and_all_gradients(self) -> None:
+        """Feature: Complete DSpark training objective with bounded backbone logits.
+
+        Description: Compare ordinary and chunked losses on the same initialized model and masked inputs.
+        Expectation: Preserve drafter weighting, reporting metrics, and every backbone/drafter gradient.
+        """
+        torch.manual_seed(117)
+        config = _config()
+        for name, value in vars(_small_config()).items():
+            if name.startswith("v41_dspark_"):
+                setattr(config, name, value)
+        config.architectures = ["DeepseekV41ForCausalLM"]
+        config.v41_dspark_noise_token_id = config.vocab_size - 1
+        config.v41_dspark_target_layer_ids = [0]
+        config.v41_dspark_loss_coeff = 0.37
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                   mock_open(read_data='{"layer_ids": []}')):
+            reference = DeepseekV41ForCausalLM(config)
+        candidate = copy.deepcopy(reference)
+        ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 30, 30, 30]])
+        labels = torch.full_like(ids, IGNORE_INDEX)
+        labels[:, 4:8] = ids[:, 4:8]
+        expected = reference(input_ids=ids, labels=labels).loss
+        expected.backward()
+        loss_fn = DeepseekV41ChunkedCausalLMLoss(chunk_size=3)
+        loss_fn.bind_model(candidate)
+        inputs = loss_fn.prepare_model_inputs(
+            {"input_ids": ids, "labels": labels}, {"labels": labels, "loss_mask": labels.ne(IGNORE_INDEX)})
+        with patch.object(candidate.lm_head, "forward", side_effect=AssertionError("full vocabulary logits")):
+            output = candidate(**inputs)
+        actual = loss_fn(model_output=output, labels=labels)
+        actual.backward()
+        self.assertIsNone(output.logits)
+        self.assertGreater(float(output.aux_loss.detach()), 0)
+        torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+        for name, value in candidate.pending_extra_metrics.items():
+            torch.testing.assert_close(value, reference.pending_extra_metrics[name], rtol=0, atol=0)
+        references = dict(reference.named_parameters())
+        for name, parameter in candidate.named_parameters():
+            torch.testing.assert_close(parameter.grad, references[name].grad,
+                                       rtol=2e-5, atol=2e-6, msg=name)
+        self.assertGreater(float(candidate.dspark.main_proj.weight.grad.abs().sum()), 0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

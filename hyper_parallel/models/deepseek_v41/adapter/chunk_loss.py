@@ -17,14 +17,18 @@
 from __future__ import annotations
 
 import functools
+import logging
+from collections.abc import Mapping
 from typing import Any
 
 # This model-family adapter follows the PyTorch-native V4.1 facade.
 # pylint: disable=forbidden-backend-import
 import torch
 from torch import nn
+from torch.nn import functional
 
 from hyper_parallel.components.losses.chunked_cross_entropy import (
+    ChunkedCausalLMLoss,
     ChunkedCausalLMOutput,
     chunked_cross_entropy,
 )
@@ -32,6 +36,58 @@ from hyper_parallel.distributed._builder.forward_rewriter import (  # pylint: di
     _ForwardRewriteRequest,
     _commit_forward_rewrite,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class DeepseekV41ChunkedCausalLMLoss(ChunkedCausalLMLoss):
+    """Use bounded vocabulary projection for V4.1 Omni training with DSpark.
+
+    Omni batches contain unshifted labels. This adapter performs their causal
+    alignment before delegating to the shared Chunk Loss protocol. Complete
+    sequences are required; shifting a CP-local shard would lose its boundary
+    target. Explicit ``shift_labels`` retain precedence for text batches.
+    """
+
+    def bind_model(self, model: nn.Module, distributed_setup: Any = None) -> None:
+        """Bind a supported complete-sequence V4.1 training model.
+
+        Args:
+            model: Constructed V4.1 model with its final parameter structure.
+            distributed_setup: Trainer setup declaring the active parallel layout.
+        """
+        if self._parallel_size(distributed_setup, "cp_size") != 1:
+            raise NotImplementedError("V4.1 Omni Chunk Loss currently requires cp_size=1")
+        super().bind_model(model, distributed_setup)
+        logger.info("V4.1 chunked backbone CE enabled; chunk_size=%d; DSpark=%s",
+                    self.chunk_size, getattr(model, "dspark", None) is not None)
+
+    def prepare_model_inputs(
+            self,
+            model_inputs: Mapping[str, Any],
+            loss_inputs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Preserve ignored visual/padding targets while shifting Omni labels.
+
+        Args:
+            model_inputs: Token, image, and packed-sequence inputs for the backbone.
+            loss_inputs: Unshifted Omni labels or explicit pre-shifted text targets.
+
+        Returns:
+            Inputs using the common Chunk Loss target and mask protocol.
+        """
+        aligned = dict(loss_inputs)
+        if aligned.get("shift_labels") is None:
+            labels = aligned.get("labels", model_inputs.get("labels"))
+            if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
+                raise ValueError("V4.1 Omni Chunk Loss requires labels with shape [batch, sequence]")
+            aligned["shift_labels"] = functional.pad(labels[..., 1:], (0, 1), value=self.ignore_index)
+            mask = aligned.get("loss_mask")
+            if mask is not None:
+                if not isinstance(mask, torch.Tensor) or mask.shape != labels.shape:
+                    raise ValueError("V4.1 Omni loss_mask must match unshifted labels")
+                aligned["loss_mask"] = functional.pad(mask[..., 1:], (0, 1), value=0)
+        return super().prepare_model_inputs(model_inputs, aligned)
 
 
 def _chunk_loss_forward(
@@ -51,6 +107,8 @@ def _chunk_loss_forward(
     logits_to_keep = model_inputs.pop("logits_to_keep", 0)
     if isinstance(logits_to_keep, torch.Tensor) or logits_to_keep != 0:
         raise ValueError("DeepSeek-V4.1 Chunk Loss requires logits_to_keep=0")
+    if model_inputs.get("output_router_logits", getattr(model.config, "output_router_logits", False)):
+        raise NotImplementedError("DeepSeek-V4.1 Chunk Loss does not support HF output_router_logits")
 
     model_inputs["use_cache"] = False
     outputs = model.model(**model_inputs)
@@ -75,7 +133,7 @@ def _chunk_loss_forward(
         chunk_size=chunk_loss_chunk_size,
         ignore_index=chunk_loss_ignore_index,
     )
-    return ChunkedCausalLMOutput(
+    result = ChunkedCausalLMOutput(
         loss_sum=loss_sum,
         valid_token_count=chunk_loss_targets.ne(chunk_loss_ignore_index).sum(),
         logits=None,
@@ -83,10 +141,23 @@ def _chunk_loss_forward(
         hidden_states=getattr(outputs, "hidden_states", None),
         attentions=getattr(outputs, "attentions", None),
     )
+    if getattr(model, "dspark", None) is not None:
+        input_ids = model_inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            raise ValueError("V4.1 DSpark Chunk Loss requires input_ids")
+        dspark_loss, metrics = model.compute_dspark_loss(input_ids, chunk_loss_targets)
+        result.aux_loss = dspark_loss
+        result.aux_loss_coef = 1.0
+        result.extra_metrics = metrics
+    return result
 
 
 def bind_chunk_loss(model: nn.Module) -> None:
-    """Atomically install the V4.1 Chunk Loss training forward."""
+    """Atomically install the V4.1 Chunk Loss training forward.
+
+    Args:
+        model: V4.1 facade with a backbone and a bias-free output projection.
+    """
     if getattr(model, "_hp_deepseek_v41_chunk_loss_bound", False):
         return
     config = getattr(model, "config", None)
@@ -122,4 +193,4 @@ def bind_chunk_loss(model: nn.Module) -> None:
     )
 
 
-__all__ = ["bind_chunk_loss"]
+__all__ = ["DeepseekV41ChunkedCausalLMLoss", "bind_chunk_loss"]

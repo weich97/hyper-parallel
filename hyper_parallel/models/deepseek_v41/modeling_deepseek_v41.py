@@ -1430,22 +1430,13 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         # The trainer may keep labels on its loss-only path, so the drafter
         # must not depend on them: it supervises from input_ids when absent.
         if self.dspark is not None and input_ids is not None:
-            targets = getattr(self.model, "dspark_target_hiddens", None)
-            if not targets:
-                raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
             # Omni labels are unshifted, while TextParallelBatch supplies an
             # explicit shifted surface. Match the backbone loss convention so
             # an ignored padding target cannot inherit its predecessor's mask.
             dspark_labels = kwargs.get("shift_labels")
             if dspark_labels is None and labels is not None:
                 dspark_labels = functional.pad(labels[..., 1:], (0, 1), value=IGNORE_INDEX)
-            dspark_loss, dspark_metrics = self.dspark(
-                targets, input_ids, dspark_labels, self.model.dspark_inputs_embeds, self.lm_head,
-                noise_embedding=self.model.dspark_noise_embedding,
-                token_mask=self.model.dspark_token_mask,
-                sequence_boundaries=self.model.dspark_sequence_boundaries,
-            )
-            dspark_term = self.dspark_loss_coeff * dspark_loss
+            dspark_term, dspark_metrics = self.compute_dspark_loss(input_ids, dspark_labels)
             # The trainer's default ModelOutputLoss backpropagates
             # model_output.loss, so the drafter objective must join that
             # field with its graph attached; a logits-side auxiliary hook
@@ -1459,6 +1450,34 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             # non-field attributes; the module attribute is the stable path.
             self.pending_extra_metrics = dspark_metrics
         return outputs
+
+    def compute_dspark_loss(
+            self,
+            input_ids: torch.Tensor,
+            shift_labels: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Evaluate the unchanged drafter objective from detached backbone taps.
+
+        Args:
+            input_ids: Complete backbone token sequence, including visual placeholders.
+            shift_labels: Next-token-aligned targets with ignored positions preserved.
+
+        Returns:
+            Weighted DSpark loss and its detached reporting metrics.
+        """
+        if self.dspark is None:
+            raise RuntimeError("DSpark objective requested without a drafter")
+        targets = getattr(self.model, "dspark_target_hiddens", None)
+        if not targets:
+            raise RuntimeError("DSpark is enabled but no backbone target hiddens were collected")
+        loss, metrics = self.dspark(
+            targets, input_ids, shift_labels, self.model.dspark_inputs_embeds, self.lm_head,
+            noise_embedding=self.model.dspark_noise_embedding,
+            token_mask=self.model.dspark_token_mask,
+            sequence_boundaries=self.model.dspark_sequence_boundaries,
+        )
+        self.pending_extra_metrics = metrics
+        return self.dspark_loss_coeff * loss, metrics
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
