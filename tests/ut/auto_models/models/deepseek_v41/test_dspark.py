@@ -36,6 +36,7 @@ from tests.ut.auto_models.models.deepseek_v41.test_modeling_deepseek_v41 import 
 
 from hyper_parallel import DeviceMesh, Replicate, Shard, init_empty_weights
 from hyper_parallel.core.activation_memory.wrapper import CheckpointWrapper
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts, is_recomputing
 from hyper_parallel.core.dtensor.device_mesh import clear_device_mesh_cache
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -279,6 +280,72 @@ class _TokenInjection(torch.nn.Module):
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_complete_stage_replay_preserves_objective_and_all_gradients(self) -> None:
+        """Feature: Complete DSpark stage activation checkpointing.
+
+        Description: Replay three complete stages with real non-reentrant autograd checkpointing.
+        Expectation: Both draft losses, all parameter derivatives, and the frozen-head boundary agree.
+        """
+        config = _small_config()
+        config.v41_dspark_depth = 3
+        reference, head = _build(config)
+        config.v41_dspark_stage_checkpoint = True
+        candidate, _ = _build(config)
+        candidate.load_state_dict(reference.state_dict())
+        input_ids, labels, targets, embeddings = _batch(config)
+        expected, expected_metrics = reference(
+            targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
+        )
+        calls = []
+        handles = [stage.mlp.register_forward_hook(lambda *_: calls.append(is_recomputing()))
+                   for stage in candidate.stages]
+        for handle in handles:
+            self.addCleanup(handle.remove)
+
+        def _cpu_checkpoint(function, *args, **kwargs):
+            """Exercise real checkpoint autograd without initializing an optional NPU runtime."""
+            with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                return torch.utils.checkpoint.checkpoint(
+                    function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
+                )
+
+        with patch.object(torch.utils.checkpoint.DefaultDeviceType, "get_device_type", return_value="cpu"), \
+                patch("hyper_parallel.models.deepseek_v41.dspark._checkpoint_stage", side_effect=_cpu_checkpoint):
+            actual, metrics = candidate(
+                targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
+            )
+            expected.backward()
+            actual.backward()
+        self.assertEqual(calls, [False] * 3 + [True] * 3)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for name in metrics:
+            torch.testing.assert_close(metrics[name], expected_metrics[name], rtol=0, atol=0)
+        for (name, parameter), (expected_name, expected_parameter) in zip(
+                candidate.named_parameters(), reference.named_parameters(), strict=True):
+            self.assertEqual(name, expected_name)
+            self.assertIsNotNone(parameter.grad)
+            torch.testing.assert_close(parameter.grad, expected_parameter.grad, rtol=0, atol=0, msg=name)
+        self.assertIsNone(head.weight.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_stage_replay_rejects_ambiguous_storage_policy(self) -> None:
+        """Feature: Explicit recomputation policy.
+
+        Description: Reject string flags and nested offload that would replace checkpoint saved-tensor hooks.
+        Expectation: Invalid policies fail during model construction.
+        """
+        config = _small_config()
+        config.v41_dspark_stage_checkpoint = "false"
+        with self.assertRaisesRegex(ValueError, "stage_checkpoint must be a boolean"):
+            _build(config)
+        config.v41_dspark_stage_checkpoint = True
+        config.v41_dspark_activation_offload = True
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _build(config)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

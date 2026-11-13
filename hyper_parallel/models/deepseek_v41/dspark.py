@@ -56,6 +56,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
+from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.data.constants import IGNORE_INDEX
@@ -98,6 +99,17 @@ def _checkpoint(function, *args):
     if on_device:
         return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False)
     return function(*args)
+
+
+def _checkpoint_stage(function, *args, **kwargs):
+    """Replay a complete stage on all ranks, including its expert collectives."""
+    if not any(isinstance(arg, torch.Tensor) and arg.device.type != "cpu" for arg in args):
+        return function(*args, **kwargs)
+    # Every rank must execute the complete collective sequence during replay.
+    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+        return torch.utils.checkpoint.checkpoint(
+            function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
+        )
 
 
 class _StreamCollapse(torch.autograd.Function):
@@ -684,6 +696,11 @@ class DeepseekV41DSpark(nn.Module):
         # lower the vocabulary-logits peak at the cost of more recompute
         # rounds; the loss value itself is chunking-invariant.
         self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 64) or 64)
+        self.stage_checkpoint = getattr(config, "v41_dspark_stage_checkpoint", False)
+        if not isinstance(self.stage_checkpoint, bool):
+            raise ValueError("v41_dspark_stage_checkpoint must be a boolean")
+        if self.stage_checkpoint and getattr(config, "v41_dspark_activation_offload", False):
+            raise ValueError("DSpark stage checkpointing and activation offload are mutually exclusive")
         if self.block_size <= 0 or self.num_targets == 0:
             raise ValueError("DSpark requires a positive block size and target layers")
         hidden = int(config.hidden_size)
@@ -850,14 +867,20 @@ class DeepseekV41DSpark(nn.Module):
         draft_ids[:, :, 0] = torch.where(next_is_in_document, first_ids, self.noise_token_id)
         draft_ids = draft_ids.reshape(batch, seq * block)
         # The flattened draft stream (seq x block positions, hc streams) makes
-        # stage activations the dominant memory term; each stage recomputes
-        # its communication-free prefix in backward while the draft-MoE
-        # dispatch stays outside the recomputed region (DSparkStage._pre_ffn).
+        # stage activations the dominant memory term. The default checkpoints
+        # only the communication-free prefix; full-stage replay also trades
+        # extra expert communication for a smaller saved-activation footprint.
         gradient_active = torch.is_grad_enabled() and self.training
         for stage in self.stages:
-            streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,
-                                     rope_sin, draft_ids, use_checkpoint=gradient_active,
-                                     sequence_boundaries=sequence_boundaries)
+            if self.stage_checkpoint and gradient_active:
+                streams, pre_mix = _checkpoint_stage(
+                    stage, streams, pre_mix, main_states, rope_cos, rope_sin, draft_ids,
+                    use_checkpoint=False, sequence_boundaries=sequence_boundaries,
+                )
+            else:
+                streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,
+                                         rope_sin, draft_ids, use_checkpoint=gradient_active,
+                                         sequence_boundaries=sequence_boundaries)
         def _collapse(streams_in: torch.Tensor, pre_mix_in: torch.Tensor) -> torch.Tensor:
             return _collapse_streams(streams_in, pre_mix_in)
 
