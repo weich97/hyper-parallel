@@ -279,6 +279,58 @@ class DSparkComponentTest(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_stage_offload_preserves_complete_objective_and_parameter_gradients(self) -> None:
+        """Keep all draft stages and gradient boundaries when saved tensors use Host.
+
+        Feature: Optional drafter activation offload.
+        Description: Compare three stages, both draft losses, and every parameter derivative.
+        Expectation: Identical results with one forward call per stage FFN.
+        """
+        config = _small_config()
+        config.v41_dspark_depth = 3
+        reference, head = _build(config)
+        candidate = copy.deepcopy(reference)
+        for stage in candidate.stages:
+            stage.activation_offload = True
+        input_ids, labels, targets, embeddings = _batch(config)
+        expected, expected_metrics = reference(
+            targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
+        )
+        calls = []
+        handles = [stage.mlp.register_forward_hook(lambda *_: calls.append(1)) for stage in candidate.stages]
+        actual, metrics = candidate(
+            targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
+        )
+        expected.backward()
+        actual.backward()
+        for handle in handles:
+            handle.remove()
+        self.assertEqual(len(calls), 3)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for name in metrics:
+            torch.testing.assert_close(metrics[name], expected_metrics[name], rtol=0, atol=0)
+        for (name, parameter), (expected_name, expected_parameter) in zip(
+                candidate.named_parameters(), reference.named_parameters(), strict=True):
+            self.assertEqual(name, expected_name)
+            self.assertIsNotNone(parameter.grad)
+            torch.testing.assert_close(parameter.grad, expected_parameter.grad, rtol=0, atol=0)
+        self.assertIsNone(head.weight.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_stage_offload_requires_boolean_configuration(self) -> None:
+        """Feature: Explicit activation-storage policy.
+
+        Description: Reject accidental truthy strings instead of enabling offload.
+        Expectation: A non-boolean option raises a descriptive configuration error.
+        """
+        config = _small_config()
+        config.v41_dspark_activation_offload = "false"
+        with self.assertRaisesRegex(ValueError, "v41_dspark_activation_offload must be a boolean"):
+            _build(config)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_chunked_backbone_loss_preserves_dspark_objective_and_all_gradients(self) -> None:
         """Feature: Complete DSpark training objective with bounded backbone logits.
 
@@ -1261,6 +1313,19 @@ class TestDrafterMatchesReleasedLayout(unittest.TestCase):
 
 class TestDSparkCropSwitches(unittest.TestCase):
     """The crop entry carries the DSpark drafter switches into the config."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_stage_offload_option_survives_config_translation(self) -> None:
+        """Feature: Optional drafter Host storage in validation recipes.
+
+        Description: Translate both valid settings and reject string values.
+        Expectation: The default stays disabled and the explicit value is preserved.
+        """
+        self.assertFalse(self._build().v41_dspark_activation_offload)
+        self.assertTrue(self._build(dspark_activation_offload=True).v41_dspark_activation_offload)
+        with self.assertRaisesRegex(ValueError, "dspark_activation_offload must be a boolean"):
+            self._build(dspark_activation_offload="false")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Any
 
@@ -103,8 +104,14 @@ class _StreamCollapse(torch.autograd.Function):
     """Bound both passes without per-chunk full-input slice-gradient allocations."""
 
     @staticmethod
-    def forward(ctx, hidden_streams, pre_mix):
-        """Keep the release's FP32 stream reduction and BF16 output boundary."""
+    def forward(ctx: Any, hidden_streams: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+        """Keep the release's FP32 stream reduction and BF16 output boundary.
+
+        Args:
+            ctx: Autograd context retaining input operands.
+            hidden_streams: Residual streams ending in stream and hidden dimensions.
+            pre_mix: Per-row stream weights.
+        """
         streams, hidden = hidden_streams.shape[-2:]
         rows = hidden_streams.reshape(-1, streams, hidden)
         weights = pre_mix.reshape(-1, streams)
@@ -116,8 +123,13 @@ class _StreamCollapse(torch.autograd.Function):
         return output.view(*hidden_streams.shape[:-2], hidden)
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """Allocate each destination gradient once and fill independent rows."""
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Allocate each destination gradient once and fill independent rows.
+
+        Args:
+            ctx: Autograd context with saved streams and weights.
+            grad_output: Derivative of the collapsed hidden rows.
+        """
         hidden_streams, pre_mix = ctx.saved_tensors
         streams, hidden = hidden_streams.shape[-2:]
         rows = hidden_streams.reshape(-1, streams, hidden)
@@ -141,8 +153,15 @@ class _NormalizedHcProjection(torch.autograd.Function):
     """Stream the weightless RMS/projection boundary in forward and backward."""
 
     @staticmethod
-    def forward(ctx, hidden_streams, weight, epsilon):
-        """Project first, then apply the exact per-row reciprocal RMS."""
+    def forward(ctx: Any, hidden_streams: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+        """Project first, then apply the exact per-row reciprocal RMS.
+
+        Args:
+            ctx: Autograd context retaining operands and epsilon.
+            hidden_streams: Residual streams to normalize and project.
+            weight: Shared projection matrix.
+            epsilon: Stability constant in the row normalization.
+        """
         rows = hidden_streams.flatten(2).reshape(-1, weight.shape[-1])
         output = torch.empty(rows.shape[0], weight.shape[0], device=rows.device, dtype=torch.float32)
         for start in range(0, rows.shape[0], _MHC_ROW_CHUNK):
@@ -155,8 +174,13 @@ class _NormalizedHcProjection(torch.autograd.Function):
         return output.view(*hidden_streams.shape[:2], weight.shape[0])
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """Recompute small FP32 tiles and accumulate the shared projection gradient."""
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None]:
+        """Recompute small FP32 tiles and accumulate the shared projection gradient.
+
+        Args:
+            ctx: Autograd context with saved operands and epsilon.
+            grad_output: Derivative of the normalized projection.
+        """
         hidden_streams, weight = ctx.saved_tensors
         rows = hidden_streams.flatten(2).reshape(-1, weight.shape[-1])
         grad = grad_output.reshape(-1, weight.shape[0])
@@ -470,6 +494,9 @@ class DSparkStage(nn.Module):
         """
         super().__init__()
         self.hc_mult = int(config.hc_mult)
+        self.activation_offload = getattr(config, "v41_dspark_activation_offload", False)
+        if not isinstance(self.activation_offload, bool):
+            raise ValueError("v41_dspark_activation_offload must be a boolean")
         self.attn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530100 + stage_index)
         self.ffn_hc = _DSparkHcCoefficients(config, initialization_seed=0x44530200 + stage_index)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -551,16 +578,24 @@ class DSparkStage(nn.Module):
         from hyper_parallel.components.modules.mhc import pipelined_mhc_post  # pylint: disable=C0415
 
         batch, seq, block, streams, hidden = hidden_streams.shape
-        if use_checkpoint:
-            flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
-                self._pre_ffn, hidden_streams, pre_mix, main_states,
-                rope_cos, rope_sin, sequence_boundaries)
-        else:
-            flat, ffn_input, ffn_pre, ffn_post, ffn_comb = self._pre_ffn(
-                hidden_streams, pre_mix, main_states, rope_cos, rope_sin, sequence_boundaries)
-        ffn_output = self.mlp(ffn_input, input_ids=input_ids)
-        flat = pipelined_mhc_post(ffn_output, flat, ffn_post, ffn_comb)
-        return flat.view(batch, seq, block, streams, hidden), ffn_pre
+        offload = self.activation_offload and self.training and torch.is_grad_enabled()
+        # Store backward tensors on Host without replaying EP collectives. The
+        # existing local checkpoints still bound temporary activations; their
+        # saved inputs now release device storage between draft stages.
+        storage = (torch.autograd.graph.save_on_cpu(
+            pin_memory=hidden_streams.device.type != "cpu", device_type=hidden_streams.device.type,
+        ) if offload else nullcontext())
+        with storage:
+            if use_checkpoint:
+                flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
+                    self._pre_ffn, hidden_streams, pre_mix, main_states,
+                    rope_cos, rope_sin, sequence_boundaries)
+            else:
+                flat, ffn_input, ffn_pre, ffn_post, ffn_comb = self._pre_ffn(
+                    hidden_streams, pre_mix, main_states, rope_cos, rope_sin, sequence_boundaries)
+            ffn_output = self.mlp(ffn_input, input_ids=input_ids)
+            flat = pipelined_mhc_post(ffn_output, flat, ffn_post, ffn_comb)
+            return flat.view(batch, seq, block, streams, hidden), ffn_pre
 
 
 class _DSparkHcCoefficients(nn.Module):
