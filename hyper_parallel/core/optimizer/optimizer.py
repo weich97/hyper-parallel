@@ -836,7 +836,8 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         """
 
         for dim_idx, pg in enumerate(replicate_pgs):
-            if pg is None:
+            # A singleton relay already holds the source data.
+            if pg is None or dist.get_world_size(pg) == 1:
                 continue
 
             participate = True
@@ -870,7 +871,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         broadcast_ops: List[Tuple[dist.ProcessGroup, int]] = []
 
         for dim_idx, pg in enumerate(replicate_pgs):
-            if pg is None:
+            if pg is None or dist.get_world_size(pg) == 1:
                 continue
 
             participate = True
