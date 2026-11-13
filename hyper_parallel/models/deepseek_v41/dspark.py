@@ -60,6 +60,7 @@ from hyper_parallel.core.activation_memory.recompute_state import create_recompu
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 
 logger = logging.getLogger(__name__)
 
@@ -721,6 +722,16 @@ class DeepseekV41DSpark(nn.Module):
         self.norm = nn.RMSNorm(hidden, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(int(config.vocab_size), int(config.v41_dspark_markov_rank))
         self.confidence_head = DSparkConfidenceHead(hidden + int(config.v41_dspark_markov_rank))
+        self._megamoe_runtime_prepared = False
+
+    def _prepare_megamoe_runtime(self) -> None:
+        """Share transient expert storage across serial drafter stages."""
+        if self._megamoe_runtime_prepared:
+            return
+        experts = [stage.mlp.experts for stage in self.stages
+                   if isinstance(getattr(stage.mlp, "experts", None), DeepseekV41MegaMoeExperts)]
+        DeepseekV41MegaMoeExperts.prepare_runtime_group(experts)
+        self._megamoe_runtime_prepared = True
 
     def _validate_rotary_settings(self):
         """Reject unsupported rotary variants instead of silently dropping release settings."""
@@ -845,6 +856,7 @@ class DeepseekV41DSpark(nn.Module):
             The scalar DSpark loss and a metrics dictionary.
         """
         self._validate_backbone_inputs(target_hiddens, input_ids, inputs_embeds, noise_embedding)
+        self._prepare_megamoe_runtime()
         batch, seq = input_ids.shape
         block = self.block_size
         device = input_ids.device

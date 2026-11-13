@@ -44,6 +44,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
     deepseek_v41_megamoe_compute_fn, deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
+from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter, _v41_sparse_moe_forward, _dspark_sparse_moe_forward,
 )
@@ -668,3 +669,33 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         for experts in model:
             experts.close_runtime()
         self.assertTrue(all(experts._executor is None for experts in model))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_dspark_shares_scratch_without_sharing_parameters(self) -> None:
+        """Feature: DSpark fused expert workspace ownership.
+        Description: Prepare three serial stages twice before native execution.
+        Expectation: Reuse one workspace and preserve every stage's independent parameters.
+        """
+        drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+        nn.Module.__init__(drafter)
+        drafter._megamoe_runtime_prepared = False
+        drafter.stages = nn.ModuleList()
+        experts = []
+        for _ in range(3):
+            stage = nn.Module()
+            stage.mlp = nn.Module()
+            stage.mlp.experts = DeepseekV41MegaMoeExperts(module=_source(), expert_weight_layout="EOI")
+            stage.mlp.experts.configure(None, 1, 2)
+            self.addCleanup(stage.mlp.experts.close_runtime)
+            drafter.stages.append(stage)
+            experts.append(stage.mlp.experts)
+        parameters = [expert.gate_up_proj for expert in experts]
+        self.assertEqual(len({id(expert._executor._resource_group) for expert in experts}), 3)
+        drafter._prepare_megamoe_runtime()
+        shared = experts[0]._executor._resource_group
+        self.assertTrue(all(expert._executor._resource_group is shared for expert in experts))
+        drafter._prepare_megamoe_runtime()
+        self.assertTrue(all(expert._executor._resource_group is shared for expert in experts))
+        self.assertEqual(len({id(parameter) for parameter in parameters}), 3)
+        self.assertTrue(all(expert.gate_up_proj is parameter for expert, parameter in zip(experts, parameters)))
