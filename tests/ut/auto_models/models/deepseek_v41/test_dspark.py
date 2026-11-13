@@ -289,10 +289,17 @@ class DSparkComponentTest(unittest.TestCase):
         Description: Replay three complete stages with real non-reentrant autograd checkpointing.
         Expectation: Both draft losses, all parameter derivatives, and the frozen-head boundary agree.
         """
+        for offload_inputs in (False, True):
+            with self.subTest(offload_inputs=offload_inputs):
+                self._assert_complete_stage_replay(offload_inputs)
+
+    def _assert_complete_stage_replay(self, offload_inputs):
+        """Compare actual checkpoint autograd with the complete direct objective."""
         config = _small_config()
         config.v41_dspark_depth = 3
         reference, head = _build(config)
         config.v41_dspark_stage_checkpoint = True
+        config.v41_dspark_stage_checkpoint_offload = offload_inputs
         candidate, _ = _build(config)
         candidate.load_state_dict(reference.state_dict())
         input_ids, labels, targets, embeddings = _batch(config)
@@ -305,9 +312,10 @@ class DSparkComponentTest(unittest.TestCase):
         for handle in handles:
             self.addCleanup(handle.remove)
 
-        def _cpu_checkpoint(function, *args, **kwargs):
+        def _cpu_checkpoint(function, *args, offload_inputs=False, **kwargs):
             """Exercise real checkpoint autograd without initializing an optional NPU runtime."""
-            with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+            storage = torch.autograd.graph.save_on_cpu(pin_memory=False) if offload_inputs else nullcontext()
+            with storage, torch.utils.checkpoint.set_checkpoint_early_stop(False):
                 return torch.utils.checkpoint.checkpoint(
                     function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
                 )
@@ -345,6 +353,14 @@ class DSparkComponentTest(unittest.TestCase):
         config.v41_dspark_stage_checkpoint = True
         config.v41_dspark_activation_offload = True
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            _build(config)
+        config.v41_dspark_activation_offload = False
+        config.v41_dspark_stage_checkpoint_offload = "false"
+        with self.assertRaisesRegex(ValueError, "stage_checkpoint_offload must be a boolean"):
+            _build(config)
+        config.v41_dspark_stage_checkpoint_offload = True
+        config.v41_dspark_stage_checkpoint = False
+        with self.assertRaisesRegex(ValueError, "requires complete stage checkpointing"):
             _build(config)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
@@ -1466,6 +1482,11 @@ class TestDSparkCropSwitches(unittest.TestCase):
         self.assertFalse(pageable.v41_dspark_offload_pin_memory)
         with self.assertRaisesRegex(ValueError, "dspark_offload_pin_memory must be a boolean"):
             self._build(dspark_offload_pin_memory="false")
+        self.assertFalse(self._build().v41_dspark_stage_checkpoint_offload)
+        staged = self._build(dspark_stage_checkpoint=True, dspark_stage_checkpoint_offload=True)
+        self.assertTrue(staged.v41_dspark_stage_checkpoint_offload)
+        with self.assertRaisesRegex(ValueError, "dspark_stage_checkpoint_offload must be a boolean"):
+            self._build(dspark_stage_checkpoint_offload="false")
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

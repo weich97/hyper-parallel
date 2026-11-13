@@ -101,12 +101,17 @@ def _checkpoint(function, *args):
     return function(*args)
 
 
-def _checkpoint_stage(function, *args, **kwargs):
+def _checkpoint_stage(function, *args, offload_inputs=False, **kwargs):
     """Replay a complete stage on all ranks, including its expert collectives."""
-    if not any(isinstance(arg, torch.Tensor) and arg.device.type != "cpu" for arg in args):
+    device = next((arg.device for arg in args if isinstance(arg, torch.Tensor) and arg.device.type != "cpu"), None)
+    if device is None:
         return function(*args, **kwargs)
     # Every rank must execute the complete collective sequence during replay.
-    with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+    # The outer hook moves only checkpoint inputs; the inner checkpoint hook
+    # discards intermediate activations instead of copying them to Host.
+    storage = (torch.autograd.graph.save_on_cpu(pin_memory=False, device_type=device.type)
+               if offload_inputs else nullcontext())
+    with storage, torch.utils.checkpoint.set_checkpoint_early_stop(False):
         return torch.utils.checkpoint.checkpoint(
             function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
         )
@@ -699,6 +704,11 @@ class DeepseekV41DSpark(nn.Module):
         self.stage_checkpoint = getattr(config, "v41_dspark_stage_checkpoint", False)
         if not isinstance(self.stage_checkpoint, bool):
             raise ValueError("v41_dspark_stage_checkpoint must be a boolean")
+        self.stage_checkpoint_offload = getattr(config, "v41_dspark_stage_checkpoint_offload", False)
+        if not isinstance(self.stage_checkpoint_offload, bool):
+            raise ValueError("v41_dspark_stage_checkpoint_offload must be a boolean")
+        if self.stage_checkpoint_offload and not self.stage_checkpoint:
+            raise ValueError("DSpark checkpoint input offload requires complete stage checkpointing")
         if self.stage_checkpoint and getattr(config, "v41_dspark_activation_offload", False):
             raise ValueError("DSpark stage checkpointing and activation offload are mutually exclusive")
         if self.block_size <= 0 or self.num_targets == 0:
@@ -875,6 +885,7 @@ class DeepseekV41DSpark(nn.Module):
             if self.stage_checkpoint and gradient_active:
                 streams, pre_mix = _checkpoint_stage(
                     stage, streams, pre_mix, main_states, rope_cos, rope_sin, draft_ids,
+                    offload_inputs=self.stage_checkpoint_offload,
                     use_checkpoint=False, sequence_boundaries=sequence_boundaries,
                 )
             else:

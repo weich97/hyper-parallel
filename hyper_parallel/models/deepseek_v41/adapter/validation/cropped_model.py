@@ -402,6 +402,7 @@ def build_deepseek_v41_validation_config(
         dspark_activation_offload: bool = False,
         dspark_offload_pin_memory: bool = True,
         dspark_stage_checkpoint: bool = False,
+        dspark_stage_checkpoint_offload: bool = False,
         engram_storage_backend: str = "device",
         engram_max_pending_entries: int = 1000000,
         engram_max_sparse_rows_per_step: int = 1000000,
@@ -438,6 +439,7 @@ def build_deepseek_v41_validation_config(
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.
+        dspark_stage_checkpoint_offload: Store only complete-stage checkpoint inputs in pageable Host memory.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -493,6 +495,9 @@ def build_deepseek_v41_validation_config(
     if not isinstance(dspark_stage_checkpoint, bool):
         raise ValueError("dspark_stage_checkpoint must be a boolean")
     config.v41_dspark_stage_checkpoint = dspark_stage_checkpoint
+    if not isinstance(dspark_stage_checkpoint_offload, bool):
+        raise ValueError("dspark_stage_checkpoint_offload must be a boolean")
+    config.v41_dspark_stage_checkpoint_offload = dspark_stage_checkpoint_offload
     _apply_engram_host_fields(
         config, engram_storage_backend, engram_max_pending_entries,
         engram_max_sparse_rows_per_step, engram_sparse_adam_config,
@@ -546,6 +551,7 @@ def build_cropped_deepseek_v41(
         *,
         dspark_offload_pin_memory: bool = True,
         dspark_stage_checkpoint: bool = False,
+        dspark_stage_checkpoint_offload: bool = False,
 ) -> PreTrainedModel:
     """Build and parallelize a configurable V4.1 validation crop.
     Args:
@@ -569,6 +575,7 @@ def build_cropped_deepseek_v41(
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.
+        dspark_stage_checkpoint_offload: Store only complete-stage checkpoint inputs in pageable Host memory.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -601,6 +608,7 @@ def build_cropped_deepseek_v41(
         dspark_activation_offload=dspark_activation_offload,
         dspark_offload_pin_memory=dspark_offload_pin_memory,
         dspark_stage_checkpoint=dspark_stage_checkpoint,
+        dspark_stage_checkpoint_offload=dspark_stage_checkpoint_offload,
         engram_storage_backend=engram_storage_backend, engram_max_pending_entries=engram_max_pending_entries,
         engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
         engram_sparse_adam_config=engram_sparse_adam_config,
