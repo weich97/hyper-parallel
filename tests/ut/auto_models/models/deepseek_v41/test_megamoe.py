@@ -228,6 +228,41 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
             self.assertIs(parameter, parameters[name])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+    def test_chunked_low_precision_weight_gradients_preserve_cancellation(self) -> None:
+        """Feature: Chunked expert parameter-gradient accumulation.
+        Description: Sum opposing low-precision chunk derivatives and a small residual.
+        Expectation: Round the accumulated derivative once, retaining the residual.
+        """
+        for dtype in (torch.bfloat16, torch.float16, torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                source = _source().to(dtype)
+                candidate = DeepseekV41MegaMoeExperts(module=source, expert_weight_layout="EOI",
+                                                     fixed_route_tokens=384, token_chunk_size=128)
+                candidate.configure(None, 1, 2, fix_router=True)
+                self.addCleanup(candidate.close_runtime)
+                residual = 2.0 ** -12
+                coefficients = torch.tensor([1.0, residual, -1.0], dtype=dtype)
+                inputs = coefficients.repeat_interleave(128).view(384, 1).expand(-1, 8).clone() / 1024
+                inputs.requires_grad_()
+                indices = torch.zeros(384, 2, dtype=torch.int64)
+                routing = torch.ones(384, 2, dtype=dtype)
+
+                def _linear_kernel(_module, states, _indices, _routing, *, expert_weights, fixed_route_tokens):
+                    """Produce analytically known derivatives for each independent chunk."""
+                    del fixed_route_tokens
+                    scale = sum(weight.sum() for weight in expert_weights)
+                    return states * scale
+
+                with patch.object(MegaMoeExperts, "forward", autospec=True, side_effect=_linear_kernel):
+                    output = candidate(inputs, indices, routing)
+                scale = sum(parameter.detach().sum() for parameter in candidate.parameters())
+                torch.testing.assert_close(output, inputs * scale, rtol=0, atol=0)
+                output.sum().backward()
+                torch.testing.assert_close(inputs.grad, torch.full_like(inputs, scale), rtol=0, atol=0)
+                for parameter in candidate.parameters():
+                    torch.testing.assert_close(parameter.grad, torch.full_like(parameter, residual), rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
     def test_chunked_routes_reject_incompatible_shape_before_execution(self) -> None:
         """Feature: Fixed-route token chunking.
         Description: Exercise invalid layouts, schedules and input shapes.

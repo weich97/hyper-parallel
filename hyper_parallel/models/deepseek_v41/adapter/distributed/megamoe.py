@@ -209,12 +209,21 @@ class DeepseekV41MegaMoeExperts(nn.Module):
         expected = (self.fixed_route_tokens, self._executor.top_k)
         if tuple(top_k_index.shape) != expected or tuple(top_k_weights.shape) != expected:
             raise ValueError("Chunked MegaMoe requires one routing row per flattened input token")
+        # Independent low-precision casts route each chunk's weight derivative
+        # into one FP32 accumulator before rounding back to the parameter dtype.
+        # Reusing a single cast would accumulate the derivatives in BF16 again.
+        accumulation_weights = tuple(
+            weight.float() if torch.is_grad_enabled() and weight.requires_grad
+            and weight.dtype in (torch.bfloat16, torch.float16) else weight for weight in weights
+        )
         outputs = []
         for start in range(0, self.fixed_route_tokens, self.token_chunk_size):
             end = start + self.token_chunk_size
+            chunk_weights = tuple(accumulator.to(dtype=weight.dtype)
+                                  for accumulator, weight in zip(accumulation_weights, weights))
             outputs.append(self._executor(
                 states[start:end], top_k_index[start:end], top_k_weights[start:end],
-                expert_weights=weights, fixed_route_tokens=self.token_chunk_size,
+                expert_weights=chunk_weights, fixed_route_tokens=self.token_chunk_size,
             ))
         return torch.cat(outputs, dim=0).reshape_as(hidden_states)
 
