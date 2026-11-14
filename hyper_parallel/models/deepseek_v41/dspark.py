@@ -881,6 +881,9 @@ class DeepseekV41DSpark(nn.Module):
         draft[:, :, 0] = torch.where(next_is_in_document[None, :, None], first_embeddings, noise)
         draft[:, :, 1:] = noise
         streams = draft.unsqueeze(3).expand(-1, -1, -1, self.hc_mult, -1).contiguous()
+        # The expanded stream owns its storage. Release construction buffers
+        # before the stage workspace and residual outputs reach their peak.
+        del draft, first_embeddings
         pre_mix = streams.new_zeros(batch, seq * block, self.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         rope_cos, rope_sin = self._rope_tables(seq, device, token_embeddings.dtype)
@@ -898,7 +901,9 @@ class DeepseekV41DSpark(nn.Module):
                 streams, pre_mix = _checkpoint_stage(
                     stage, streams, pre_mix, main_states, rope_cos, rope_sin, draft_ids,
                     offload_inputs=self.stage_checkpoint_offload,
-                    use_checkpoint=False, sequence_boundaries=sequence_boundaries,
+                    # Retain the local prefix checkpoint during stage replay:
+                    # otherwise its saved activations overlap the expert workspace.
+                    use_checkpoint=True, sequence_boundaries=sequence_boundaries,
                 )
             else:
                 streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,

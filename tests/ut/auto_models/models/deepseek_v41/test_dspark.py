@@ -286,7 +286,7 @@ class DSparkComponentTest(unittest.TestCase):
     def test_complete_stage_replay_preserves_objective_and_all_gradients(self) -> None:
         """Feature: Complete DSpark stage activation checkpointing.
 
-        Description: Replay three complete stages with real non-reentrant autograd checkpointing.
+        Description: Replay three complete stages with nested communication-free prefix checkpoints.
         Expectation: Both draft losses, all parameter derivatives, and the frozen-head boundary agree.
         """
         for offload_inputs in (False, True):
@@ -320,8 +320,13 @@ class DSparkComponentTest(unittest.TestCase):
                     function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
                 )
 
+        def _cpu_local_checkpoint(function, *args):
+            """Exercise nested prefix and objective recomputation without a device runtime."""
+            return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False)
+
         with patch.object(torch.utils.checkpoint.DefaultDeviceType, "get_device_type", return_value="cpu"), \
-                patch("hyper_parallel.models.deepseek_v41.dspark._checkpoint_stage", side_effect=_cpu_checkpoint):
+                patch("hyper_parallel.models.deepseek_v41.dspark._checkpoint_stage", side_effect=_cpu_checkpoint), \
+                patch("hyper_parallel.models.deepseek_v41.dspark._checkpoint", side_effect=_cpu_local_checkpoint):
             actual, metrics = candidate(
                 targets, input_ids, labels, embeddings, head, noise_embedding=_noise(config),
             )
