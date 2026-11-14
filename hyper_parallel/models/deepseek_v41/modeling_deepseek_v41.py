@@ -617,6 +617,11 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
         module.init_weights(std)
     elif isinstance(module, DSparkDraftAttention):
         module.attn_sink.zero_()
+    elif isinstance(module, DeepseekV41MegaMoeExperts) and not module.is_transposed:
+        # Identity-layout replacements have no weight-conversion reset hook.
+        # Initialize at the source expert's traversal position to retain its RNG stream.
+        nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
+        nn.init.normal_(module.down_proj, mean=0.0, std=std)
 
 
 def _hc_pre(hidden_states: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:

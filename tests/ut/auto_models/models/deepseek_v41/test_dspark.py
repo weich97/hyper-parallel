@@ -48,6 +48,7 @@ from hyper_parallel.models.deepseek_v41.dspark import (
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM, DeepseekV41Model
 from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.chunk_loss import DeepseekV41ChunkedCausalLMLoss
 from hyper_parallel.trainer.base import BaseTrainer
 from hyper_parallel.trainer.runtime.eager_phases import eager_forward_backward
@@ -280,6 +281,48 @@ class _TokenInjection(torch.nn.Module):
 
 class DSparkComponentTest(unittest.TestCase):
     """Validate structure, gradient isolation, and target alignment."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_native_source_layout_preserves_materialized_model_initialization(self) -> None:
+        """Feature: Native experts initialized after meta materialization.
+
+        Description: Poison complete model storage and initialize source-layout expert replacements.
+        Expectation: Every parameter and the final RNG state match the unreplaced model exactly.
+        """
+        config = _config()
+        for name, value in vars(_small_config()).items():
+            if name.startswith("v41_dspark_"):
+                setattr(config, name, value)
+        config.architectures = ["DeepseekV41ForCausalLM"]
+        config.v41_dspark_depth = 3
+        config.v41_dspark_noise_token_id = config.vocab_size - 1
+        config.v41_dspark_target_layer_ids = [0]
+        config.initializer_range = 0.035
+        with patch("hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                   mock_open(read_data='{"layer_ids": []}')), init_empty_weights():
+            reference = DeepseekV41ForCausalLM(config)
+        candidate = copy.deepcopy(reference)
+        for stage in candidate.dspark.stages:
+            stage.mlp.experts = DeepseekV41MegaMoeExperts(
+                module=stage.mlp.experts, expert_weight_layout="EOI")
+        for model in (reference, candidate):
+            model.to_empty(device="cpu")
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.fill_(float("nan"))
+        with torch.random.fork_rng():
+            torch.manual_seed(1703)
+            _initialize_model_weights(reference)
+            expected_rng = torch.get_rng_state()
+            torch.manual_seed(1703)
+            _initialize_model_weights(candidate)
+            torch.testing.assert_close(torch.get_rng_state(), expected_rng, rtol=0, atol=0)
+        expected = dict(reference.named_parameters())
+        for name, parameter in candidate.named_parameters():
+            with self.subTest(parameter=name):
+                self.assertTrue(torch.isfinite(parameter).all())
+                torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
