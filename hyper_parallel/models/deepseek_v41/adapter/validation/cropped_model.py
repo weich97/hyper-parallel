@@ -435,7 +435,7 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
-        dspark_attention_backend: Reference window gather or native ``flash_v3`` training attention.
+        dspark_attention_backend: Reference gather, native ``flash_v3`` or repaired ``sparse_v2`` attention.
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.
@@ -483,8 +483,8 @@ def build_deepseek_v41_validation_config(
             or dspark_attention_chunk_size < 0):
         raise ValueError("dspark_attention_chunk_size must be a nonnegative integer")
     config.v41_dspark_attention_chunk_size = dspark_attention_chunk_size
-    if dspark_attention_backend not in ("reference", "flash_v3"):
-        raise ValueError("dspark_attention_backend must be reference or flash_v3")
+    if dspark_attention_backend not in ("reference", "flash_v3", "sparse_v2"):
+        raise ValueError("dspark_attention_backend must be reference, flash_v3 or sparse_v2")
     config.v41_dspark_attention_backend = dspark_attention_backend
     if not isinstance(dspark_activation_offload, bool):
         raise ValueError("dspark_activation_offload must be a boolean")
@@ -571,7 +571,7 @@ def build_cropped_deepseek_v41(
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
-        dspark_attention_backend: Reference window gather or native ``flash_v3`` training attention.
+        dspark_attention_backend: Reference gather, native ``flash_v3`` or repaired ``sparse_v2`` attention.
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.

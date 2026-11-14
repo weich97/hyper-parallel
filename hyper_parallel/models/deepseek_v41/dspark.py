@@ -61,6 +61,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.adapter.dspark_sparse_attention import dspark_sparse_attention
 
 logger = logging.getLogger(__name__)
 
@@ -355,9 +356,10 @@ class DSparkDraftAttention(nn.Module):
         self.window = int(config.v41_dspark_window)
         self.attention_chunk_size = int(getattr(config, "v41_dspark_attention_chunk_size", 0))
         self.attention_backend = getattr(config, "v41_dspark_attention_backend", "reference")
-        if self.attention_backend not in ("reference", "flash_v3"):
-            raise ValueError("DSpark attention backend must be reference or flash_v3")
+        if self.attention_backend not in ("reference", "flash_v3", "sparse_v2"):
+            raise ValueError("DSpark attention backend must be reference, flash_v3 or sparse_v2")
         self._flash_engaged = False
+        self._sparse_engaged = False
         self.q_lora_rank = int(config.q_lora_rank)
         self.o_groups = int(config.o_groups)
         self.o_lora_rank = int(config.o_lora_rank)
@@ -445,11 +447,18 @@ class DSparkDraftAttention(nn.Module):
         draft_kv = self.kv_norm(self.wkv(draft_states))
         draft_kv = torch.cat((draft_kv[..., :-rope],
                               _apply_rope(draft_kv[..., -rope:], draft_cos, draft_sin)), dim=-1)
-        combined_kv, valid = self._gather_context(key_value, draft_kv, start, local_positions)
-        if self.attention_backend == "flash_v3":
-            context = self._flash_window_context(query, combined_kv, document_positions)
+        if self.attention_backend == "sparse_v2":
+            context = dspark_sparse_attention(query, key_value, draft_kv, self.attn_sink.to(query.dtype).float(),
+                                               self.window, start, document_positions)
+            if not self._sparse_engaged:
+                logger.info("DSpark native sparse_v2 training attention engaged with valid-prefix selected KV")
+                self._sparse_engaged = True
         else:
-            context = self._reference_window_context(query, combined_kv, valid)
+            combined_kv, valid = self._gather_context(key_value, draft_kv, start, local_positions)
+            if self.attention_backend == "flash_v3":
+                context = self._flash_window_context(query, combined_kv, document_positions)
+            else:
+                context = self._reference_window_context(query, combined_kv, valid)
         context = torch.cat((context[..., :-rope], _apply_rope(
             context[..., -rope:], draft_cos.unsqueeze(-2), draft_sin.unsqueeze(-2), inverse=True)), dim=-1)
         grouped = context.reshape(batch, seq, block, self.o_groups, -1)
