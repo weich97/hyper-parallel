@@ -63,7 +63,7 @@ def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
 
 
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
-    """Return visual units and homogeneous-mesh Engram child units.
+    """Return visual, Engram and DSpark stage execution units.
 
     Args:
         model: Model being built or inspected.
@@ -79,7 +79,13 @@ def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
         or (module_fqn.endswith(".engram.embed")
             and not isinstance(module_by_fqn[module_fqn], HostEngramTable))
     )
-    return _get_visual_fsdp_wrap_modules(model) + engram_units
+    # The drafter is outside the HF decoder container. Keep its serial stages
+    # out of the root unit so their full dense weights can reshard independently.
+    draft_units = tuple(
+        module_fqn for module_fqn in module_by_fqn
+        if module_fqn.startswith("dspark.stages.") and module_fqn.count(".") == 2
+    )
+    return _get_visual_fsdp_wrap_modules(model) + engram_units + draft_units
 
 
 def get_fsdp_excluded_subtrees(model: Any) -> tuple[str, ...]:
@@ -119,6 +125,12 @@ def get_fsdp_execution_order(
             child_fqn = f"{layer_fqn}.{suffix}"
             if child_fqn in selected_fqns:
                 execution_order.append(child_fqn)
+    for stage_fqn in module_fqns:
+        if stage_fqn.startswith("dspark.stages.") and stage_fqn.count(".") == 2:
+            execution_order.append(stage_fqn)
+            expert_fqn = f"{stage_fqn}.mlp.experts"
+            if expert_fqn in selected_fqns:
+                execution_order.append(expert_fqn)
     execution_order.extend(
         module_fqn for module_fqn in module_fqns if module_fqn not in execution_order
     )
