@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 from rl.agentic.core.types import Action, ToolCall, ToolResult, TurnContext
-from rl.registry import Registry
+from rl.utils.registry import Registry
 
 
 _DEFAULT_MAX_CONCURRENCY = 4
@@ -189,7 +189,8 @@ class JsonFunctionCallProtocol:
             tool_calls=tuple(self._tool_call(value, index) for index, value in enumerate(raw_calls))
         )
 
-    def format_tool_results(self, results: Sequence[ToolResult], context: TurnContext) -> str:
+    @staticmethod
+    def format_tool_results(results: Sequence[ToolResult], context: TurnContext) -> str:
         """Serialize correlated tool results for the next model turn."""
         del context
         payload = {"tool_results": [
@@ -203,7 +204,8 @@ class JsonFunctionCallProtocol:
         ]}
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
-    def format_error(self, message: str, context: TurnContext) -> str:
+    @staticmethod
+    def format_error(message: str, context: TurnContext) -> str:
         """Return structured feedback so the model can self-correct."""
         del context
         return json.dumps({"interaction_error": message}, ensure_ascii=False, separators=(",", ":"))
@@ -230,7 +232,8 @@ class OpenAIToolCallProtocol(JsonFunctionCallProtocol):
             return ParsedAction(final_answer=content.strip())
         raise ValueError("OpenAI assistant message must contain tool_calls or non-empty content")
 
-    def format_tool_results(self, results: Sequence[ToolResult], context: TurnContext) -> str:
+    @staticmethod
+    def format_tool_results(results: Sequence[ToolResult], context: TurnContext) -> str:
         """Serialize tool results as newline-delimited OpenAI tool messages."""
         del context
         messages = (
@@ -247,7 +250,8 @@ class OpenAIToolCallProtocol(JsonFunctionCallProtocol):
             json.dumps(message, ensure_ascii=False, separators=(",", ":")) for message in messages
         )
 
-    def format_error(self, message: str, context: TurnContext) -> str:
+    @staticmethod
+    def format_error(message: str, context: TurnContext) -> str:
         """Return a recoverable OpenAI-style tool observation."""
         del context
         payload = {

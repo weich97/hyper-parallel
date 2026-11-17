@@ -18,10 +18,11 @@ from typing import Set
 
 from hyper_parallel.core.multicore.scheduler.config import (
     TaskDescC, TensorDescC, RuntimeConfigC,
-    TaskAiCoreType, TaskType,
+    TaskAiCoreType, TaskType, TaskSplitValue,
     MAX_TENSOR_DIMS,
 )
 from hyper_parallel.core.multicore.tasks.task_base import FillConfig
+from hyper_parallel.core.multicore.scheduler.graph import OperatorNode
 from hyper_parallel.core.multicore.tasks.utils import (
     advance_tsv_cube, advance_tsv_cube_only,
 )
@@ -38,6 +39,9 @@ class GmmFillConfig(FillConfig):
         Input indices that receive base_ptr_offset and dynamic_shape.
         activation GMMs (up_proj, down_proj, act_grad, gate_grad): {0}
         weight-grad GMMs (w2_grad, w1_grad): {0, 1}
+
+    transpose_inputs : Set[int]
+        Additional transposed operands, without changing shared TensorSpec objects.
 
     rank_in_event : bool
         True  → dependent_event adds single_rank_expert_num * rank_id.
@@ -72,14 +76,24 @@ class GmmFillConfig(FillConfig):
         Number of AI Cube cores (910B=24).
     """
     offset_inputs:  Set[int] = field(default_factory=lambda: {0})
+    # Shared activation specs retain their producer's interpretation.
+    transpose_inputs: Set[int] = field(default_factory=set)
     rank_in_event:  bool     = False
     global_trigger: bool     = False
     out_offset:     bool     = True
     advance:        str      = "cube"   # "cube" | "cube_only" | "cube_custom"
     event_delta:    int      = 0        # only used when advance="cube_custom"
     num_cube_cores: int      = 24
+    defer_weight_grad: bool  = False
 
-    def fill(self, cfg: RuntimeConfigC, op, tsv) -> None:
+    def fill(self, cfg: RuntimeConfigC, op: OperatorNode, tsv: TaskSplitValue) -> None:
+        """Serialize operand interpretation and event dependencies.
+
+        Args:
+            cfg: Runtime descriptor to populate.
+            op: Operator supplying operands and split metadata.
+            tsv: Current task indices and expert dimensions.
+        """
         task_num = op.task_num
         param    = op.param_positions
         glist_j  = len(op.inputs) - 1   # last input is always group_list
@@ -109,7 +123,7 @@ class GmmFillConfig(FillConfig):
                     td.base_ptr_offset = data_index * 4096 * spec.shape[1]
                     td.dynamic_shape   = int(spec.is_dynamic)
 
-                td.transpose_flag = int(spec.transpose)
+                td.transpose_flag = int(spec.transpose or j in self.transpose_inputs)
                 for k in range(min(len(spec.shape), MAX_TENSOR_DIMS)):
                     td.dim[k] = spec.shape[k]
                 task.inputs[j] = td
@@ -140,6 +154,7 @@ class GmmFillConfig(FillConfig):
             task.task_split_num       = task_num
             task.task_split_value     = op.split_value
             task.tiling_data_position = op.tiling_position
+            task.extra_value_0        = int(self.defer_weight_grad)
 
             cfg.all_tasks[tsv.pre_task_num + i]              = task
             cfg.cube_task_indices[tsv.pre_cube_task_num + i] = tsv.pre_task_num + i

@@ -44,11 +44,6 @@ TORCH29_REQUIRES = [
     "torch-npu==2.9.1",
 ]
 
-MINDSPORE_REQUIRES = [
-    "mindspore>=2.10",
-]
-
-
 def _read_requirements(requirements_path: str) -> list[str]:
     """Read Python requirement lines from a repository-local file."""
     with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
@@ -111,8 +106,7 @@ def get_extra_requires() -> dict[str, list[str]]:
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
         "torch29": list(TORCH29_REQUIRES),
-        "mindspore": list(MINDSPORE_REQUIRES),
-        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
+        "all": list(TORCH29_REQUIRES),
     }
 
 
@@ -234,9 +228,8 @@ if __name__ == '__main__':
     }
     setup(
         name='hyper_parallel',
-        version='0.1.0',
+        version='1.2.0.dev0',
         author='The MindSpore Authors',
-        author_email='contact@mindspore.cn',
         url='https://www.mindspore.cn',
         download_url='https://gitcode.com/mindspore/hyper-parallel/tags',
         project_urls={
@@ -256,9 +249,19 @@ if __name__ == '__main__':
         scripts=['hyper_parallel/core/multicore/scripts/hyper_parallel_multicore_set_env.bash'],
         package_data={
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
-            'hyper_parallel.components.functional': ['GDN_LICENSE', 'KDA_README.md'],
+            'hyper_parallel.components.functional._triton.gated_delta_net': ['GDN_LICENSE'],
+            'hyper_parallel.components.functional._triton.kimi_delta_attention': ['KDA_README.md'],
             'hyper_parallel.core.multicore': ['README.md', 'docs/**/*', 'examples/**/*', 'set_env.bash'],
-            'hyper_parallel.models.qwen3_moe': ['recipes/*.yaml'],
+            # Model adapter recipes + committed codegen reference bundles.
+            'hyper_parallel.models.qwen3_moe': [
+                'recipes/*.yaml', 'generated/*.json', 'generated/*.diff',
+            ],
+            'hyper_parallel.models.deepseek_v41': [
+                'generated/*.json', 'generated/*.diff',
+            ],
+            'hyper_parallel.models.deepseek_v41.tools': ['*.sh', '*.yaml', '*.md'],
+            'hyper_parallel.auto_parallel': ['op_profiles/*.yaml', 'op_records.yaml'],
+            'hyper_parallel.models.deepseek_v3': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],

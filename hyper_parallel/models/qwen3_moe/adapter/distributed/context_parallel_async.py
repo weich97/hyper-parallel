@@ -58,7 +58,7 @@ from hyper_parallel.distributed.context_parallel.collectives import (
     ulysses_head_to_seq,
 )
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
+from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 
@@ -167,6 +167,15 @@ def _prepare_qwen3_moe_attention_mask(
             "Qwen3-MoE CP attention_mask must cover the global KV sequence: "
             f"mask kv length={attention_mask.shape[-1]}, expected {kv_len}"
         )
+    if attention_mask.ndim == 2:
+        causal_mask = _cp_offset_causal_mask(
+            q_len,
+            kv_len,
+            query_offset,
+            query.device,
+        )
+        padding_mask = attention_mask.to(device=query.device, dtype=torch.bool)
+        return causal_mask[None, None, :, :] & padding_mask[:, None, None, :]
     if attention_mask.ndim >= 2 and attention_mask.shape[-2] != q_len:
         if attention_mask.shape[-2] < query_offset + q_len:
             raise ValueError(

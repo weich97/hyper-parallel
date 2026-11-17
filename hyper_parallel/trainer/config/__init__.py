@@ -26,14 +26,23 @@ definitions.
 __all__ = [
     "AcceleratorConfig",
     "ActivationCheckpointConfig",
+    "ActivationCheckpointSelection",
     "CompileConfig",
     "DataLoaderConfig",
     "DatasetConfig",
     "DebugConfig",
     "FSDP2Config",
+    "MemoryConfig",
     "MixedPrecisionConfig",
+    "ModelIntegrationConfig",
     "OptimizerConfig",
+    "OptimizerSwapConfig",
+    "ProfilingAnalysisConfig",
     "ProfilingConfig",
+    "StressDetectConfig",
+    "OpStressDetectConfig",
+    "ModelStressDetectConfig",
+    "ReplaceAction",
     "Target",
     "TrainerConfig",
     "TrainingConfig",
@@ -53,20 +62,32 @@ from hyper_parallel.trainer.config.data import (
 from hyper_parallel.trainer.config.optimization import (
     MixedPrecisionConfig,
     OptimizerConfig,
+    OptimizerSwapConfig,
 )
 from hyper_parallel.trainer.config.parallelism import (
     AcceleratorConfig,
     ActivationCheckpointConfig,
+    ActivationCheckpointSelection,
     PlanOverride,
+    ReplaceAction,
     _import_module_type,
     entries_to_module_replacements,
+    entries_to_method_replacements,
     entries_to_plan_overrides,
     normalize_distributed_setup_overrides,
 )
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.trainer.config.stress_detect import (
+    ModelStressDetectConfig,
+    OpStressDetectConfig,
+    StressDetectConfig,
+)
 from hyper_parallel.trainer.config.trainer import TrainerConfig, save_configs
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    MemoryConfig,
+    ModelIntegrationConfig,
+    ProfilingAnalysisConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,

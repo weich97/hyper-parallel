@@ -14,6 +14,7 @@
 # ============================================================================
 """Verify that MegaMoe never consumes unwritten activation or communication rows."""
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -29,28 +30,33 @@ from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_ev
 
 @contextmanager
 def poison_overwritten_buffers(value: float) -> Iterator[None]:
-    """Fill candidate outputs before their producers, preserving required dW zeros."""
+    """Fill candidate outputs before their producers, preserving required dW zeros.
+
+    Args:
+        value: Sentinel used to detect rows that a producer did not overwrite.
+    """
     allocate_forward = function_module._allocate_forward_intermediates  # pylint: disable=protected-access
     allocate_backward = function_module._allocate_backward_intermediates  # pylint: disable=protected-access
     claim = MegaMoeWorkspace.claim
 
     def _forward(*args):
         tensors = allocate_forward(*args)
-        for tensor in tensors:
+        for tensor in (tensors.up_proj, tensors.activation, tensors.down_proj):
             tensor.fill_(value)
         return tensors
 
     def _backward(*args):
         tensors = allocate_backward(*args)
-        for tensor in tensors[2:]:
+        for tensor in (tensors.act_grad, tensors.swiglu_grad, tensors.gate_dx):
             tensor.fill_(value)
         return tensors
 
     def _poisoned_claim(workspace):
         claim(workspace)
         # The existing stream lease must finish before overwriting shared storage.
-        workspace.expert_buffer.fill_(value)
-        workspace.routed_buffer.fill_(value)
+        for tensor in (workspace.expert_buffer, workspace.source_buffer, workspace.routed_buffer):
+            if tensor is not None:
+                tensor.fill_(value)
 
     with (
         patch.object(function_module, "_allocate_forward_intermediates", side_effect=_forward),
@@ -95,9 +101,11 @@ def test_mega_moe_poisoned_buffers() -> None:
     source, upstream = baseline.make_data(shape)
     stream = torch.npu.Stream(device=baseline.DEVICE)
     results = []
-    for factor in (None, 1.5):
+    mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
+    factors = (None, 1.5) if mode == "push" else (None,)
+    for factor in factors:
         start_shmem_lifetime()
-        mega, common = baseline.new_layers(shape, expert_capacity_factor=factor)
+        mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         patterns = ["balanced", "tail", "empty_experts", "balanced"]
         if factor is None:
             patterns.extend(["destination0", "destination1", "tail"])
@@ -113,4 +121,4 @@ def test_mega_moe_poisoned_buffers() -> None:
                 results.append({"factor": factor, "pattern": pattern, "poison": str(value), "passed": True})
         finally:
             mega.close()
-    write_evidence({"poisoned_buffers": results})
+    write_evidence({"dispatch_mode": mode, "poisoned_buffers": results})

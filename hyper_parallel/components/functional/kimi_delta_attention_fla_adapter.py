@@ -15,6 +15,15 @@
 """Lazy adapter for the external FLA Triton-Ascend KDA backend."""
 from __future__ import annotations
 
+# pylint: disable=forbidden-backend-import
+
+__all__ = [
+    "FLAKDAStagedOps",
+    "get_fla_kda_staged_ops",
+    "is_fla_triton_kda_available",
+    "run_fla_chunk_kda",
+]
+
 import importlib
 import importlib.util
 import re
@@ -249,6 +258,7 @@ def run_fla_chunk_kda(
     lower_bound: float = -5.0,
     chunk_size: int = 64,
     safe_gate: bool = True,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run FLA's public KDA API with the validated Kimi K3 fused contract."""
     runtime = _require_fla_kda_runtime()
@@ -269,12 +279,5 @@ def run_fla_chunk_kda(
         safe_gate=safe_gate,
         lower_bound=lower_bound,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
-
-
-__all__ = [
-    "FLAKDAStagedOps",
-    "get_fla_kda_staged_ops",
-    "is_fla_triton_kda_available",
-    "run_fla_chunk_kda",
-]

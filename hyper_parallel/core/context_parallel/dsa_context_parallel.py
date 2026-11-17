@@ -27,6 +27,8 @@ stay replicated.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+import torch.distributed as dist
+
 from hyper_parallel.core.context_parallel.context_parallel import (
     _OUTPUT_NON_CP,
     _drop_cp_from_output,
@@ -779,7 +781,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     def _get_local_idx(cp_mesh: DeviceMesh) -> int:
         """Return current rank's index in the CP mesh rank list."""
         rank_list = list(cp_mesh.rank_list)
-        rank = utils.get_rank()
+        rank = dist.get_rank()
         return rank_list.index(rank) if rank in rank_list else 0
 
     def _apply_with_loss_specs(

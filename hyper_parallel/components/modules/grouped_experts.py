@@ -30,6 +30,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 )
 
 from hyper_parallel.models.replacement import module_replacement
+from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
 from hyper_parallel.components.functional import (
     grouped_matmul,
     moe_token_permute,
@@ -188,6 +189,12 @@ class GroupedExperts(nn.Module):
                 torch.empty(npu_down_shape, device=source_down.device, dtype=source_down.dtype),
                 requires_grad=source_down.requires_grad,
             )
+            # Meta weights are populated by the existing checkpoint/init pipeline.
+            # Eager replacement must preserve values already present in the source.
+            if not source_gate_up.is_meta:
+                with torch.no_grad():
+                    target_gate_up.copy_(source_gate_up.transpose(-2, -1))
+                    self.down_proj.copy_(source_down.transpose(-2, -1))
         else:
             target_gate_up = source_gate_up
             self.down_proj = source_down
@@ -279,6 +286,9 @@ class GroupedExperts(nn.Module):
         if self.has_gate and not self.is_concatenated:
             raise ValueError("GroupedExperts requires concatenated gate/up expert weights")
         self.is_transposed = True
+        # Keep HF native initialization order stable; this replacement module
+        # resets its packed expert parameters after materialization instead.
+        self._hp_reset_after_materialization = True
         self.train(module.training)
 
     def _initialize_projection_layout(
@@ -482,3 +492,37 @@ class GroupedExperts(nn.Module):
             top_k_weights,
         )
         return output.view(hidden_shape)
+
+
+register_module_family(ModuleFamily(
+    name="grouped_experts",
+    baseline=GroupedExperts,
+    variants={
+        "w8a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_mxfp8_grouped_experts",
+        "w4a8": "hyper_parallel.components.modules.low_precision_grouped_experts.replace_w4a8_grouped_experts",
+        "fake_w4a8": (
+            "hyper_parallel.components.modules.low_precision_grouped_experts.replace_fake_w4a8_grouped_experts"
+        ),
+        "mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU",
+        "fused_mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.FusedMXFP8GroupedSwiGLU",
+    },
+    selector_specs={
+        "use_mxfp8": SelectorSpec(bool, False), "fused": SelectorSpec(bool, False, aliases=("use_fused_mxfp8",)),
+        "weight_format": SelectorSpec(str, ""), "act_format": SelectorSpec(str, ""),
+        "is_fake_quantize": SelectorSpec(bool, False),
+    },
+    variant_rules=(
+        VariantRule({"use_mxfp8": True, "fused": False,
+                     "weight_format": "", "act_format": "", "is_fake_quantize": False}, "mxfp8"),
+        VariantRule({"use_mxfp8": True, "fused": True,
+                     "weight_format": "", "act_format": "", "is_fake_quantize": False}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False}, "w8a8"),
+        VariantRule({"use_mxfp8": False, "fused": True,
+                     "weight_format": "mxfp8", "act_format": "mxfp8", "is_fake_quantize": False}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp4", "act_format": "mxfp8", "is_fake_quantize": False}, "w4a8"),
+        VariantRule({"use_mxfp8": False, "fused": False,
+                     "weight_format": "mxfp4", "act_format": "mxfp8", "is_fake_quantize": True}, "fake_w4a8"),
+    ),
+))

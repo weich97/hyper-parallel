@@ -62,9 +62,9 @@ from model import (  # pylint: disable=C0413
     DataSampler,
 )
 from hyper_parallel.compile import (  # pylint: disable=C0413
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
 )
 from hyper_parallel.distributed.mesh import MeshContext  # pylint: disable=C0413
 from hyper_parallel.distributed import (  # pylint: disable=C0413
@@ -153,7 +153,7 @@ def build_mesh_context(parallel_cfg: dict, device_type: str) -> MeshContext:
     return ctx
 
 
-def train_fn(model, input_ids, labels):
+def train_fn(model, *, input_ids, labels):
     """Standard CE loss on the boundary-wrapped model forward.
 
     In SP mode the lm_head boundary all-gathers hidden_states to full
@@ -273,12 +273,14 @@ def main():  # pylint: disable=too-many-locals
             "attention, no patch needed"
         )
 
-    # 4. FSDP wrap plan for the graph-mode FSDPPass (wrap everything).
-    fsdp_plan = PassPlan()
-    fsdp_plan.fsdp_wrap_pattern("*")
+    # 4. FSDP plan for the graph-mode FSDPPass (mark everything).
+    fsdp_plan = GraphParallelPlan()
+    fsdp_plan.fsdp_mark_pattern("*")
 
     # 5. GraphTrainer reuses the automodel mesh (tp group already created);
     #    it registers the dp sub-mesh as "fsdp" and back-fills fsdp_degree.
+    #    TP/SP/LP are NOT PassConfig knobs: they live in the automodel plan
+    #    applied above, and the graph passes never read them.
     tcfg = cfg["train"]
     trainer = GraphTrainer(
         model=model,
@@ -286,11 +288,8 @@ def main():  # pylint: disable=too-many-locals
         pass_config=PassConfig(
             enable_overlap=cfg["parallel"].get("enable_overlap", True),
             fsdp_degree=cfg["parallel"]["dp_size"],
-            tp_size=tp_size,
-            sequence_parallel=sequence_parallel,
-            loss_parallel=loss_parallel,
         ),
-        pass_plan=fsdp_plan,
+        parallel_plan=fsdp_plan,
         optimizer_config={
             "lr": tcfg.get("lr", 1e-4),
             "grad_clip": tcfg.get("grad_clip", 1.0),
@@ -322,7 +321,7 @@ def main():  # pylint: disable=too-many-locals
             "reduce-scatter)",
             input_batch.shape[1],
         )
-    trainer.compile(input_batch, label_batch)
+    trainer.compile(input_ids=input_batch, labels=label_batch)
     inspect_graph(trainer)
 
     # 7. Training data iterator (DataSampler yields full-sequence batches)

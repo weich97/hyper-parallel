@@ -33,18 +33,23 @@ __all__ = [
     "ExpertParallel",
     "TensorParallel",
     "ExpertTensorParallel",
+    # Re-exported for the UT, which applies it directly.
+    "_AsyncA2ALazyBwd",
 ]
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
-from torch import Tensor
-from torch.distributed.nn import functional as dist_func
 from torch.nn import Module
 
+from hyper_parallel.core.expert_parallel.static_splits import (
+    get_static_plan,
+    static_plan_key,
+    store_static_plan,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
     distribute_module,
@@ -56,6 +61,16 @@ from hyper_parallel.core.dtensor.dtensor import (
 )
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
+from hyper_parallel.core.utils.communication import (
+    _AsyncA2ALazyBwd,
+    differentiable_all_gather_concat,
+    differentiable_all_to_all_single,
+    differentiable_all_to_all_single_async,
+    differentiable_reduce_scatter,
+    exchange_splits_via_all_to_all,
+    gather_counts_via_all_gather,
+    wait_async_tensor,
+)
 
 
 class AsyncHandle:
@@ -83,207 +98,6 @@ class AsyncHandle:
             wait_async_tensor(self._tensor)
             self._waited = True
         return self._tensor
-
-
-class _AsyncA2ALazyBwd(torch.autograd.Function):
-    """All-to-all whose forward AND backward return ``AsyncCollectiveTensor``.
-
-    PyTorch's stock ``all_to_all_single_autograd`` calls ``wait_tensor`` in
-    its backward eagerly, and the autograd engine binds backward stream
-    context to the forward stream — so even if the BWD thread is wrapped
-    in a side-stream context, that wait still lands on the FWD main
-    stream and blocks Attention launches.
-
-    This Function bypasses the engine's binding by calling the
-    non-autograd functional op in both directions and returning ACT.
-    The wait is deferred to the next consumer's first non-view access
-    (e.g. the indexing backward of ``_unpermute``), giving the FWD
-    thread a small Python window to enqueue its Attention kernels onto
-    the main stream **before** the wait lands there.
-    """
-
-    @staticmethod
-    def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
-        """Perform the forward all-to-all single collective, saving splits and group for backward."""
-        ctx.input_splits = input_splits
-        ctx.output_splits = output_splits
-        ctx.group = group
-        # pylint: disable=C0415
-        from torch.distributed._functional_collectives import all_to_all_single
-        return all_to_all_single(
-            input_tensor, output_splits, input_splits, group,
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Compute the backward pass by performing the inverse all-to-all with swapped splits."""
-        # pylint: disable=C0415
-        from torch.distributed._functional_collectives import all_to_all_single
-        grad_input = all_to_all_single(
-            grad_output, ctx.input_splits, ctx.output_splits, ctx.group,
-        )
-        return grad_input, None, None, None
-
-
-class _TorchContiguousGrad(torch.autograd.Function):  # pylint: disable=abstract-method
-    """Autograd identity that materializes gradients before upstream collectives."""
-
-    @staticmethod
-    def forward(ctx: Any, tensor: Tensor) -> Tensor:  # pylint: disable=arguments-differ
-        """Return the input unchanged in the forward pass.
-
-        Args:
-            ctx: Autograd context required by ``torch.autograd.Function``.
-            tensor: Tensor produced by the differentiable collective.
-
-        Returns:
-            The input tensor without a forward copy.
-        """
-        del ctx
-        return tensor
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tensor:  # pylint: disable=arguments-differ
-        """Return a contiguous gradient to the preceding autograd node.
-
-        Args:
-            ctx: Autograd context required by ``torch.autograd.Function``.
-            grad_output: Gradient from the collective output consumer.
-
-        Returns:
-            A contiguous gradient tensor.
-        """
-        del ctx
-        return grad_output.contiguous()
-
-
-# Mapping from string op names to torch.distributed.ReduceOp
-_OP_MAP = {
-    'sum': dist.ReduceOp.SUM,
-    'prod': dist.ReduceOp.PRODUCT,
-    'max': dist.ReduceOp.MAX,
-    'min': dist.ReduceOp.MIN,
-    # convert tensor elements to int32 and use MIN
-    'all': dist.ReduceOp.MIN,
-    # 'avg' is typically handled by SUM followed by division in current implementation logic
-    'avg': dist.ReduceOp.SUM,
-}
-
-# Try to add AVG for 'mean' if supported by current torch version
-if hasattr(dist.ReduceOp, "AVG"):
-    _OP_MAP['mean'] = dist.ReduceOp.AVG
-else:
-    # Fallback for older torch versions if necessary, though this might require manual division upstream
-    # Assuming standard behavior where 'mean' implies native AVG support or upstream handling
-    _OP_MAP['mean'] = dist.ReduceOp.SUM
-
-
-def _ensure_contiguous(x):
-    """Return a contiguous copy of *x* if not already contiguous."""
-    if torch.compiler.is_compiling():
-        return x.contiguous()
-    if not x.is_contiguous() or x.storage_offset() != 0:
-        return x.contiguous()
-    return x
-
-
-def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
-    """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
-    out_total = sum(output_splits)
-    output = torch.empty(
-        out_total, *input_tensor.shape[1:],
-        dtype=input_tensor.dtype, device=input_tensor.device,
-    )
-    output = dist_func.all_to_all_single(
-        output, input_tensor,
-        output_split_sizes=output_splits,
-        input_split_sizes=input_splits,
-        group=group,
-    )
-    return output
-
-
-def differentiable_all_to_all_single_async(input_tensor, input_splits, output_splits, group):
-    """Truly-async variant of :meth:`differentiable_all_to_all_single`.
-
-    Both forward AND backward return :class:`AsyncCollectiveTensor`,
-    so the ``wait_tensor`` op is queued lazily — only when a downstream
-    kernel actually reads the result.
-
-    Why both directions need lazy wait:
-
-    * FWD: ACT lazy wait lets host return immediately and the paired
-      BWD thread's compute kernel slip into the queue before the wait.
-    * BWD: PyTorch's stock backward issues ``wait_tensor`` eagerly,
-      and the autograd engine binds backward stream to the forward
-      stream — so even running BWD inside a ``with torch.npu.stream
-      (side_stream)`` context does not move that wait off the main
-      stream.  Returning ACT from backward defers the wait to the
-      next backward op's first consumption, opening a small window
-      during which FWD's Attention kernels can be queued onto the
-      main stream **before** the wait lands.
-
-    Args:
-        input_tensor:  Input tensor, split along dim 0 by ``input_splits``.
-        input_splits:  ``list[int]`` — rows sent to each rank.
-        output_splits: ``list[int]`` — rows received from each rank.
-        group:         Process group.
-
-    Returns:
-        ``AsyncCollectiveTensor`` of shape
-        ``[sum(output_splits), *input_tensor.shape[1:]]``.
-    """
-    return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
-
-
-# pylint: disable-next=unused-argument
-def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
-    """Gather differentiable shards and concatenate them in the requested rank order."""
-    data = _ensure_contiguous(data)
-    output = [
-        _TorchContiguousGrad.apply(tensor)
-        for tensor in dist_func.all_gather(data, group=group)
-    ]
-    if rank_list is not None:
-        group_ranks = dist.get_process_group_ranks(group)
-        if tuple(rank_list) != tuple(group_ranks):
-            rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
-            output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
-    return torch.cat(output, dim=concat_dim)
-
-
-def differentiable_reduce_scatter(data, dev_num, axis, op, group):
-    """Reduce differentiable chunks and scatter one result to each rank."""
-    data = _ensure_contiguous(data)
-    input_tuple = torch.chunk(data, dev_num, dim=axis)
-    output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
-
-    # Resolve the op from string to ReduceOp enum
-    reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
-
-    output_tensor = dist_func.reduce_scatter(output_tensor, input_tuple, op=reduce_op, group=group)
-
-    # Keep manual handling for 'avg' string as it maps to SUM in _OP_MAP
-    if op == 'avg':
-        output_tensor = output_tensor / dev_num
-    return output_tensor
-
-
-def wait_async_tensor(tensor):
-    """Wait for an async collective tensor to become materialised.
-
-    Idempotent — calling on an already-waited tensor is a no-op.
-
-    Args:
-        tensor: ``AsyncCollectiveTensor`` whose device-side values may
-            not yet be ready.
-
-    Returns:
-        The same *tensor*, now fully materialised.
-    """
-    from torch.distributed._functional_collectives import wait_tensor  # pylint: disable=C0415
-    wait_tensor(tensor)
-    return tensor
 
 
 # ---------------------------------------------------------------------------
@@ -765,35 +579,37 @@ class AllToAllTokenDispatcher:
         ep_size = device_mesh.size()
         num_local_experts = num_tokens_per_expert.shape[0] // ep_size
 
-        # --- Step 1: exchange token counts (no gradient needed) ---
-        # Each rank needs to know how many tokens it will receive from every
-        # other rank (for each local expert).  Uses ``async_op=True`` + an
-        # explicit ``handle.wait()`` rather than ``async_op=False`` because
-        # the implicit cross-stream sync is NCCL-only; on HCCL the compute
-        # stream may read ``counts_out`` before the collective write is
-        # visible, producing garbage values that blow up the downstream
-        # ``torch.empty(sum(output_splits), ...)`` allocation.
-        counts_out = torch.empty(
-            [num_tokens_per_expert.shape[0]],
+        # --- Steps 1-2: token counts and the split vectors ---
+        # Under a static routing plan the answer never changes, so it is computed once and
+        # reused: that is what removes the per-layer counts a2a and its two D2H syncs.
+        plan_key = static_plan_key(
+            num_tokens_per_expert.shape[0], ep_size, num_local_experts,
             device=num_tokens_per_expert.device,
-            dtype=num_tokens_per_expert.dtype,
         )
-        handle = dist.all_to_all_single(
-            counts_out, num_tokens_per_expert, group=ep_group, async_op=True,
-        )
-        if handle is not None:
-            handle.wait()
-        # counts_out shape: [ep_size * num_local_experts]
-        # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
+        cached_plan = get_static_plan(plan_key)
+        if cached_plan is not None:
+            counts_out, input_splits, output_splits = cached_plan
+        else:
+            # The counts exchange is shared with the other dispatchers (see
+            # ``core.utils.communication``): async with an explicit wait, because the
+            # implicit cross-stream sync is NCCL-only and on HCCL the compute stream
+            # could read ``counts_out`` before the collective write is visible.
+            counts_out = exchange_splits_via_all_to_all(num_tokens_per_expert, ep_group)
+            # counts_out shape: [ep_size * num_local_experts]
+            # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
 
-        # --- Step 2: compute input / output splits ---
-        # input_splits[r] = tokens this rank sends to rank r
-        # output_splits[r] = tokens this rank receives from rank r
-        # Reshape to [ep_size, num_local_experts] and sum per rank on device;
-        # a single ``tolist()`` drains the rank-sum vector to host, replacing
-        # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
-        input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
-        output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            # input_splits[r] = tokens this rank sends to rank r
+            # output_splits[r] = tokens this rank receives from rank r
+            # Reshape to [ep_size, num_local_experts] and sum per rank on device;
+            # a single ``tolist()`` drains the rank-sum vector to host, replacing
+            # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
+            input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
+            store_static_plan(
+                plan_key, (counts_out, input_splits, output_splits),
+                f"(ep={ep_size}, local_experts={num_local_experts}, "
+                f"tokens/peer={input_splits[0] if input_splits else 0})",
+            )
 
         # --- Step 3a: exchange actual tokens (differentiable) ---
         dispatched = differentiable_all_to_all_single(
@@ -988,18 +804,9 @@ class DeredundencyTokenDispatcher:
             gathered_counts = num_tokens_per_expert.view(1, num_tokens_per_expert.shape[0])
             return gathered_counts, routed_input, router_coeff
 
-        gathered_counts = torch.empty(
-            [mesh_info.oep_size * num_tokens_per_expert.shape[0]],
-            dtype=num_tokens_per_expert.dtype,
-            device=num_tokens_per_expert.device,
+        gathered_counts = gather_counts_via_all_gather(
+            num_tokens_per_expert, mesh_info.oep_group, mesh_info.oep_size,
         )
-        handle = dist.all_gather_into_tensor(
-            gathered_counts, num_tokens_per_expert,
-            group=mesh_info.oep_group, async_op=True,
-        )
-        if handle is not None:
-            handle.wait()
-        gathered_counts = gathered_counts.view(mesh_info.oep_size, num_tokens_per_expert.shape[0])
         source_token_totals = gathered_counts.sum(dim=1).tolist()
         if any(total != routed_input.shape[0] for total in source_token_totals):
             raise ValueError(
@@ -1121,17 +928,7 @@ class DeredundencyTokenDispatcher:
     @staticmethod
     def _iep_exchange_counts(node_counts_per_expert, mesh_info, num_local_experts):
         """IEP all-to-all of per-expert counts; return (counts_out, output_splits)."""
-        iep_counts_out = torch.empty(
-            [node_counts_per_expert.shape[0]],
-            device=node_counts_per_expert.device,
-            dtype=node_counts_per_expert.dtype,
-        )
-        handle = dist.all_to_all_single(
-            iep_counts_out, node_counts_per_expert,
-            group=mesh_info.iep_group, async_op=True,
-        )
-        if handle is not None:
-            handle.wait()
+        iep_counts_out = exchange_splits_via_all_to_all(node_counts_per_expert, mesh_info.iep_group)
         iep_output_splits = iep_counts_out.view(
             mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
         return iep_counts_out, iep_output_splits
@@ -1236,6 +1033,8 @@ class DeredundencyTokenDispatcher:
         """
         return handle.wait()
 
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_DISPATCHERS = {
     "all_to_all": AllToAllTokenDispatcher,
@@ -1396,10 +1195,9 @@ class ExpertParallel(BaseExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
-        # are captured by autograd graph and don't need the attribute. But in
-        # MindSpore PyNative mode, deleting the attribute may break backward.
-        # The context will be overwritten on the next forward call.
+        # Note: Do NOT delete the context here. The tensors in ctx are
+        # captured by the autograd graph, so the attribute is not needed for
+        # backward and is simply overwritten on the next forward call.
 
         if self.async_combine:
             handle = self._token_dispatcher.combine_start(
@@ -1614,10 +1412,9 @@ class ExpertTensorParallel(ExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
-        # are captured by autograd graph and don't need the attribute. But in
-        # MindSpore PyNative mode, deleting the attribute may break backward.
-        # The context will be overwritten on the next forward call.
+        # Note: Do NOT delete the context here. The tensors in ctx are
+        # captured by the autograd graph, so the attribute is not needed for
+        # backward and is simply overwritten on the next forward call.
 
         dispatch_mesh = self._dispatch_mesh(device_mesh)
 

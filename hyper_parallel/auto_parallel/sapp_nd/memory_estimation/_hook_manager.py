@@ -20,7 +20,7 @@ import textwrap
 import inspect
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
-from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import strategy_guarded
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.arch_hooks import check_and_apply_custom_hook
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
@@ -145,7 +145,8 @@ class _HookManager(_Backbone):
     def __set_node_eval_comm_fun(self, cls_obj, target_node, *args, **kwargs):
         """overwrite given node's comm formulas"""
         c_comm = None
-        if (args and args[-1] == 0) or kwargs.get("dyn_comm") == 0 or kwargs.get("dyn") == 0:
+        positional_zero = args and args[-1] == 0
+        if positional_zero or kwargs.get("dyn_comm") == 0 or kwargs.get("dyn") == 0:
             c_comm = 0
         dyn_dp_comm = kwargs.get("dyn_dp_comm", c_comm)
         dyn_tp_comm = kwargs.get("dyn_tp_comm", c_comm)
@@ -305,9 +306,9 @@ class _HookManager(_Backbone):
             )
 
     def set_expert_param_eval_fun(
-        self, routed_num_p: Any = None, shared_num_p: Any = None
+        self, routed_num_p: Any = None, shared_num_p: Any = None, router_num_p: Any = None
     ) -> None:
-        """overwrite expert param count formulas for routed/shared breakdown"""
+        """overwrite expert param count formulas for routed/shared breakdown, and the router's"""
         if self.__is_valid_eval_func(routed_num_p):
             self._ctx.ffn_routed_num_p = self.__custom_getattr(
                 EvalFFn, routed_num_p
@@ -316,6 +317,8 @@ class _HookManager(_Backbone):
             self._ctx.ffn_shared_num_p = self.__custom_getattr(
                 EvalFFn, shared_num_p
             )
+        if self.__is_valid_eval_func(router_num_p):
+            self._ctx.ffn_router_num_p = self.__custom_getattr(EvalFFn, router_num_p)
 
     def set_norm_eval_fun(self, num_p: Any = None, activation=None):
         """overwrite norm formulas"""
@@ -343,21 +346,8 @@ class _HookManager(_Backbone):
     def set_ccfg(self, hook):
         """overwrite cost model variable (except strategy)"""
         if hook and callable(hook):
-
-            def custom_setter(self, name, value):
-                strat_vars = ["d", "t", "ep", "p", "vp", "cp", "os_max_shard"]
-                if name in strat_vars:
-                    raise AttributeError(
-                        f"Cannot directly modify {name}, use set_strategy()"
-                    )
-                self.__dict__[name] = value
-
-            original_setter = CostModelConfig.__setattr__
-            CostModelConfig.__setattr__ = custom_setter
-            try:
+            with strategy_guarded(self._ccfg):
                 hook(self._ccfg)
-            finally:
-                CostModelConfig.__setattr__ = original_setter
 
     def __wrap_mem_counter(self, mem_type: MemType, fun: Callable) -> None:
         """Wrap formula calls to accumulate memory by type."""
@@ -498,6 +488,7 @@ class _HookManager(_Backbone):
         self.set_expert_param_eval_fun(
             routed_num_p=self.eval_cfg.base_arch_mem_comp.feedforward.routed_num_fun,
             shared_num_p=self.eval_cfg.base_arch_mem_comp.feedforward.shared_num_fun,
+            router_num_p=self.eval_cfg.base_arch_mem_comp.feedforward.router_num_fun,
         )
         self.set_norm_eval_fun(
             self.eval_cfg.base_arch_mem_comp.norm.num_param_fun,

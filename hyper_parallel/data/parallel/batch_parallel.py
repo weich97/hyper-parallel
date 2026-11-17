@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header,forbidden-backend-import
 
 """data.parallel.batch_parallel: CP-aware batch sharding.
 
@@ -28,13 +29,44 @@ Split out of components/distributed/cp_utils.py in stage 4e; merged with
 components/datasets/parallel/batch_parallel.py in stage 6 (05 §11.2).
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
-import torch
-import torch.distributed as dist
+
+import torch  # pylint: disable=forbidden-backend-import
+import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
+
+
+def _pad_batch_for_cp(batch: dict[str, Any], pad_len: int) -> dict[str, Any]:
+    """Pad sequence-dimension tensor fields for context parallelism."""
+    padded = dict(batch)
+    if pad_len <= 0:
+        return padded
+
+    pad_values = {"labels": -100, "input_ids": 0, "attention_mask": 0}
+    for key, value in batch.items():
+        if key == "qkv_format" or not isinstance(value, torch.Tensor) or value.ndim < 1:
+            continue
+        if key in ("seq_lens", "seq_lens_padded"):
+            continue  # recomputed separately, not padded
+        if key == "position_ids":
+            # position_ids increment-pad: continue incrementing from the last value
+            last = value[..., -1:].to(torch.long)
+            increment = torch.arange(1, pad_len + 1, device=value.device,
+                                     dtype=value.dtype)
+            increment = increment.reshape(*([1] * (value.ndim - 1)), pad_len)
+            pad_block = increment.expand(*value.shape[:-1], pad_len) + last
+        else:
+            shape = list(value.shape)
+            shape[-1] = pad_len
+            pad_block = torch.full(shape, pad_values.get(key, 0),
+                                   dtype=value.dtype, device=value.device)
+        padded[key] = torch.cat([value, pad_block], dim=-1)
+    return padded
 
 
 def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, Any]:
@@ -50,6 +82,10 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     Sharding strategy: pad to a multiple of 2*cp, then slice the token
     interval [cp_rank*chunk, (cp_rank+1)*chunk); the seq_lens family is
     recomputed separately (_shard_seq_lens_for_cp).
+
+    Args:
+        batch: Canonical token batch to shard.
+        cp_mesh: Context-parallel process mesh.
     """
     cp_size = cp_mesh.size()
     if cp_size <= 1:
@@ -63,27 +99,7 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     hi = lo + chunk
     slc = slice(lo, hi)
 
-    pad_values = {"labels": -100, "input_ids": 0, "attention_mask": 0}
-    padded = dict(batch)
-    if pad_len > 0:
-        for k, v in batch.items():
-            if k == "qkv_format" or not isinstance(v, torch.Tensor) or v.ndim < 1:
-                continue
-            if k in ("seq_lens", "seq_lens_padded"):
-                continue  # recomputed separately, not padded
-            if k == "position_ids":
-                # position_ids increment-pad: continue incrementing from the last value
-                last = v[..., -1:].to(torch.long)
-                inc = torch.arange(1, pad_len + 1, device=v.device,
-                                   dtype=v.dtype)
-                inc = inc.reshape(*([1] * (v.ndim - 1)), pad_len)
-                pad_block = inc.expand(*v.shape[:-1], pad_len) + last
-            else:
-                shape = list(v.shape)
-                shape[-1] = pad_len
-                pad_block = torch.full(shape, pad_values.get(k, 0),
-                                       dtype=v.dtype, device=v.device)
-            padded[k] = torch.cat([v, pad_block], dim=-1)
+    padded = _pad_batch_for_cp(batch, pad_len)
 
     out = {}
     for k, v in padded.items():
@@ -104,6 +120,28 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     return out
 
 
+def _shard_seq_lens_row(row_lens, row_padded, lo, hi):
+    """Recompute one sample's pack lengths inside a CP shard."""
+    local_lens, local_padded = [], []
+    offset = 0
+    for raw_len, raw_pad in zip(row_lens, row_padded):
+        if raw_len == -1000:
+            break
+        pack_start = offset
+        pack_end = offset + raw_pad
+        offset = pack_end
+        inter_start = max(pack_start, lo)
+        inter_end = min(pack_end, hi)
+        if inter_start >= inter_end:
+            continue
+        local_actual = max(min(pack_start + raw_len, hi) - max(pack_start, lo), 0)
+        local_pad = inter_end - inter_start
+        if local_actual > 0 or local_pad > 0:
+            local_lens.append(local_actual)
+            local_padded.append(local_pad)
+    return local_lens, local_padded
+
+
 def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: int):
     """Recompute seq_lens/seq_lens_padded per CP shard (preserving the -1000
     sentinel semantics).
@@ -117,36 +155,15 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     The output is shifted to the local coordinate system; when
     max_local_packs=0 it is set to 1 to avoid an empty tensor.
     """
-    batch_size = seq_lens.shape[0]
     lo = cp_rank * chunk
     hi = lo + chunk
-    device = seq_lens.device
-    sentinel = -1000
 
     local_lens_b, local_lens_padded_b = [], []
     max_local_packs = 0
-    for b in range(batch_size):
-        row_lens = seq_lens[b].tolist()
-        row_padded = seq_lens_padded[b].tolist()
-        local_lens, local_padded = [], []
-        offset = 0
-        for raw_len, raw_pad in zip(row_lens, row_padded):
-            if raw_len == sentinel:
-                break
-            pack_start = offset
-            pack_end = offset + raw_pad
-            offset = pack_end
-            inter_start = max(pack_start, lo)
-            inter_end = min(pack_end, hi)
-            if inter_start >= inter_end:
-                continue
-            actual_start = max(pack_start, lo)
-            actual_end = min(pack_start + raw_len, hi)
-            local_actual = max(actual_end - actual_start, 0)
-            local_pad = inter_end - inter_start
-            if local_actual > 0 or local_pad > 0:
-                local_lens.append(local_actual)
-                local_padded.append(local_pad)
+    for b in range(seq_lens.shape[0]):
+        local_lens, local_padded = _shard_seq_lens_row(
+            seq_lens[b].tolist(), seq_lens_padded[b].tolist(), lo, hi,
+        )
         local_lens_b.append(local_lens)
         local_lens_padded_b.append(local_padded)
         max_local_packs = max(max_local_packs, len(local_lens))
@@ -154,17 +171,17 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
     if max_local_packs == 0:
         max_local_packs = 1
 
-    out_lens = torch.full((batch_size, max_local_packs), sentinel,
-                          dtype=seq_lens.dtype, device=device)
-    out_padded = torch.full((batch_size, max_local_packs), sentinel,
-                            dtype=seq_lens_padded.dtype, device=device)
-    for b in range(batch_size):
+    out_lens = torch.full((seq_lens.shape[0], max_local_packs), -1000,
+                          dtype=seq_lens.dtype, device=seq_lens.device)
+    out_padded = torch.full((seq_lens.shape[0], max_local_packs), -1000,
+                            dtype=seq_lens_padded.dtype, device=seq_lens.device)
+    for b in range(seq_lens.shape[0]):
         n = len(local_lens_b[b])
         if n > 0:
             out_lens[b, :n] = torch.tensor(
-                local_lens_b[b], dtype=seq_lens.dtype, device=device)
+                local_lens_b[b], dtype=seq_lens.dtype, device=seq_lens.device)
             out_padded[b, :n] = torch.tensor(
-                local_lens_padded_b[b], dtype=seq_lens_padded.dtype, device=device)
+                local_lens_padded_b[b], dtype=seq_lens_padded.dtype, device=seq_lens.device)
     return out_lens, out_padded
 
 
@@ -172,18 +189,22 @@ def _shard_seq_lens_for_cp(seq_lens, seq_lens_padded, *, cp_rank: int, chunk: in
 
 
 class CPBatchSharder:
-    """Select the contiguous token fields owned by the current CP rank."""
+    """Select contiguous CP token intervals with optional multimodal field rules."""
 
     def __init__(
             self,
             parallel_context: DataLoaderParallelContext,
+            token_fields: frozenset[str] | None = None,
     ) -> None:
         """Initialize context-parallel batch sharding.
 
         Args:
             parallel_context: DataLoader and TP/CP topology information.
+            token_fields: Optional sequence fields to slice.
+                When supplied, fields not listed here remain complete on each CP rank.
         """
         self.parallel_context = parallel_context
+        self.token_fields = token_fields
 
     def shard(
             self,
@@ -200,6 +221,11 @@ class CPBatchSharder:
         if canonical_batch is None:
             cp_batch = None
             return cp_batch
+
+        if self.token_fields is not None:
+            cp_batch = self._shard_configured_fields(canonical_batch)
+            return cp_batch
+
 
         input_ids = canonical_batch["input_ids"]
         cp_batch = {
@@ -219,6 +245,64 @@ class CPBatchSharder:
         for field, value in cp_batch.items():
             local_value = torch.chunk(value, cp_size, dim=1)[cp_rank]
             cp_batch[field] = local_value.contiguous()
+
+        return cp_batch
+
+    @staticmethod
+    def _extend_cu_seq_lens(cp_batch: dict[str, Any], sequence_length: int, pad_length: int) -> None:
+        """Keep packed sequence boundaries aligned with token padding."""
+        if "cu_seq_lens" not in cp_batch:
+            return
+        boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+        if int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
+            raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+        if pad_length:
+            boundaries = torch.cat((boundaries, boundaries[-1:] + pad_length))
+        cp_batch["cu_seq_lens"] = boundaries
+
+    def _shard_configured_fields(self, canonical_batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Slice aligned token fields and preserve global boundaries and media.
+
+        Example:
+            CP=2, TP=4: collate supplies [1, 24], then each CP rank
+            receives [1, 12]. A length of 18 is rejected here.
+        """
+        cp_batch = dict(canonical_batch)
+        cp_size = self.parallel_context.cp_world_size
+        alignment = cp_size * self.parallel_context.tp_world_size
+        if cp_size == 1 and alignment == 1:
+            return cp_batch
+
+        input_ids = cp_batch["input_ids"]
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("Configured CP sharding requires input_ids with shape [1, sequence]")
+
+        sequence_length = input_ids.shape[1]
+        if sequence_length % alignment:
+            raise ValueError(
+                f"sequence_length ({sequence_length}) must be divisible by tp_size * cp_size ({alignment}); "
+                "align token fields in collate_fn before get_batch"
+            )
+
+        if "cu_seq_lens" in cp_batch:
+            boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+            if boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
+                raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+
+            cp_batch["cu_seq_lens"] = boundaries
+
+        chunk_length = sequence_length // cp_size
+        local_start = self.parallel_context.cp_rank * chunk_length
+        local_end = local_start + chunk_length
+        for field in self.token_fields:
+            if field not in cp_batch:
+                continue
+
+            value = cp_batch[field]
+            if not torch.is_tensor(value) or value.ndim != 2 or value.shape != input_ids.shape:
+                raise ValueError(f"CP token field {field!r} must match input_ids shape")
+
+            cp_batch[field] = value[:, local_start:local_end].contiguous()
 
         return cp_batch
 
@@ -243,21 +327,29 @@ class TPBatchBroadcaster:
     def broadcast(
             self,
             cp_local_batch: Mapping[str, Any] | None,
-            cu_seq_lens: Any,
+            cu_seq_lens: Any = None,
+            *,
+            broadcast_all_fields: bool = False,
     ) -> dict[str, Any]:
         """Broadcast CP-local fields and global boundaries across TP ranks.
 
         Args:
-            cp_local_batch: CP-local fields on TP rank zero, or ``None`` elsewhere.
+            cp_local_batch: CP-local fields on source owners, or ``None`` elsewhere.
+                When ``tp_source_rank=None``, every rank already has its fields
+                and this method only normalizes device and dtype.
             cu_seq_lens: Global sequence boundaries, unsharded across CP ranks.
+            broadcast_all_fields: Preserve heterogeneous Omni fields and dtypes.
 
         Returns:
             Local batch populated on every TP rank.
         """
+        if broadcast_all_fields:
+            parallel_batch = self._broadcast_mapping(cp_local_batch)
+            return parallel_batch
+
         tp_rank = self.parallel_context.tp_rank
-        # TP rank zero owns the CP-local DataLoader fields and moves them to
-        # the target device before communication.
-        if tp_rank == 0:
+        source_rank = self.parallel_context.tp_source_rank
+        if source_rank is None or tp_rank == source_rank:
             parallel_batch = {
                 field: value.to(self.device, dtype=torch.int64, non_blocking=True)
                 for field, value in cp_local_batch.items()
@@ -270,13 +362,13 @@ class TPBatchBroadcaster:
             local_cu_seq_lens = None
 
         tp_size = self.parallel_context.tp_world_size
-        if tp_size <= 1:
+        if source_rank is None or tp_size <= 1:
             parallel_batch["cu_seq_lens"] = local_cu_seq_lens
             return parallel_batch
 
         # Dynamic Online batches do not have a fixed local sequence length.
         # Broadcast compact shape metadata before receivers allocate tensors.
-        if tp_rank == 0:
+        if tp_rank == source_rank:
             batch_size, seq_len = parallel_batch["input_ids"].shape
             num_boundaries = 0 if local_cu_seq_lens is None else local_cu_seq_lens.numel()
             batch_meta = torch.tensor(
@@ -288,10 +380,10 @@ class TPBatchBroadcaster:
             batch_meta = torch.empty((3,), dtype=torch.int64, device=self.device)
 
         tp_group = self.parallel_context.tp_group
-        dist.broadcast(batch_meta, group=tp_group, group_src=0)
+        dist.broadcast(batch_meta, group=tp_group, group_src=source_rank)
 
         # Non-source TP ranks allocate the same device shapes and dtypes.
-        if tp_rank != 0:
+        if tp_rank != source_rank:
             batch_size, seq_len, num_boundaries = [int(value) for value in batch_meta.tolist()]
             shape = (batch_size, seq_len)
             parallel_batch = {
@@ -306,12 +398,52 @@ class TPBatchBroadcaster:
             tensor = parallel_batch.get(field)
             if tensor is None:
                 raise ValueError(f"parallel batch requires {field!r}")
-            dist.broadcast(tensor, group=tp_group, group_src=0)
+
+            dist.broadcast(tensor, group=tp_group, group_src=source_rank)
 
         # Packed boundaries remain global across CP ranks and variable in size.
         if local_cu_seq_lens is not None:
-            dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=0)
+            dist.broadcast(local_cu_seq_lens, group=tp_group, group_src=source_rank)
 
         parallel_batch["cu_seq_lens"] = local_cu_seq_lens
 
         return parallel_batch
+
+    def _broadcast_mapping(self, cp_local_batch: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Broadcast variable-shaped Omni tensors and scalar metadata."""
+        source_rank = self.parallel_context.tp_source_rank
+        if source_rank is None or self.parallel_context.tp_world_size == 1:
+            parallel_batch = self._move_mapping_to_device(cp_local_batch)
+            return parallel_batch
+
+        is_source = self.parallel_context.tp_rank == source_rank
+        if is_source:
+            parallel_batch = self._move_mapping_to_device(cp_local_batch)
+            metadata = []
+            for name, value in parallel_batch.items():
+                if torch.is_tensor(value):
+                    metadata.append((name, tuple(value.shape), value.dtype, None))
+                else:
+                    metadata.append((name, None, None, value))
+        else:
+            parallel_batch = {}
+            metadata = None
+        object_list = [metadata]
+        dist.broadcast_object_list(
+            object_list, group=self.parallel_context.tp_group, group_src=source_rank, device=self.device
+        )
+        for name, shape, dtype, value in object_list[0]:
+            if shape is None:
+                parallel_batch[name] = value
+                continue
+            if not is_source:
+                parallel_batch[name] = torch.empty(shape, dtype=dtype, device=self.device)
+            dist.broadcast(parallel_batch[name], group=self.parallel_context.tp_group, group_src=source_rank)
+        return parallel_batch
+
+    def _move_mapping_to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Transfer Omni tensors without changing their native dtypes."""
+        return {
+            field: value.to(self.device, non_blocking=True) if torch.is_tensor(value) else value
+            for field, value in batch.items()
+        }

@@ -1,21 +1,24 @@
-# 自动并行使用指南
+# Automatic Parallelism Guide
 
-HyperParallel 提供 AutoParallel（自动并行）能力，主要包含 SAPP-ND 和 SAPP-PPB：SAPP-ND 用于多维混合并行策略搜索，SAPP-PPB 用于 Pipeline Parallel stage 负载均衡和 offset/recompute 联合调优。
+**English** | [简体中文](auto_parallel.zh.md)
 
-## 核心概念
+HyperParallel provides automatic parallelism through SAPP-ND and SAPP-PPB. SAPP-ND searches multidimensional hybrid parallel strategies; SAPP-PPB balances pipeline parallel stages and jointly tunes offsets and recomputation.
 
-| 模块 | 说明 | 适用场景 |
+## Core Concepts
+
+| Module | Description | Use case |
 |------|------|----------|
-| SAPP-ND | N Dimensional Parallelism 并行策略生成，提供 top T 个最优并行配置 | DP, TP, PP, EP 多维并行自动配置 |
-| SAPP-PPB | Pipeline Parallelism Balancing，自动平衡 PP stage 的计算和内存负载 | PP stage offset 和 recompute 联合自动调优 |
+| SAPP-ND | N-dimensional parallel strategy generation, returning the top T configurations | Automatic DP, TP, PP, and EP configuration |
+| SAPP-PPB | Pipeline Parallelism Balancing, automatically balancing computation and memory across PP stages | Joint tuning of PP stage offsets and recomputation |
 
 ---
 
-## SAPP-ND：ND 搜索
+## SAPP-ND: ND Search <!-- codespell:ignore nd -->
 
-ND 提供 N 维并行策略的生成。它会根据模型配置、硬件规模、全局 batch size 和内存预算生成候选并行配置，先通过内存估算过滤 OOM 配置，再通过性能估算对剩余配置排序。由于内存和性能都采用解析式估算，ND 搜索不依赖在线 profiling，可以在 CPU-only 环境中完成规划。
+ND generates N-dimensional parallel strategies. It creates candidate configurations from model configuration, hardware scale, global batch size, and memory budget, filters out OOM configurations using memory estimates, and ranks the remaining candidates using performance estimates. Both estimates are analytical, so ND search does not require online profiling and can run in a CPU-only environment. <!-- codespell:ignore nd -->
 
 ```bash
+# codespell:ignore-next-line nd
 python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
     -y <yaml> \
     -l DP MP PP EP MB MBS \
@@ -24,45 +27,67 @@ python -m hyper_parallel.auto_parallel.sapp_nd.nd.run_nd \
     -t 10
 ```
 
-常用输入包括：
+Typical inputs include:
 
-- 模型类型和模型超参数
-- 待搜索的并行维度
-- 硬件类型和设备数
-- global batch size 和内存预算
+- Model type and hyperparameters
+- Parallel dimensions to search
+- Hardware type and device count
+- Global batch size and memory budget
 
-SAPP-ND 开放的并行维度：
+SAPP-ND exposes these parallel dimensions:
 
-- `DP`：数据并行
-- `TP`：模型并行或张量并行
-- `SP`：Megatron sequence parallel
-- `EP`：专家并行
-- `PP`：流水线并行
-- `MB`：micro-batch 数
-- `MBS`：micro-batch size
-- `VPP`：virtual pipeline parallelism
-- `CP`：context parallelism (适配中)
-- `OP`：优化器或 ZeRO-DP 并行 (适配中)
+- `DP`: Data parallelism
+- `TP`: Model or tensor parallelism
+- `SP`:Megatron sequence parallel
+- `EP`: Expert parallelism
+- `PP`: Pipeline parallelism
+- `MB`: Number of micro-batches
+- `MBS`:micro-batch size
+- `VPP`:virtual pipeline parallelism
+- `CP`: Context parallelism (integration in progress)
+- `OP`: Optimizer or ZeRO-DP parallelism (integration in progress)
 
-SAPP-ND 模块包含：
+The SAPP-ND module contains:
 
-- `nd/`：ND 搜索入口、并行空间构造和排序逻辑
-- `memory_estimation/`：内存估算
-- `perf_estimation/`：性能估算
+- `nd/`: ND search entry point, parallel search space construction, and ranking <!-- codespell:ignore nd -->
+- `memory_estimation/`: Memory estimation
+- `perf_estimation/`: Performance estimation
 
-ND 的输出会给出满足内存约束的候选配置和排序结果，并生成全局并行策略的性能对比图，便于选择当前约束下的最优并行配置。
+ND returns ranked candidates that satisfy memory constraints and generates a performance comparison chart for global parallel strategies, helping select the best configuration under the current constraints. <!-- codespell:ignore nd -->
 
-![SAPP-ND 输出示例](../../hyper_parallel/auto_parallel/sapp_nd/figures/plot_example.png)
+![Example SAPP-ND output](../../hyper_parallel/auto_parallel/sapp_nd/figures/plot_example.png)
 
-图中展示候选并行配置的性能排序和对比结果。
+The chart compares and ranks candidate configurations by performance.
+
+In addition to the top results selected by `-t`, you can include configurations where each dimension listed in `-l` has a value greater than 1:
+
+| Option | Behavior |
+| --- | --- |
+| `-e N` / `--exhaustive N` | Show at least N qualifying configurations per dimension, counting the top results |
+| `-ee N` / `--force_exhaustive N` | Add N configurations per dimension; if a larger `-e` is also specified, continue filling its quota |
+| `-eee N` / `--fforce-exhaustive N` | Add N distinct configurations per dimension, without reusing additions across dimensions; positive values take precedence over `-e` and `-ee` |
+
+All three options accept nonnegative integers and default to 0. With `-e` and `-ee`, one added configuration can satisfy multiple dimensions, so the total number of additions may be smaller than the number of dimensions multiplied by N. `-eee` selects unused configurations in `-l` order and returns the available candidates if fewer than requested exist.
+
+For example, `-t 5 -l DP EP MP CP OP -eee 2 -o output/nd_perf` shows the top five results and adds ten distinct configurations when enough candidates exist. Verbosity defaults to 2, and the chart is written to `output/nd_perf/results.pdf`. A black vertical line separates the top results from additions when additions are present.
+
+These options apply to standard ND search; nonzero values cannot be combined with `--real_csv`, `--search-config`, or `--verify`. See the [ND option reference](../../hyper_parallel/auto_parallel/sapp_nd/README.md#exhaustive-plot-selection) for precedence, counting examples, and output details. <!-- codespell:ignore nd -->
+
+When using `-ar` with per-layer choices of recomputation modes, you can add `-rp` / `--recompute_potentials`:
+
+| Parameter | Behavior |
+| --- | --- |
+| `-rp` / `--recompute_potentials` | For each configuration satisfying memory constraints, keep parallel degrees and memory budget fixed, fully recompute one additional layer at each step, and report the cost model's estimate for every step |
+
+This option is disabled by default, so the search skips these calculations unless requested. When enabled, it additionally writes `recompute_potentials.csv`, `result_recompute_inc.pdf`, and `result_recompute_full_next.pdf` under `-o`. Every value estimates step time using the same cost model as search ranking. Measurements may differ; the difference between two plans represents the model's expected cost of recomputing one more layer, not a measured or guaranteed benefit. This option is for standard ND search and cannot be combined with `--real_csv`, `--search-config`, or `--verify`. See the [ND parameter documentation](../../hyper_parallel/auto_parallel/sapp_nd/README.md#recompute-potentials). <!-- codespell:ignore nd -->
 
 ---
 
-## SAPP-PPB：Pipeline Parallelism Balancing
+## SAPP-PPB:Pipeline Parallelism Balancing
 
-SAPP-PPB 用于 Pipeline Parallel stage 负载均衡。它读取每类 layer 在不同重计算或 swap 策略下的耗时和内存信息，以及 PP stage 数、micro-batch 数、interleave 数、调度策略等流水线配置，然后构造整数线性规划问题，由求解器返回 layer 分配、offset 和 recompute 配置，并可通过 simulator 查看流水线效果。
+SAPP-PPB balances pipeline stages. It reads timing and memory information for each layer type under different recomputation or swap strategies, together with pipeline configuration such as stage count, micro-batch count, interleave count, and scheduling strategy. It formulates an integer linear programming problem, and the solver returns layer assignments, offsets, and recomputation settings. A simulator visualizes the resulting pipeline.
 
-> **说明**：PPB 中的 `recompute` 指 PP stage 级的重计算策略搜索，与 `hyper_parallel.core.activation_checkpoint` 中的 Activation Checkpoint / Swap API 是不同层面的配置，可组合使用但语义独立。
+> **Note**: PPB's `recompute` searches recomputation strategies at the PP stage level. This is a different configuration level from the Activation Checkpoint / Swap APIs in `hyper_parallel.core.activation_checkpoint`; they can be combined but have independent semantics.
 
 ```bash
 python hyper_parallel/auto_parallel/sapp_ppb/run_pipeline_balance.py \
@@ -73,38 +98,38 @@ python hyper_parallel/auto_parallel/sapp_ppb/run_pipeline_balance.py \
     -O 2
 ```
 
-SAPP-PPB 的核心流程：
+The SAPP-PPB workflow:
 
-1. 解析 layer 描述和 pipeline 配置，生成 ILP 问题。
-2. 使用第三方求解器求解；默认使用 PuLP，可选 Gurobi。
-3. 输出 balancing 结果，并通过 pipeline simulator 生成可视化结果。
+1. Parse layer descriptions and pipeline configuration to formulate the ILP problem.
+2. Solve it with a third-party solver; PuLP is the default, with Gurobi optional.
+3. Output the balancing results and visualize them with the pipeline simulator.
 
-SAPP-PPB 模块包含：
+The SAPP-PPB module contains:
 
-- `run_pipeline_balance.py`：PPB 命令行入口
-- `sapp/`：问题构造和 ILP 求解逻辑
-- `simulator/`：pipeline block 级调度模拟和可视化
-- `layers/`：layer 描述样例
-- `cfgs/`：手动配置样例
+- `run_pipeline_balance.py`: PPB command-line entry point
+- `sapp/`: Problem formulation and ILP solving
+- `simulator/`: Pipeline block scheduling simulation and visualization
+- `layers/`: Sample layer descriptions
+- `cfgs/`: Sample manual configurations
 
-PPB 的输出包括 pipeline simulator 可视化图，以及可直接落到训练配置里的 layer 分配、offset 和 recompute 结果。
+PPB outputs pipeline simulator visualizations and layer assignments, offsets, and recomputation settings that can be applied directly to training configuration.
 
-![SAPP-PPB 输出示例](../../hyper_parallel/auto_parallel/sapp_ppb/figures/ex_result.png)
+![Example SAPP-PPB output](../../hyper_parallel/auto_parallel/sapp_ppb/figures/ex_result.png)
 
-图中展示不同 PP stage 的执行时间线和负载分布。
+The chart shows execution timelines and load distribution across PP stages.
 
 ```yaml
 offset:    [[0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1], [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,-2]]
 recompute: [[3,1,1,1, 1,0,0,0, 0,0,0,0, 0,0,0,0], [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0, 0]]
 ```
 
-`offset` 表示各 virtual stage 的层数偏移，`recompute` 表示各 stage 采用的重计算策略。
+`offset` specifies the layer-count offset for each virtual stage; `recompute` specifies the recomputation strategy for each stage.
 
 ---
 
-## 性能建议
+## Performance Recommendations
 
-1. **ND 并行配置调优用 SAPP-ND**：先用 ND 搜索 DP/MP/PP/EP/MB/MBS 等多维组合，得到满足内存约束并按性能排序的候选配置。
-2. **Pipeline 调优用 SAPP-PPB**：当 PP stage 分配、VPP、offset 或 recompute 成为主要问题时，用 PPB 做流水线负载均衡。
-3. **建议先定全局并行配置，再细调流水线**：优先用 ND 确认较优的整体并行配置，再基于该配置使用 PPB 调整 pipeline offset 和 recompute。
-4. **当前为 demo 特性**：相关功能正在逐渐完善及扩展。
+1. **Use SAPP-ND for global parallel configuration**: Search combinations such as DP/MP/PP/EP/MB/MBS to obtain candidates that satisfy memory constraints and are ranked by performance.
+2. **Use SAPP-PPB for pipeline tuning**: When PP stage allocation, VPP, offsets, or recomputation are the main concern, use PPB to balance pipeline load.
+3. **Choose the global configuration before fine-tuning the pipeline**: First select a promising overall configuration with ND, then use PPB to adjust offsets and recomputation for that configuration. <!-- codespell:ignore nd -->
+4. **Currently a demo feature**: These capabilities are being improved and extended.

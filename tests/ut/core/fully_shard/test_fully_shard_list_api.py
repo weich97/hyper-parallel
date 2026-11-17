@@ -17,9 +17,9 @@
 Covers _get_root_modules, _validate_module_for_fully_shard, and fully_shard(list) API:
 root filtering, validation, in-place return, scheduler backfill. Platform/mesh mocked; no NPU.
 """
-import os
 import unittest
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch, MagicMock
 
 # Force torch platform before any hyper_parallel imports
@@ -349,7 +349,9 @@ class TestFullyShardListAPI(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cover every parameter"):
             _validate_managed_params_source_shard_infos(managed, {first: metadata})
         with self.assertRaisesRegex(ValueError, "not managed"):
-            _validate_managed_params_source_shard_infos(managed, {first: metadata, second: metadata, external: metadata})
+            _validate_managed_params_source_shard_infos(
+                managed, {first: metadata, second: metadata, external: metadata}
+            )
         with self.assertRaisesRegex(ValueError, "SourceShardMetaInfo"):
             _validate_managed_params_source_shard_infos(managed, {first: metadata, second: object()})
         origin_metadata = SourceShardMetaInfo(self._create_mock_mesh(), (Replicate(),), origin_is_dtensor=True)
@@ -438,7 +440,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         linear2 = SimpleLinear(4, 4)
         modules_list = [linear1, linear2]
         # Act
-        def fake_hsdp_init_noop(self, *a, **k):
+        def fake_hsdp_init_noop(self, *_args, **_kwargs):
             self.hsdp_scheduler = MagicMock()
 
         with patch(
@@ -522,7 +524,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         scheduler_mock = MagicMock()
         scheduler_mock.hsdp_state = MagicMock()
 
-        def fake_hsdp_init(self, *args, **kwargs):
+        def fake_hsdp_init(self, *_args, **_kwargs):
             self.hsdp_scheduler = scheduler_mock
 
         with patch(
@@ -541,6 +543,87 @@ class TestFullyShardListAPI(unittest.TestCase):
         linear2.reshard()
         linear1.set_modules_to_forward_prefetch([linear2])
         linear1.set_modules_to_backward_prefetch([linear2])
+
+
+class TestModuleControlScope(unittest.TestCase):
+    """Check control scopes and gradient clearing on shared module groups."""
+
+    def test_controls_allow_outer_override_and_respect_recurse(self):
+        """Feature: FSDP module control scope.
+        Description: Apply local controls and then an outer recursive update.
+        Expectation: Local settings persist until the recursive update overrides them.
+        """
+        class Unit(HSDPModule, nn.Module):
+            def __init__(self, scheduler: Optional[MagicMock] = None) -> None:
+                """Create an FSDP test module with an optional shared scheduler."""
+                nn.Module.__init__(self)
+                HSDPModule.__init__(self)
+                self.hsdp_scheduler = scheduler if scheduler is not None else MagicMock()
+
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                """Return inputs unchanged for the module control test."""
+                return inputs
+
+        for method, control in (
+            ("set_requires_gradient_sync", "set_requires_grad_sync"),
+            ("set_requires_all_reduce", "set_requires_all_reduce"),
+            ("set_reshard_after_forward", "set_reshard_after_forward"),
+            ("set_reshard_after_backward", "set_reshard_after_backward"),
+        ):
+            with self.subTest(method=method):
+                root = Unit()
+                root.norm = Unit()
+                root.head = Unit(root.norm.hsdp_scheduler)
+                getattr(root.head, method)(False, recurse=False)
+                getattr(root, method)(False, recurse=False)
+                getattr(root.hsdp_scheduler, control).assert_called_once_with(False)
+                getattr(root.norm.hsdp_scheduler, control).assert_called_once_with(False)
+                root.hsdp_scheduler.reset_mock()
+                getattr(root, method)(True)
+                getattr(root.hsdp_scheduler, control).assert_called_once_with(True)
+                child_control = getattr(root.norm.hsdp_scheduler, control)
+                self.assertEqual(child_control.call_count, 3)
+                self.assertEqual(child_control.call_args.args, (True,))
+
+    def test_invalid_recurse_is_rejected(self):
+        """Feature: FSDP module control scope.
+        Description: Pass non-boolean control and recursion options to each public control.
+        Expectation: Each control rejects the invalid values.
+        """
+        module = MagicMock(spec=HSDPModule)
+        for method in (
+            "set_requires_gradient_sync",
+            "set_requires_all_reduce",
+            "set_reshard_after_forward",
+            "set_reshard_after_backward",
+        ):
+            with self.subTest(method=method, invalid="control"), self.assertRaisesRegex(ValueError, "must be bool"):
+                getattr(HSDPModule, method)(module, "invalid")
+            with self.subTest(method=method, invalid="recurse"), self.assertRaisesRegex(ValueError, "recurse"):
+                getattr(HSDPModule, method)(module, True, recurse="invalid")
+
+    def test_zero_grad_accepts_set_to_none(self):
+        """Feature: FSDP gradient clearing.
+        Description: Clear a gradient with both set_to_none values.
+        Expectation: The gradient is zeroed or set to None as requested.
+        """
+        class Unit(HSDPModule, nn.Module):
+            def __init__(self) -> None:
+                """Create an FSDP test module with one trainable parameter."""
+                nn.Module.__init__(self)
+                HSDPModule.__init__(self)
+                self.weight = nn.Parameter(torch.ones(3))
+
+            def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+                """Return inputs unchanged for the gradient clearing test."""
+                return inputs
+
+        unit = Unit()
+        unit.weight.grad = torch.ones(3)
+        unit.zero_grad(set_to_none=False)
+        torch.testing.assert_close(unit.weight.grad, torch.zeros(3))
+        unit.zero_grad(set_to_none=True)
+        self.assertIsNone(unit.weight.grad)
 
 if __name__ == "__main__":
     unittest.main()

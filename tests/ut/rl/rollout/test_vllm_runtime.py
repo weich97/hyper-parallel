@@ -19,6 +19,7 @@
 
 import asyncio
 import json
+import os
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -26,10 +27,10 @@ from typing import Any
 import pytest
 import torch
 
-import rl.roles.rollout.vllm as vllm_module
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles.rollout.base import GenerationRequest, GenerationSettings
-from rl.roles.rollout.vllm import VLLMGenerationEngine
+import rl.rollout.vllm as vllm_module
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
+from rl.rollout.base import GenerationRequest, GenerationSettings
+from rl.rollout.vllm import VLLMGenerationEngine
 
 
 def _model() -> ModelRegistration:
@@ -77,11 +78,13 @@ def test_vllm_completion_preserves_payload_and_choice_order() -> None:
                     "index": 1,
                     "token_ids": [20],
                     "logprobs": {"token_logprobs": [-0.2]},
+                    "finish_reason": "length",
                 },
                 {
                     "index": 0,
                     "token_ids": [10, 2],
                     "logprobs": {"token_logprobs": [-0.1, -0.3]},
+                    "finish_reason": "stop",
                 },
             ]
         },
@@ -93,7 +96,7 @@ def test_vllm_completion_preserves_payload_and_choice_order() -> None:
     assert payload["top_k"] == 5
     assert payload["stop_token_ids"] == [2, 3]
     assert payload["logprobs"] == 1
-    assert records == [([10, 2], [-0.1, -0.3]), ([20], [-0.2])]
+    assert records == [([10, 2], [-0.1, -0.3], "stop"), ([20], [-0.2], "length")]
 
 
 def test_vllm_router_respects_capacity_and_restores_row_order(
@@ -147,7 +150,7 @@ def test_vllm_router_respects_capacity_and_restores_row_order(
         )
     )
 
-    assert records == [([10], None), ([11], None), ([12], None), ([13], None)]
+    assert records == [([10], None, None), ([11], None, None), ([12], None, None), ([13], None, None)]
     assert peak == 2
     assert events.index(("start", 12)) < events.index(("finish", 10))
 
@@ -232,7 +235,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
         child_capacity: int,
         batch_invariant: bool,
         row_seeds: tuple[int, ...],
-    ) -> list[tuple[list[int], list[float]]]:
+    ) -> list[tuple[list[int], list[float], str]]:
         captured.update(
             prompts=prompts,
             settings=settings,
@@ -240,7 +243,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
             batch_invariant=batch_invariant,
             row_seeds=row_seeds,
         )
-        return [([9, 2], [-0.1, -0.2]), ([8], [-0.3])]
+        return [([9, 2], [-0.1, -0.2], "stop"), ([8], [-0.3], "length")]
 
     monkeypatch.setattr(client, "generate_tokens", generate_tokens)
     engine = VLLMGenerationEngine(
@@ -281,6 +284,7 @@ def test_sync_generate_executes_complete_http_generation_pipeline(
     )
     assert result.generation_seconds == 2.5
     assert result.worker_policy_version == 4
+    assert result.finish_reasons == ("stop", "length")
     assert version_calls == ["version", "version"]
 
 
@@ -295,7 +299,7 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
     )
     owner_result = VLLMGenerationEngine._build_generation_result(
         request,
-        [([9, 2], [-0.1, -0.2])],
+        [([9, 2], [-0.1, -0.2], "stop")],
         1.5,
         3,
     )
@@ -314,7 +318,8 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
 
     def gather(output: list[Any], value: Any, group: Any) -> None:
         assert group == "tp"
-        output[:] = [value, value] if isinstance(value, tuple) else [1.5, None]
+        output[:] = ([value, value] if isinstance(value, tuple)
+                     else [{"generation_seconds": 1.5, "finish_reasons": ("stop",)}, None])
 
     monkeypatch.setattr(vllm_module.dist, "broadcast", broadcast)
     monkeypatch.setattr(vllm_module.dist, "all_gather_object", gather)
@@ -348,6 +353,7 @@ def test_tp_owner_generates_once_and_broadcasts_complete_result(
     replica = non_owner._generate_tp_owned(request)
 
     assert generation_calls == ["owner"]
+    assert owner_copy.finish_reasons == replica.finish_reasons == ("stop",)
     assert owner.request_owner_generate_count == 1
     assert non_owner.request_owner_generate_count == 0
     torch.testing.assert_close(replica.sequences, owner_copy.sequences)
@@ -447,12 +453,15 @@ def test_shared_server_builds_command_and_isolated_environment(
         "deployment": "colocated",
         "data_parallel_size": 2,
         "tensor_parallel_size": 2,
-        "model_implementation": "hyper",
+        "model_implementation": "native",
         "enable_prefix_caching": False,
         "enable_chunked_prefill": True,
         "enable_prompt_tokens_details": True,
         "skip_mm_profiling": True,
         "profiler_config": {"profiler": "none"},
+        "seed": 42,
+        "disable_log_stats": True,
+        "task_queue_enable": 2,
         "batch_invariant": True,
         "server_hccl_if_base_port": 65000,
         "server_hccl_npu_socket_port_range": "65000-65010",
@@ -460,33 +469,38 @@ def test_shared_server_builds_command_and_isolated_environment(
         "max_num_seqs": 8,
         "weight_sync": {
             "bucket_size_mb": 1,
-            "strategy": "direct_reshard",
+            "strategy": "full_gather",
         },
     }
     transfer = SimpleNamespace(publish=lambda _client, _snapshot: None)
     monkeypatch.setattr(
         vllm_module,
-        "build_weight_transfer",
+        "build_weight_publisher",
         lambda *args, **kwargs: transfer,
     )
     engine = vllm_module.build_vllm_engine({"vllm": vllm_config}, _model())
     monkeypatch.setenv("RANK", "9")
+    monkeypatch.setenv("TASK_QUEUE_ENABLE", "1")
     command = engine._server_command("127.0.0.1", 8100)
     environment = engine._server_environment("0,1,2,3")
+    assert environment["TASK_QUEUE_ENABLE"] == "2"
+    assert os.environ["TASK_QUEUE_ENABLE"] == "1"
 
     assert engine._weight_sync._weight_transfer is transfer
     assert command[command.index("--data-parallel-size") + 1] == "2"
+    assert command[command.index("--seed") + 1] == "42"
+    assert "--disable-log-stats" in command
     assert command[command.index("--tensor-parallel-size") + 1] == "2"
     assert "--no-enable-prefix-caching" in command
     assert "--enable-chunked-prefill" in command
     assert "--enable-prompt-tokens-details" in command
     assert "--skip-mm-profiling" in command
     assert command[command.index("--profiler-config") + 1] == '{"profiler": "none"}'
-    assert "HyperQwen3ForCausalLM" in command[command.index("--hf-overrides") + 1]
+    assert "--hf-overrides" not in command
     assert environment["ASCEND_RT_VISIBLE_DEVICES"] == "0,1,2,3"
     assert environment["VLLM_BATCH_INVARIANT"] == "1"
     assert environment["HCCL_IF_BASE_PORT"] == "65000"
-    assert environment["HYPER_RL_CONSISTENCY_PROFILE"] == "profile"
+    assert "HYPER_RL_CONSISTENCY_PROFILE" not in environment
     assert "RANK" not in environment
 
 
@@ -515,6 +529,7 @@ def test_engine_computes_child_capacity_and_inprocess_results(
                 completion = SimpleNamespace(
                     token_ids=[token_id],
                     logprobs=[{token_id: candidate}],
+                    finish_reason="stop" if token_id == 7 else "length",
                 )
                 outputs.append(SimpleNamespace(outputs=[completion]))
             return outputs
@@ -547,7 +562,7 @@ def test_engine_computes_child_capacity_and_inprocess_results(
     )
 
     assert capacity == 4
-    assert records == [([7], [-0.5]), ([8], [-0.5])]
+    assert records == [([7], [-0.5], "stop"), ([8], [-0.5], "length")]
     assert [sampling.seed for sampling in local_client.sampling] == [30, 31]
     assert all(sampling.stop_token_ids == [2, 3] for sampling in local_client.sampling)
 
@@ -703,7 +718,7 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
     monkeypatch.setattr(
         delayed,
         "_wait_process_group_exit",
-        lambda process_group: events.append(("exit", process_group)),
+        lambda process_group, timeout=30: events.append(("exit", process_group, timeout)),
     )
     monkeypatch.setattr(
         vllm_module.os,
@@ -722,7 +737,7 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
     monkeypatch.setattr(
         exited,
         "_wait_process_group_exit",
-        lambda process_group: events.append(("exit", process_group)),
+        lambda process_group, timeout=30: events.append(("exit", process_group, timeout)),
     )
     exited.close()
 
@@ -731,10 +746,9 @@ def test_http_client_retries_readiness_and_completes_bounded_process_cleanup(
         ("wait", 20),
         ("signal", 101, vllm_module.signal.SIGKILL),
         ("wait", 10),
-        ("exit", 101),
+        ("exit", 101, 5),
         ("signal", 102, vllm_module.signal.SIGTERM),
-        ("signal", 102, vllm_module.signal.SIGKILL),
-        ("exit", 102),
+        ("exit", 102, 5),
     ]
 
 
@@ -903,12 +917,12 @@ def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
     """Rollout forwards the retained publication status."""
     engine = object.__new__(VLLMGenerationEngine)
     engine._weight_sync = SimpleNamespace(
-        configured_strategy="direct_reshard",
+        configured_strategy="full_gather",
         last_strategy="full_gather",
         streaming_stats={"bucket_count": 3},
     )
     engine._model = _model()
-    engine._rollout_model = resolve_vllm_model(engine._model, "hyper")
+    engine._rollout_model = resolve_vllm_model(engine._model, "native")
     engine._deployment = "colocated"
     engine._config = {
         "tensor_parallel_size": 1,
@@ -918,7 +932,7 @@ def test_engine_exposes_weight_sync_strategy_and_streaming_stats() -> None:
 
     command = engine._server_command("127.0.0.1", 8100)
 
-    assert engine.weight_sync_configured_strategy == "direct_reshard"
+    assert engine.weight_sync_configured_strategy == "full_gather"
     assert engine.weight_sync_last_strategy == "full_gather"
     assert engine.weight_sync_streaming_stats == {"bucket_count": 3}
     assert "--enable-expert-parallel" not in command

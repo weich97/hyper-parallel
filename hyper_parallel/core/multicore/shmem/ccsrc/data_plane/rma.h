@@ -81,4 +81,53 @@ __aicore__ inline void put_signal(__gm__ void *remote_dst, __gm__ const void *lo
   signal(remote_signal, signal_value, signal_op, target_pe);
 }
 
+/**
+ * @brief Complete a double-buffered MTE GET with bursts capped at four KiB.
+ *
+ * @param destination Local GM destination owned by the caller.
+ * @param source Symmetric GM source represented by its local address.
+ * @param elements Number of T elements to transfer; zero is a no-op.
+ * @param source_pe Source in CANN Root WORLD coordinates.
+ * @pre One worker exclusively owns both halves of the CANN-provided UB range and EVENT_ID0/1 for the call duration.
+ * @note Return means the final MTE3 write to destination has completed.
+ */
+template <typename T>
+__aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe) {
+  if (elements == 0) {
+    return;
+  }
+  uint64_t ub_address;
+  uint64_t ub_bytes;
+  if (!cann::device::query_mte_resources(source_pe, ub_address, ub_bytes)) {
+    AscendC::Trap();
+  }
+  auto *remote = reinterpret_cast<__gm__ T *>(cann::device::remote_ptr(source, source_pe));
+  if (remote == nullptr) {
+    AscendC::Trap();
+  }
+  auto *local = reinterpret_cast<__gm__ T *>(destination);
+  uint64_t block_bytes = ub_bytes / 2;
+  // Larger remote-read bursts lengthen concurrent GMM execution.
+  constexpr uint64_t max_block_bytes = 4 * 1024;
+  if (block_bytes > max_block_bytes) {
+    block_bytes = max_block_bytes;
+  }
+  uint64_t total_bytes = static_cast<uint64_t>(elements) * sizeof(T);
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+  AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+  for (uint64_t offset = 0, block = 0; offset < total_bytes; offset += block_bytes, ++block) {
+    AscendC::TEventID event = (block & 1) ? EVENT_ID1 : EVENT_ID0;
+    auto *buffer = reinterpret_cast<__ubuf__ T *>(ub_address + (block & 1) * block_bytes);
+    uint64_t bytes = total_bytes - offset < block_bytes ? total_bytes - offset : block_bytes;
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+    cann::device::copy_gm_to_ub(buffer, remote + offset / sizeof(T), bytes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+    cann::device::copy_ub_to_gm(local + offset / sizeof(T), buffer, bytes);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+  }
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+}
+
 }  // namespace hyper_parallel::multicore::shmem::data_plane

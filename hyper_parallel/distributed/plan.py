@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """plan: the model-level sharding plan (05 §3.1 canonical).
 
 :class:`ShardingPlan` is the single authoritative model-level plan of
@@ -31,7 +32,7 @@ from hyper_parallel.distributed.recipe_spec import (
 @dataclass
 class ShardingPlan:
     """Complete sharding plan for a model (05 §3.1)."""
-    # {module_fqn: ModuleShardingSpec} — contains only modules with is_boundary=True
+    # Contains both activation boundaries and parameter-only source specs.
     modules: Dict[str, ModuleShardingSpec] = field(default_factory=dict)
 
     # Global switches

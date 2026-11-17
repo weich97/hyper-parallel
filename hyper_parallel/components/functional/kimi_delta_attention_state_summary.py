@@ -14,6 +14,15 @@
 # ============================================================================
 """Affine KDA state summary built from prepared WY intermediates."""
 
+# pylint: disable=forbidden-backend-import
+
+__all__ = [
+    "apply_kda_state_gradient_summary",
+    "apply_kda_state_summary",
+    "kda_state_gradient_summary_from_prepared",
+    "kda_state_summary_forward_from_prepared",
+]
+
 from typing import Optional
 
 import torch
@@ -28,7 +37,7 @@ def _validate_prepared_summary_inputs(
     chunk_size: int,
 ) -> tuple[int, int, int, int, int]:
     """Validate the fixed Kimi K3 summary contract and return dimensions."""
-    if key.ndim != 4 or w.ndim != 4 or u.ndim != 4 or gate.ndim != 4:
+    if (key.ndim, w.ndim, u.ndim, gate.ndim) != (4, 4, 4, 4):
         raise ValueError("KDA prepared summary expects rank-4 key/w/u/gate tensors.")
     batch, sequence_length, heads, key_dim = key.shape
     value_dim = u.shape[-1]
@@ -37,11 +46,8 @@ def _validate_prepared_summary_inputs(
             "Triton KDA state summary requires key_dim=value_dim=128 and "
             "chunk_size=64."
         )
-    if sequence_length % chunk_size:
-        raise ValueError(
-            f"KDA summary sequence length {sequence_length} must be divisible "
-            f"by chunk_size {chunk_size}."
-        )
+    if sequence_length <= 0:
+        raise ValueError("State summary requires a nonempty sample fragment.")
     if w.shape != key.shape or gate.shape != key.shape:
         raise ValueError(
             "KDA prepared key, w, and gate must have identical shapes, got "
@@ -79,11 +85,8 @@ def _validate_gradient_summary_inputs(
             "Triton KDA state-gradient summary requires key_dim=value_dim=128 "
             "and chunk_size=64."
         )
-    if sequence_length % chunk_size:
-        raise ValueError(
-            f"KDA gradient-summary sequence length {sequence_length} must be "
-            f"divisible by chunk_size {chunk_size}."
-        )
+    if sequence_length <= 0:
+        raise ValueError("State summary requires a nonempty sample fragment.")
     prepared_shape = (batch, sequence_length, heads, key_dim)
     value_shape = (batch, sequence_length, heads, value_dim)
     if key.shape != prepared_shape or w.shape != prepared_shape:
@@ -117,14 +120,16 @@ def _launch_kda_state_summary(
     gate: torch.Tensor,
     *,
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch the validated mixed-tile summary used by the P2P path."""
-    return _launch_kda_mixed_state_summary(
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Launch the shared S/M summary used by the state CP protocols."""
+    return _launch_kda_paired_state_summary(
         key,
         w,
         u,
         gate,
         chunk_size=chunk_size,
+        output_transition=output_transition,
     )
 
 
@@ -141,7 +146,7 @@ def _launch_kda_state_gradient_summary(
     block_size: int = 64,
 ) -> torch.Tensor:
     """Launch the reverse-wavefront Triton-Ascend summary kernel."""
-    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    from ._triton.kimi_delta_attention.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_state_grad_ext_kernel,
     )
 
@@ -193,17 +198,19 @@ def _launch_kda_state_gradient_summary(
 
 
 @torch.compiler.disable
-def _launch_kda_mixed_state_summary(
+def _launch_kda_paired_state_summary(
     key: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
     gate: torch.Tensor,
     *,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build ``S_ext`` and ``M`` in compile-time-separated BV=128 modes."""
-    from ._kda_triton.state_summary import (  # pylint: disable=import-outside-toplevel
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build Ascend FLA-paired ``S_ext`` and an explicit FP32 transfer ``M``."""
+    from ._triton.kimi_delta_attention.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_split_state_summary_kernel,
+        kda_state_transition_kernel,
     )
 
     batch, sequence_length, heads, key_dim, value_dim = (
@@ -220,21 +227,23 @@ def _launch_kda_mixed_state_summary(
         dtype=torch.float32,
         device=key.device,
     )
-    transition = torch.empty(
-        batch,
-        heads,
-        key_dim,
-        key_dim,
-        dtype=torch.float32,
-        device=key.device,
-    )
+    transition = None
+    if output_transition:
+        transition = torch.empty(
+            batch,
+            heads,
+            key_dim,
+            key_dim,
+            dtype=torch.float32,
+            device=key.device,
+        )
     kda_split_state_summary_kernel[(1, batch * heads)](
         key,
         w,
         u,
         gate,
         state_ext,
-        transition,
+        transition if transition is not None else state_ext,
         sequence_length,
         H=heads,
         H_TOTAL=heads,
@@ -246,24 +255,20 @@ def _launch_kda_mixed_state_summary(
         OUTPUT_MODE=1,
         num_warps=2,
     )
-    kda_split_state_summary_kernel[(1, batch * heads)](
-        key,
-        w,
-        u,
-        gate,
-        state_ext,
-        transition,
-        sequence_length,
-        H=heads,
-        H_TOTAL=heads,
-        HEAD_OFFSET=0,
-        K=key_dim,
-        V=value_dim,
-        BT=chunk_size,
-        BV=128,
-        OUTPUT_MODE=2,
-        num_warps=1,
-    )
+    if output_transition:
+        kda_state_transition_kernel[(triton.cdiv(key_dim, 64), batch * heads)](
+            key,
+            w,
+            gate,
+            transition,
+            sequence_length,
+            H=heads,
+            K=key_dim,
+            BT=chunk_size,
+            BV=64,
+            num_warps=4,
+            num_stages=2,
+        )
     return state_ext, transition
 
 
@@ -275,14 +280,33 @@ def kda_state_summary_forward_from_prepared(
     gate: torch.Tensor,
     *,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a fused summary for an outer P2P custom-autograd function."""
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build the local affine summary for state context parallelism.
+
+    ``S_ext`` follows Ascend FLA h's FP32 feedback. ``M`` composes explicit
+    chunk transfers with FP32 feedback, following FLA CP.
+    ``output_transition=False`` returns only S and skips M allocation/computation.
+    It is valid for a zero-entry P2P endpoint whose backward never applies M.
+
+    Args:
+        key: Prepared keys, shaped [batch, tokens, heads, key_dim].
+        w: Prepared feedback weights with the same shape as key.
+        u: Prepared values, shaped [batch, tokens, heads, value_dim].
+        gate: Per-chunk cumulative log2 gates matching key.
+        chunk_size: Number of tokens per local chunk; the kernel requires 64.
+        output_transition: Whether the caller needs the local transition M.
+
+    Returns:
+        The FP32 state S and the FP32 transition M, or None when M is omitted.
+    """
     return _launch_kda_state_summary(
         key,
         w,
         u,
         gate,
         chunk_size=chunk_size,
+        output_transition=output_transition,
     )
 
 
@@ -300,9 +324,23 @@ def kda_state_gradient_summary_from_prepared(
 ) -> torch.Tensor:
     """Return the local-loss contribution to the incoming KDA state gradient.
 
-    ``grad_value`` is read-only in this operator. Callers must build this
-    summary before passing the same buffer to a local backward implementation
-    that updates ``grad_value`` in place, such as FLA ``bwd_dhu``.
+    Match Ascend FLA ``dhu`` at zero terminal state: scale ``grad_output``
+    before its dot-input cast and preserve the two K64 slabs and subtraction
+    grouping. This summary omits the full ``dh``/``dv`` outputs. All inputs
+    are read-only; the affine application to a nonzero state is a separate step.
+
+    Args:
+        query: Prepared gated queries [B,T,H,K].
+        key: Matching prepared gated keys.
+        w: Prepared feedback weights matching key.
+        gate: Per-chunk cumulative log2 gates matching key.
+        grad_output: Original token-output gradients [B,T,H,V].
+        grad_value: Local value gradients before recurrent feedback.
+        scale: Attention scaling factor.
+        chunk_size: Tokens per local chunk; the kernel requires 64.
+
+    Returns:
+        FP32 local contribution G, shaped [B,H,K,V].
     """
     return _launch_kda_state_gradient_summary(
         query,
@@ -319,13 +357,24 @@ def kda_state_gradient_summary_from_prepared(
 
 def apply_kda_state_summary(
     state_ext: torch.Tensor,
-    transition: torch.Tensor,
+    transition: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Apply a prepared KDA state summary in FP32."""
+    """Apply a prepared KDA state summary in FP32.
+
+    Args:
+        state_ext: Local zero-entry state S.
+        transition: Local transfer M; may be omitted for a zero entry.
+        initial_state: Incoming FP32 state, or None for a zero entry.
+
+    Returns:
+        The outgoing FP32 state.
+    """
     if initial_state is None:
         return state_ext
-    return torch.matmul(transition, initial_state.float()) + state_ext
+    # Model autocast must not silently quantize a communicated FP32 state.
+    with torch.autocast(device_type=state_ext.device.type, enabled=False):
+        return torch.matmul(transition.float(), initial_state.float()) + state_ext
 
 
 def apply_kda_state_gradient_summary(
@@ -336,15 +385,8 @@ def apply_kda_state_gradient_summary(
     """Apply the adjoint summary for the reverse P2P state wavefront."""
     if grad_final_state is None:
         return grad_state_ext
-    return (
-        torch.matmul(transition.transpose(-2, -1), grad_final_state.float())
-        + grad_state_ext
-    )
-
-
-__all__ = [
-    "apply_kda_state_gradient_summary",
-    "apply_kda_state_summary",
-    "kda_state_gradient_summary_from_prepared",
-    "kda_state_summary_forward_from_prepared",
-]
+    with torch.autocast(device_type=grad_state_ext.device.type, enabled=False):
+        return (
+            torch.matmul(transition.float().transpose(-2, -1), grad_final_state.float())
+            + grad_state_ext
+        )

@@ -137,6 +137,8 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
             "hyper_parallel.core.optimizer.optimizer.dist.get_global_rank",
             side_effect=[0, 1],
     ), patch(
+            "hyper_parallel.core.optimizer.optimizer.dist.get_world_size", return_value=2,
+    ), patch(
             "hyper_parallel.core.optimizer.optimizer.dist.broadcast",
             side_effect=[first_work, final_work],
     ) as broadcast:
@@ -151,3 +153,29 @@ def test_async_hierarchical_broadcast_waits_between_mesh_dimensions():
     first_work.wait.assert_called_once_with()
     final_work.wait.assert_not_called()
     assert handles == [final_work]
+
+
+@pytest.mark.parametrize("async_op", [False, True])
+def test_hierarchical_broadcast_skips_singleton_replicate_group(async_op):
+    """A one-rank relay is an identity and must not initialize a communicator."""
+    singleton, replica_group = MagicMock(), MagicMock()
+    work = MagicMock()
+    buffer = torch.ones(4)
+    method = (BaseDistributedOptimizer._hierarchical_broadcast_buffer_async if async_op  # pylint: disable=protected-access
+              else BaseDistributedOptimizer._hierarchical_broadcast_buffer)  # pylint: disable=protected-access
+    with patch(
+            "hyper_parallel.core.optimizer.optimizer.dist.get_world_size", side_effect=[1, 2],
+    ), patch(
+            "hyper_parallel.core.optimizer.optimizer.dist.get_global_rank", return_value=4,
+    ) as source_rank, patch(
+            "hyper_parallel.core.optimizer.optimizer.dist.broadcast", return_value=work,
+    ) as broadcast:
+        result = method(buffer, (0, 1), (singleton, replica_group), (0, 1))
+
+    source_rank.assert_called_once_with(replica_group, 1)
+    if async_op:
+        broadcast.assert_called_once_with(buffer, src=4, group=replica_group, async_op=True)
+        assert result == [work]
+        work.wait.assert_not_called()
+    else:
+        broadcast.assert_called_once_with(buffer, src=4, group=replica_group)

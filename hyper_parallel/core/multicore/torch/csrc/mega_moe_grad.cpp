@@ -1,17 +1,16 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::mega_moe_grad.
  *
- * NPU implementation calls aclnnHyperMegaMoeGrad via EXEC_NPU_CMD_EXT
- * from the public torch_npu C++ extension header.
+ * NPU implementation calls aclnnHyperMegaMoeGrad via the cached public
+ * torch_npu extension bridge.
  * Meta implementation is a no-op (output tensors pre-allocated by caller).
  */
 #include <torch/library.h>
 
 #include <tuple>
-
-#include "op_plugin/include/npu_cpp_extension.h"
+#include "csrc/cached_op_api.h"
 
 namespace {
 
@@ -52,20 +51,20 @@ BwdReturn mega_moe_grad_npu(
     const at::Tensor& swiglu_grad_workspace,  // pos 26
     const at::Tensor& runtime_config,         // pos 27
     const at::Tensor& all_event_counters,     // pos 28
-    const at::Tensor& profile_buffer,          // pos 29
+    const at::Tensor& diagnostic_buffer,       // pos 29
     int64_t rank_id,
     int64_t ep,
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad,
+    HYPER_EXEC_NPU_CMD_EXT(aclnnHyperMegaMoeGrad,
         dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,
         permute_out, gate_dw, group_list,
         act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
-        runtime_config, all_event_counters, profile_buffer,
+        runtime_config, all_event_counters, diagnostic_buffer,
         rank_id, ep, expert_num, hidden_size, seq_size);
     return BwdReturn(dispatch_target, hidden_dw, act_grad_y, grad_gate,
                      gate_dx, grad_x, permute_out, gate_dw);
@@ -104,7 +103,7 @@ BwdReturn mega_moe_grad_meta(
     const at::Tensor& /* swiglu_grad_workspace */,
     const at::Tensor& /* runtime_config */,
     const at::Tensor& /* all_event_counters */,
-    const at::Tensor& /* profile_buffer */,
+    const at::Tensor& /* diagnostic_buffer */,
     int64_t /* rank_id */,
     int64_t /* ep */,
     int64_t /* expert_num */,

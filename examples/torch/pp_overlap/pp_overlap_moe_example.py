@@ -50,7 +50,7 @@ import torch.distributed as dist
 from hyper_parallel import PipelineStage, init_device_mesh
 from hyper_parallel.components.modules.moe import MoE
 from hyper_parallel.core.context_parallel.utils import all_to_all_single
-from hyper_parallel.core.dtensor._utils import differentiable_all_to_all_single_async
+from hyper_parallel.core.utils.communication import differentiable_all_to_all_single_async
 from hyper_parallel.core.expert_parallel.expert_parallel import (  # pylint: disable=C0412
     ExpertParallel,
     _permute,

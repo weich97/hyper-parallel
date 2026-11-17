@@ -30,6 +30,7 @@ function(hp_enable_link_hardening target_name)
     set_target_properties(${target_name} PROPERTIES
         SKIP_BUILD_RPATH TRUE
         SKIP_INSTALL_RPATH TRUE
+        INSTALL_REMOVE_ENVIRONMENT_RPATH TRUE
     )
 endfunction()
 

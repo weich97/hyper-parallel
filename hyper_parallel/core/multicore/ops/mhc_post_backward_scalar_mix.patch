@@ -1,0 +1,69 @@
+diff --git a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+--- a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
++++ b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+@@ -89,6 +89,7 @@
+     uint64_t hOutSize = 0;
+     uint64_t hPostSize = 0;
+     bool addDirectGrad = false;
++    bool useScalarMix = false;
+     bool taskMode = false;
+     uint64_t taskOffset = 0;
+     uint64_t taskCount = 0;
+@@ -116,6 +117,7 @@
+     this->alignN = tilingData.alignN;
+     this->loopC = tilingData.loopC;
+     this->tailC = tilingData.tailC;
++    this->useScalarMix = this->channel == 5120 && this->n == 4 && sizeof(T) == 2 && this->blockChannel > 1024;
+
+     this->dFPostResSize = tilingData.dFPostResSize;
+     this->xSize = tilingData.xSize;
+@@ -152,7 +154,9 @@
+     pipe->InitBuffer(this->dxLBuf, this->n * this->blockChannel * sizeof(float));       // [n, tileC]
+
+     pipe->InitBuffer(this->dHLResTmpBuf1, this->blockChannel * this->n * sizeof(float)); // [tilC, n] [k, n]
+-    pipe->InitBuffer(this->dHLResTmpBuf2, this->blockChannel * this->n * this->n * sizeof(float));
++    if (!this->useScalarMix) {
++        pipe->InitBuffer(this->dHLResTmpBuf2, this->blockChannel * this->n * this->n * sizeof(float));
++    }
+     pipe->InitBuffer(this->dHLResTmpBuf3, this->n * this->alignN * sizeof(float)); // [n, n] [m, n]
+     pipe->InitBuffer(this->dHLResTmpBuf4, this->n * this->n * sizeof(uint8_t));    // [n, n] [m, n]
+
+@@ -217,7 +221,9 @@
+     this->dxLUb = this->dxLBuf.template Get<float>();
+
+     this->dHLResTmp1 = this->dHLResTmpBuf1.template Get<float>();
+-    this->dHLResTmp2 = this->dHLResTmpBuf2.template Get<float>();
++    if (!this->useScalarMix) {
++        this->dHLResTmp2 = this->dHLResTmpBuf2.template Get<float>();
++    }
+     this->dHLResTmp3 = this->dHLResTmpBuf3.template Get<float>();
+
+     this->dxLTmp2 = this->dxLTmpBuf2.template Get<float>();
+@@ -231,6 +237,10 @@
+         DataCopyPad(this->HLPostUb, this->HLPostGm[i * this->n], copyParamsHLPostUb, this->padParamsFloat);
+         DataCopyExtParams copyParamsHLResUb{1, static_cast<uint32_t>(this->n * this->n * sizeof(float)), 0, 0, 0};
+         DataCopyPad(this->HLResUb, this->HLResGm[i * this->n * this->n], copyParamsHLResUb, this->padParamsFloat);
++        if (this->useScalarMix) {
++            SetFlag<HardEvent::MTE2_S>(3);
++            WaitFlag<HardEvent::MTE2_S>(3);
++        }
+
+         // 清0
+         SetFlag<HardEvent::MTE3_V>(0);
+@@ -459,6 +469,16 @@
+                                                                LocalTensor<float> &broadcastBuffer, uint32_t m,
+                                                                uint32_t k, uint32_t n)
+ {
++    if (this->useScalarMix) {
++        // Read coefficients as scalars and keep every vector address aligned.
++        PipeBarrier<PIPE_V>();
++        for (uint32_t i = 0; i < m; ++i) {
++            for (uint32_t j = 0; j < k; ++j) {
++                Axpy(C[i * n], B[j * n], A.GetValue(i * k + j), n);
++            }
++        }
++        return;
++    }
+     uint32_t broadcastSrcShape[] = {m * k, 1};
+     uint32_t broadcastDstShape[] = {m * k, n};
+     Broadcast<float, 2, 1>(broadcastBuffer, A, broadcastDstShape, broadcastSrcShape);

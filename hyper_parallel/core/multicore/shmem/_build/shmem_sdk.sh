@@ -152,6 +152,37 @@ print(hashlib.sha256(encoded).hexdigest())
     rm -rf "${source_dir}"
     mkdir -p "${source_dir}" "${build_dir}"
     git -C "${locked_source_dir}" archive --format=tar HEAD | tar -xf - -C "${source_dir}"
+    if ! "${python_bin}" - "${project_root}" "${source_dir}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+project_root, source_dir = (Path(value).resolve() for value in sys.argv[1:])
+lock_path = project_root / "hyper_parallel/core/multicore/_build/dependencies.lock.json"
+lock = json.loads(lock_path.read_text(encoding="utf-8"))["components"]["multicore"]["shmem"]
+environment = os.environ.copy()
+environment["GIT_CEILING_DIRECTORIES"] = str(source_dir.parent)
+for adapter in lock.get("patches", []):
+    adapter_path = project_root / adapter["path"]
+    actual_hash = hashlib.sha256(adapter_path.read_bytes()).hexdigest()
+    if actual_hash != adapter["sha256"]:
+        raise ValueError(f"SHMEM adapter hash mismatch: {adapter_path}")
+    for options in (("--check",), (), ("--check", "--reverse")):
+        subprocess.run(
+            ["git", "apply", *options, str(adapter_path)],
+            cwd=source_dir,
+            env=environment,
+            check=True,
+        )
+PY
+    then
+        echo "HP_NATIVE_REASON_CODE=SHMEM_ADAPTER_FAILED"
+        echo "ERROR: Cannot apply the locked SHMEM compatibility adapter." >&2
+        return 6
+    fi
     rm -rf "${install_root}"
 
     echo "INFO: preparing pinned CANN SHMEM SDK"

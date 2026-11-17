@@ -134,13 +134,13 @@ def _run_experts_grouped_mm_gpu(
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
     """
-    # offs: cumulative split offsets (int32) for torch._grouped_mm.
-    offs = torch.cumsum(num_tokens_per_expert[:-1], dim=0).to(torch.int32)
-    # w1/w3 stored as [num_experts, hidden_dim, dim]; grouped_mm expects
-    # [num_experts, dim, hidden_dim], so transpose the inner two dims.
-    w1_t = w1.transpose(1, 2).contiguous()  # [num_experts, dim, hidden_dim]
-    w3_t = w3.transpose(1, 2).contiguous()
-    w2_t = w2.transpose(1, 2).contiguous()  # [num_experts, hidden_dim, dim]
+    # grouped_mm needs an end offset for every expert, including the last one.
+    offs = torch.cumsum(num_tokens_per_expert, dim=0).to(torch.int32)
+    # Column-major views let grouped_mm consume the existing parameter storage
+    # without retaining another full set of expert weights for backward.
+    w1_t = w1.transpose(1, 2)
+    w3_t = w3.transpose(1, 2)
+    w2_t = w2.transpose(1, 2)
     h1 = torch._grouped_mm(x, w1_t, offs=offs)  # pylint: disable=protected-access
     h3 = torch._grouped_mm(x, w3_t, offs=offs)  # pylint: disable=protected-access
     h = F.silu(h1) * h3

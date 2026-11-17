@@ -28,12 +28,12 @@ from typing import Any
 import numpy as np
 from numpy.random import RandomState
 
+from hyper_parallel.data.constants import IGNORE_INDEX, PAD_TOKEN_ID
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
-from hyper_parallel.data.indexed.indexed_data_reader import IndexedDataReader
+from hyper_parallel.data.indexed.indexed_data_reader import ArrowDataReader, IndexedDataReader
 
 logger = get_dataset_logger(__name__)
-_PAD_TOKEN_ID = -1
 
 
 def _build_document_index(
@@ -105,9 +105,9 @@ class _IndexedPretrainDataset(ABC):
         # Handle pad token id provided by the tokenizer.
         try:
             pad_token_id = self.config.tokenizer.pad
-            self._pad_token_id = _PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
+            self._pad_token_id = PAD_TOKEN_ID if pad_token_id is None else int(pad_token_id)
         except (AttributeError, NotImplementedError):
-            self._pad_token_id = _PAD_TOKEN_ID
+            self._pad_token_id = PAD_TOKEN_ID
 
         try:
             special_token_ids = [
@@ -131,7 +131,7 @@ class _IndexedPretrainDataset(ABC):
                     "masked as padding"
                 )
             else:
-                self._pad_token_id = _PAD_TOKEN_ID
+                self._pad_token_id = PAD_TOKEN_ID
                 logger.warning(
                     "The tokenizer PAD ID collides with another special token ID; using an internal padding sentinel"
                 )
@@ -296,7 +296,7 @@ class MockGPTDataset(_MockDataset):
         labels = sample[1:]
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(self._build_ltor_fields(tokens, labels))
@@ -313,6 +313,31 @@ class GPTDataset(_IndexedPretrainDataset):
             raise ValueError("GPTDataset requires a low-level Dataset and split indices")
 
         self.document_index, self.sample_index, self.shuffle_index = self._build_document_sample_shuffle_indices()
+
+    def _plan_epochs(self, num_tokens_per_epoch: int) -> tuple[int, bool, int]:
+        """Choose the epoch count and whether to shuffle a short final epoch separately."""
+        num_epochs = 0
+        accumulated_tokens = 0
+        extra_token = int(self.config.add_extra_token_to_sequence)
+        requested_tokens = self.num_samples * self.config.sequence_length + extra_token
+        while accumulated_tokens < requested_tokens:
+            num_epochs += 1
+            accumulated_tokens += num_tokens_per_epoch
+
+        if num_epochs == 1:
+            separate_final_epoch = False
+            samples_without_final_epoch = 0
+        else:
+            samples_without_final_epoch = (
+                (num_epochs - 1) * num_tokens_per_epoch - extra_token
+            ) // self.config.sequence_length
+            samples_from_final_epoch = self.num_samples - samples_without_final_epoch
+            samples_per_epoch = (num_tokens_per_epoch - extra_token) // self.config.sequence_length
+
+            # Keep a small final epoch separate from the main shuffled range.
+            threshold = 0.80
+            separate_final_epoch = samples_from_final_epoch < int(threshold * samples_per_epoch)
+        return num_epochs, separate_final_epoch, samples_without_final_epoch
 
     def _build_document_sample_shuffle_indices(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build or load the document, sample, and shuffle indices.
@@ -367,29 +392,7 @@ class GPTDataset(_IndexedPretrainDataset):
         if num_tokens_per_epoch <= 1:
             raise ValueError("The selected indexed split must contain at least two tokens")
 
-        # repeate documents for multi-epcho
-        num_epochs = 0
-        accumulated_tokens = 0
-        extra_token = int(self.config.add_extra_token_to_sequence)
-        requested_tokens = self.num_samples * self.config.sequence_length + extra_token
-        while accumulated_tokens < requested_tokens:
-            num_epochs += 1
-            accumulated_tokens += num_tokens_per_epoch
-
-        if num_epochs == 1:
-            separate_final_epoch = False
-            samples_without_final_epoch = 0
-        else:
-            samples_without_final_epoch = (
-                (num_epochs - 1) * num_tokens_per_epoch - extra_token
-            ) // self.config.sequence_length
-            samples_from_final_epoch = self.num_samples - samples_without_final_epoch
-            samples_per_epoch = (num_tokens_per_epoch - extra_token) // self.config.sequence_length
-
-            # Keep a small final epoch separate from the main shuffled range.
-            threshold = 0.80
-            separate_final_epoch = samples_from_final_epoch < int(threshold * samples_per_epoch)
-
+        num_epochs, separate_final_epoch, samples_without_final_epoch = self._plan_epochs(num_tokens_per_epoch)
         random_state = RandomState(self.config.random_seed)
 
         # Shuffle the repeated document IDs, optionally isolating the final epoch.
@@ -468,7 +471,7 @@ class GPTDataset(_IndexedPretrainDataset):
             raise ValueError("An input token is out of bounds of the tokenizer vocabulary")
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(ltor_fields)
@@ -631,7 +634,7 @@ class GPTFromMRDataset(_IndexedPretrainDataset):
         labels[labels == self._pad_token_id] = 0
 
         raw_sample = {
-            "tokens": tokens,
+            "input_ids": tokens,
             "labels": labels,
         }
         raw_sample.update(ltor_fields)
@@ -690,3 +693,96 @@ def _get_ltor_masks_and_position_ids(
     attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
+
+
+class SFTFromMRDataset:
+    """Prepared Arrow records with authoritative next-token labels and boundaries.
+
+    Each row is kept intact, without tokenization, shifting, EOS insertion or
+    truncation. Field names can be mapped inside ``low_level_dataset`` using
+    input_ids_key, labels_key, boundaries_key and loss_mask_key. Missing boundaries
+    mean one document. Optional binary loss_mask is folded into owned labels.
+    """
+
+    def __init__(
+        self, dataset: ArrowDataReader, dataset_path: str, indices: np.ndarray,
+        num_samples: int, index_split: Any, config: GPTDatasetConfig,
+    ) -> None:
+        """Store whole-record sampling inputs without building GPT packing caches."""
+        self.dataset = dataset
+        self.indices = indices
+        self.num_samples = num_samples
+        self.config = config
+        self.unique_identifiers = self.build_unique_identifiers(dataset_path, num_samples, index_split, config)
+        if self.config.simple_blend not in ("inter", "intra"):
+            raise ValueError("Prepared Arrow datasets require simple_blend='inter' or 'intra'")
+        if self.num_samples > len(self.indices):
+            raise ValueError("Requested samples exceed prepared records in this split")
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset: ArrowDataReader) -> int:
+        """Split by complete records rather than by inner documents."""
+        return len(low_level_dataset)
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> ArrowDataReader:
+        """Open the Arrow reader used by the existing split builder."""
+        del config
+        return ArrowDataReader(dataset_path)
+
+    @classmethod
+    def build_unique_identifiers(
+        cls, dataset_path: str, num_samples: int, index_split: Any, config: GPTDatasetConfig,
+    ) -> dict[str, Any]:
+        """Identify the record view without opening Arrow files during lazy setup."""
+        return {"class": cls.__name__, "dataset_path": dataset_path, "num_samples": num_samples,
+                "index_split": index_split.name.lower(), "split": config.split,
+                "dataset_options": config.dataset_options}
+
+    def __len__(self) -> int:
+        """Return the requested record count."""
+        return self.num_samples
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        """Read labels unchanged except for explicit binary mask suppression."""
+        sample = self.dataset[int(self.indices[index])]
+        fields = self.config.dataset_options
+        tokens = np.asarray(sample[fields.get("input_ids_key", "input_ids")])
+        labels = np.asarray(sample[fields.get("labels_key", "labels")])
+        boundaries = np.asarray(sample.get(fields.get("boundaries_key", "cu_seq_lens"), [0, tokens.size]))
+        boundaries = self._validate_record_layout(tokens, labels, boundaries, int(self.indices[index]))
+        if (np.any(tokens < 0) or np.any(tokens >= self.config.tokenizer.vocab_size)
+                or np.any((labels < 0) & (labels != IGNORE_INDEX))
+                or np.any(labels >= self.config.tokenizer.vocab_size)):
+            raise ValueError("Prepared token/label IDs must fit the vocabulary; ignored labels must be -100")
+        # Arrow buffers may be shared/read-only; never modify their supervision in place.
+        labels = labels.astype(np.int64, copy=True)
+        mask = sample.get(fields.get("loss_mask_key", "loss_mask"))
+        if mask is not None:
+            mask = np.asarray(mask)
+            if mask.shape != labels.shape or not np.isin(mask, (0, 1)).all():
+                raise ValueError("loss_mask must be binary and match labels")
+            labels[mask == 0] = IGNORE_INDEX
+        if not np.any(labels != IGNORE_INDEX):
+            raise ValueError("Prepared record has no effective targets")
+        return {"input_ids": tokens.astype(np.int64), "labels": labels,
+                "cu_seq_lens": boundaries.astype(np.int32)}
+
+    def _validate_record_layout(
+        self, tokens: np.ndarray, labels: np.ndarray, boundaries: np.ndarray, record_index: int,
+    ) -> np.ndarray:
+        """Check record shapes, configured length and internal document boundaries."""
+        if (tokens.ndim != 1 or not tokens.size or labels.shape != tokens.shape
+                or tokens.dtype.kind not in "iu" or labels.dtype.kind not in "iu"):
+            raise ValueError("Prepared tokens and labels must be matching nonempty 1D integer arrays")
+        if not self.config.skip_data_check and tokens.size != self.config.sequence_length:
+            raise ValueError(
+                "Prepared record must match seq_length; "
+                f"record {record_index}: expected {self.config.sequence_length}, got {tokens.size}"
+            )
+        boundaries = boundaries[boundaries != -1] if boundaries.ndim == 1 else boundaries
+        if (boundaries.ndim != 1 or boundaries.dtype.kind not in "iu" or boundaries.size < 2
+                or boundaries[0] != 0 or boundaries[-1] != tokens.size
+                or np.any(boundaries[1:] <= boundaries[:-1]) or tokens.size > np.iinfo(np.int32).max):
+            raise ValueError("Document boundaries must strictly increase from zero to token count")
+        return boundaries

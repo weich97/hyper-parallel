@@ -18,6 +18,7 @@
 # pylint: disable=wrong-import-position,import-outside-toplevel,unused-argument
 import contextlib
 import importlib
+import inspect
 import os
 import unittest
 from unittest.mock import MagicMock, patch, sentinel
@@ -98,6 +99,7 @@ class TestApiExports(unittest.TestCase):
                 "get_class_activation_wrapper",
                 "noop_context_fn",
                 "is_compiling",
+                "reentrant_checkpoint_scope",
             ],
         )
 
@@ -204,16 +206,48 @@ class TestLazyApiDelegates(unittest.TestCase):
         self.assertIs(result, sentinel.noop_context_fn)
 
     def test_checkpoint_exclude_wrapper_forwards_arguments(self):
-        """Test checkpoint-exclusion wrapper forwards its output-retention flag."""
+        """Test checkpoint-exclusion wrapper forwards all swap options."""
         with patch.object(
             _wrapper_impl,
             "checkpoint_exclude_wrapper",
             return_value=sentinel.wrapper,
         ) as mock_wrapper:
-            result = checkpoint_exclude_wrapper(sentinel.module, save_output=False)
+            result = checkpoint_exclude_wrapper(
+                sentinel.module,
+                swap=True,
+                group_swap=True,
+                cpu_pool=sentinel.cpu_pool,
+            )
 
         self.assertIs(result, sentinel.wrapper)
-        mock_wrapper.assert_called_once_with(sentinel.module, save_output=False)
+        mock_wrapper.assert_called_once_with(
+            sentinel.module,
+            swap=True,
+            group_swap=True,
+            cpu_pool=sentinel.cpu_pool,
+        )
+
+    def test_checkpoint_exclude_wrapper_forwards_defaults(self):
+        """Test checkpoint-exclusion defaults are explicit at the facade boundary."""
+        with patch.object(
+            _wrapper_impl,
+            "checkpoint_exclude_wrapper",
+            return_value=sentinel.wrapper,
+        ) as mock_wrapper:
+            result = checkpoint_exclude_wrapper(sentinel.module)
+
+        self.assertIs(result, sentinel.wrapper)
+        mock_wrapper.assert_called_once_with(
+            sentinel.module,
+            swap=False,
+            group_swap=False,
+            cpu_pool=None,
+        )
+
+    def test_checkpoint_exclude_wrapper_rejects_removed_save_output_argument(self):
+        """Test the removed output-elision option is no longer accepted."""
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'save_output'"):
+            inspect.signature(checkpoint_exclude_wrapper).bind(sentinel.module, save_output=True)
 
     def test_checkpoint_wrapper_forwards_keyword_arguments(self):
         """Test checkpoint wrapper delegates all checkpoint options."""
@@ -359,11 +393,12 @@ class TestLazyApiDelegates(unittest.TestCase):
         mock_recompute.assert_called_once_with(sentinel.handle, sentinel.session_id)
 
     def test_recompute_session_ctx_forwards_options(self):
-        """Test recompute-session context forwards retention configuration."""
-        with patch.object(_checkpoint_impl, "recompute_session_ctx", return_value=sentinel.context) as mock_session:
-            result = recompute_session_ctx(sentinel.session_id, retain_on_unpack=True)
+        """Test session entry forwards options while binding reentrant frames."""
+        with patch.object(_checkpoint_impl, "recompute_session_ctx",
+                          wraps=_checkpoint_impl.recompute_session_ctx) as mock_session:
+            with recompute_session_ctx(sentinel.session_id, retain_on_unpack=True):
+                pass
 
-        self.assertIs(result, sentinel.context)
         mock_session.assert_called_once_with(session_id=sentinel.session_id, retain_on_unpack=True)
 
     def test_recompute_session_ctx_rejects_none_session_id(self):
@@ -480,6 +515,17 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertIs(spy.call_args.kwargs["context_fn"], create_recompute_contexts)
         mock_create.assert_not_called()
 
+    def test_checkpoint_propagates_disabled_rng_preservation_to_recompute_state(self):
+        """Excluded SAVE regions should not mutate RNG when checkpoint preservation is off."""
+        with _spy_checkpoint() as spy:
+            checkpoint(sentinel.function, 3, preserve_rng_state=False)
+            forward_context, recompute_context = spy.call_args.kwargs["context_fn"]()
+
+        with forward_context:
+            self.assertFalse(get_recompute_state().preserve_rng_state)
+        with recompute_context:
+            self.assertFalse(get_recompute_state().preserve_rng_state)
+
     def test_checkpoint_policy_context_forwards_group_swap_and_cpu_pool(self):
         """Test selective context receives group-swap and explicit pool options once."""
         policy = lambda context, op, *a, **kw: CheckpointPolicy.MUST_SWAP  # pylint: disable=C3001
@@ -529,12 +575,18 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertEqual(result, "result")
         self.assertFalse(spy.call_args.kwargs["early_stop"])
 
-    def test_checkpoint_forces_non_reentrant_implementation(self):
-        """Test callers cannot override the non-reentrant implementation mode."""
-        with _spy_checkpoint() as spy:
-            checkpoint(sentinel.function, use_reentrant=True)
+    def test_checkpoint_honors_reentrant_implementation(self):
+        """Test reentrant mode dispatches to the eager reentrant implementation."""
+        from hyper_parallel.core.activation_memory import reentrant_checkpoint as implementation
 
-        self.assertFalse(spy.call_args.kwargs["use_reentrant"])
+        with patch.object(implementation, "checkpoint", return_value=sentinel.result) as mock_reentrant:
+            result = checkpoint(sentinel.function, use_reentrant=True)
+
+        self.assertIs(result, sentinel.result)
+        mock_reentrant.assert_called_once()
+        self.assertIs(mock_reentrant.call_args.args[0], sentinel.function)
+        self.assertTrue(mock_reentrant.call_args.kwargs["preserve_rng_state"])
+        self.assertTrue(callable(mock_reentrant.call_args.kwargs["context_fn"]))
 
     def test_checkpoint_rejects_non_boolean_early_stop(self):
         """Test checkpoint rejects ambiguous early_stop values."""

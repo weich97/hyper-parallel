@@ -25,6 +25,8 @@ device placement, and the ``train`` loop. Model / device / compiled-graph
 state lives on the compiler (``trainer._compiler``).
 """
 
+from __future__ import annotations
+
 __all__ = ["GraphTrainer"]
 
 import logging
@@ -35,7 +37,7 @@ import torch.distributed as dist
 
 from .compiler import GraphCompiler
 from .pass_config import PassConfig
-from .pass_plan import PassPlan
+from .graph_parallel_plan import GraphParallelPlan
 
 _LOG = logging.getLogger(__name__)
 
@@ -55,19 +57,28 @@ class GraphTrainer:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        pass_config: PassConfig,
-        pass_plan: Optional[PassPlan] = None,
+        pass_config: Optional[PassConfig] = None,
+        parallel_plan: Optional[GraphParallelPlan] = None,
+        trainer_config: Optional[Any] = None,
         optimizer_config: Optional[dict] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: Optional[bool] = None,
+        dynamic_arg_dims: dict[str, int | list[int]] | None = None,
     ) -> None:
         """
         Args:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
-            pass_config: Parallel configuration
-            pass_plan: PassPlan declaring which modules to shard (optional;
-                enables declarative sharding)
+            pass_config: Parallel configuration. When omitted, GraphTrainer
+                uses ``trainer_config`` to project topology intent onto a
+                graph-mode ``PassConfig``; if ``trainer_config`` is also
+                omitted, it falls back to ``PassConfig()``.
+            parallel_plan: GraphParallelPlan declaring which modules to shard
+                (optional; enables declarative sharding)
+            trainer_config: Optional eager trainer config used only to infer a
+                default graph-mode ``PassConfig`` when ``pass_config`` is not
+                provided.
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.
@@ -77,6 +88,8 @@ class GraphTrainer:
                 already hold the group object) and only the FSDP shard
                 sub-mesh is registered under ``"fsdp"``. Use this to feed an
                 automodel TP-sharded model into the graph-mode FSDP pass.
+            dynamic: Enable symbolic user input dimensions (forwarded to GraphCompiler).
+            dynamic_arg_dims: Optional input paths to dynamic dimensions (forwarded to GraphCompiler).
         """
         # The compiler owns the model, device, config, and the compiled
         # graph; the trainer keeps only the optimizer / loop policy.
@@ -84,14 +97,17 @@ class GraphTrainer:
             model=model,
             train_fn=train_fn,
             pass_config=pass_config,
-            pass_plan=pass_plan,
+            parallel_plan=parallel_plan,
+            trainer_config=trainer_config,
             device=device,
             mesh_context=mesh_context,
+            dynamic=dynamic,
+            dynamic_arg_dims=dynamic_arg_dims,
         )
         self.optimizer_config = optimizer_config or {}
         self.optimizer = None
 
-    def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
+    def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
 
@@ -99,13 +115,13 @@ class GraphTrainer:
         at first train_step
 
         Args:
-            input_batch: Input batch used to trace the joint graph
-            label_batch: Label batch used to trace the joint graph
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments and used to trace the joint graph
         """
-        self._compiler.compile(input_batch, label_batch)
+        self._compiler.compile(**inputs)
         self._init_optimizer()
 
-    def train_step(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> Any:
+    def train_step(self, **inputs: Any) -> Any:
         """
         Execute one training step
 
@@ -114,16 +130,21 @@ class GraphTrainer:
         do that, because the optimizer belongs to the trainer.
 
         Args:
-            input_batch: Input batch
-            label_batch: Label batch
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments
 
         Returns:
             loss: Loss value
         """
         if self._compiler.is_compiled is False:
-            self.compile(input_batch, label_batch)
+            self.compile(**inputs)
 
-        return self._compiler.forward_backward(input_batch, label_batch)
+        return self._compiler.forward_backward(**inputs)
+
+    @property
+    def pass_config(self) -> PassConfig:
+        """Return the compiler-owned graph pass configuration."""
+        return self._compiler.pass_config
 
     def to(self, device: torch.device) -> "GraphTrainer":
         """Move the model to ``device`` and remember it for batch placement.
@@ -150,13 +171,15 @@ class GraphTrainer:
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-    def _place_on_device(self, batch):
-        """Move a ``(input, label)`` batch onto the compiler's device."""
+    def _place_on_device(self, inputs: dict) -> dict:
+        """Move a dict of model inputs onto the compiler's device."""
         device = self._compiler.device
         if device is None:
-            return batch
-        moved = tuple(b.to(device) if isinstance(b, torch.Tensor) else b for b in batch)
-        return moved
+            return inputs
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
 
     def train(
         self,
@@ -167,14 +190,15 @@ class GraphTrainer:
     ) -> List[Any]:
         """Run the full training loop over ``data_iterable``.
 
-        The data iterator must yield ``(input, label)`` pairs (the same two
-        positional arguments ``train_fn`` and ``train_step`` consume). Each
-        batch is moved onto the compiler's device, then ``train_step`` +
+        The data iterator must yield dicts of model inputs (the keyword
+        arguments ``train_fn`` and ``train_step`` consume, e.g.
+        ``{"input_ids": ..., "labels": ...}``). Each batch is moved onto the
+        compiler's device, then ``train_step(**inputs)`` +
         ``optimizer_step`` are driven. The graph is compiled lazily on the
         first batch via ``train_step``.
 
         Args:
-            data_iterable: An iterable / iterator of ``(input, label)`` pairs.
+            data_iterable: An iterable / iterator of model-input dicts.
             max_steps: Stop after this many steps. Runs the whole iterator when
                 ``None``.
             log_interval: Log a loss every ``log_interval`` steps (requires
@@ -194,10 +218,9 @@ class GraphTrainer:
             if max_steps is not None and step >= max_steps:
                 break
 
-            input_batch, label_batch = batch
-            input_batch, label_batch = self._place_on_device((input_batch, label_batch))
+            inputs = self._place_on_device(batch)
 
-            loss = self.train_step(input_batch, label_batch)
+            loss, _ = self.train_step(**inputs)
             self.optimizer_step()
             losses.append(loss)
 

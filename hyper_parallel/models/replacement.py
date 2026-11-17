@@ -12,26 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Compile and atomically apply structure-preserving module replacements."""
+"""Compile and incrementally apply structure-preserving module replacements."""
 
 from __future__ import annotations
 
 import fnmatch
 import inspect
+import logging
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 
-from torch import nn
+from torch import nn  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
     get_model_conversion_mapping,
 )
 
-
 ModuleReplacementFactory = Callable[..., nn.Module]
+MethodReplacementFactory = Callable[..., Callable[..., Any]]
+logger = logging.getLogger(__name__)
+
+
+class ModuleReplacementMatchError(ValueError):
+    """A required replacement pattern did not match the final model tree."""
+
+    def __init__(self, unmatched: tuple[dict[str, str], ...]) -> None:
+        """Initialize the error with unmatched replacement declarations."""
+        self.unmatched = unmatched
+        patterns = [item["pattern"] for item in unmatched]
+        super().__init__(
+            "module replacement pattern(s) matched no final module: "
+            f"{patterns}. Inspect the finalized module inventory and update the "
+            "adapter pattern; do not silently skip a required replacement."
+        )
 
 
 def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFactory:
@@ -53,31 +71,161 @@ def module_replacement(factory: ModuleReplacementFactory) -> ModuleReplacementFa
     return factory
 
 
+def method_replacement(factory: MethodReplacementFactory) -> MethodReplacementFactory:
+    """Declare a factory that replaces one bound module method.
+
+    The factory receives the owning module, the full method FQN, the original
+    bound method, and a read-only build context. It returns a callable whose
+    arguments are the same as calls to the original bound method.
+    """
+    signature = inspect.signature(factory)
+    required = {"module", "method_fqn", "original_method", "context"}
+    missing = required - set(signature.parameters)
+    if missing:
+        raise TypeError(f"method replacement factory {factory!r} must declare {sorted(missing)}")
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        raise TypeError("method replacement factories must not declare **kwargs")
+    factory._hp_method_replacement = True  # type: ignore[attr-defined]  # pylint: disable=protected-access
+    return factory
+
+
+@dataclass(frozen=True)
+class MethodReplacementSpec:
+    """One rule selecting a named method on matching module instances."""
+
+    match: str
+    factory: MethodReplacementFactory
+
+    def __post_init__(self) -> None:
+        owner_pattern, separator, method_name = self.match.rpartition(".")
+        if (not separator or not owner_pattern or not method_name.isidentifier()
+                or (method_name.startswith("__") and method_name.endswith("__"))):
+            raise ValueError("method replacement match must end in a literal method name")
+        if method_name == "forward":
+            raise ValueError("forward replacements belong to the sharding planner")
+        if not callable(self.factory) or not getattr(self.factory, "_hp_method_replacement", False):
+            raise TypeError("method replacement factory must use @method_replacement")
+
+
+def _compile_method_replacements(model: nn.Module, specs: Iterable[MethodReplacementSpec]) -> tuple:
+    """Resolve method patterns against the finalized module tree before mutation."""
+    selected = {}
+    aliases = _all_module_aliases(model)
+    for spec in specs:
+        owner_pattern, _, method_name = spec.match.rpartition(".")
+        matched = False
+        for module_id, (module, fqns) in aliases.items():
+            matched_fqns = tuple(fqn for fqn in fqns if fnmatch.fnmatchcase(fqn, owner_pattern))
+            if not matched_fqns:
+                continue
+            matched = True
+            if (method_name in module._modules or method_name in module._parameters  # pylint: disable=protected-access
+                    or method_name in module._buffers):  # pylint: disable=protected-access
+                raise TypeError(f"method replacement {spec.match!r} selected a registered module or tensor")
+            original = getattr(module, method_name, None)
+            if not callable(original):
+                raise ValueError(f"method replacement {spec.match!r} selected {matched_fqns[0]!r} without a callable "
+                                 f"{method_name!r} method")
+            key = (module_id, method_name)
+            previous = selected.get(key)
+            if previous is not None:
+                if previous[3] is not spec:
+                    raise ValueError(f"method replacement conflict for {matched_fqns[0]}.{method_name}")
+                continue
+            method_fqns = tuple(f"{fqn}.{method_name}" for fqn in matched_fqns)
+            selected[key] = (module, method_fqns, original, spec)
+        if not matched:
+            raise ValueError(f"method replacement pattern {spec.match!r} matched no module")
+    return tuple(selected.values())
+
+
+def apply_method_replacements(
+    model: nn.Module,
+    specs: Iterable[MethodReplacementSpec],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> nn.Module:
+    """Install method replacements before the sharding planner runs.
+
+    Args:
+        model: Finalized model after structure-changing module replacements.
+        specs: Rules with a glob module path and a literal method suffix.
+        context: Build-time topology and precision values for factories.
+
+    Returns:
+        The same model with replacement callables bound to selected instances.
+    """
+    targets = _compile_method_replacements(model, specs)
+    if targets:
+        logger.info("method replacements resolved: %s", [
+            fqn for _, method_fqns, _, _ in targets for fqn in method_fqns
+        ])
+    frozen_context = MappingProxyType(dict(context or {}))
+    for module, method_fqns, original, spec in targets:
+        method_fqn = method_fqns[0]
+        replacement = spec.factory(
+            module=module, method_fqn=method_fqn, original_method=original, context=frozen_context,
+        )
+        if not callable(replacement) or isinstance(replacement, nn.Module):
+            raise TypeError(f"method replacement factory for {method_fqn!r} must return a callable")
+        _validate_callable_compatibility(original, replacement, method_fqn)
+        setattr(module, method_fqn.rpartition(".")[2], replacement)
+    return model
+
+
 @dataclass(frozen=True)
 class ModuleReplacementSpec:
     """One declarative, structure-preserving module replacement rule."""
 
     match: tuple[str, ...]
     factory: ModuleReplacementFactory
-    module_type: type[nn.Module]
+    module_type: type[nn.Module] | None = None
     exact_type: bool = False
+    declaration_id: str = ""
+    replacement_target: Optional[str] = None
+    static_arguments: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        self._validate_match_and_type()
+        self._validate_factory_and_codegen_metadata()
+
+    def _validate_match_and_type(self) -> None:
+        """Validate matching and source-module constraints."""
         if not self.match or any(not isinstance(pattern, str) or not pattern for pattern in self.match):
             raise ValueError("module replacement match must contain non-empty FQN patterns")
-        if not isinstance(self.module_type, type) or not issubclass(self.module_type, nn.Module):
+        if self.module_type is not None and (
+                not isinstance(self.module_type, type) or not issubclass(self.module_type, nn.Module)):
             raise TypeError("module_type must be an nn.Module type")
+        if self.exact_type and self.module_type is None:
+            raise ValueError("exact_type requires module_type")
+
+    def _validate_factory_and_codegen_metadata(self) -> None:
+        """Validate the factory and optional serializable declaration metadata."""
         if not callable(self.factory) or not getattr(self.factory, "_hp_module_replacement", False):
             raise TypeError("module replacement factory must be decorated with @module_replacement")
+        if not isinstance(self.declaration_id, str):
+            raise TypeError("module replacement declaration_id must be a string")
+        if self.replacement_target is not None and not isinstance(self.replacement_target, str):
+            raise TypeError("module replacement replacement_target must be a string or None")
+        if self.static_arguments is not None and not isinstance(self.static_arguments, Mapping):
+            raise TypeError("module replacement static_arguments must be a mapping or None")
 
 
 @dataclass(frozen=True)
 class ModuleReplacementTarget:
-    """One source module and every registered FQN that aliases it."""
+    """One source module's aliases without retaining its parameter storage."""
 
     module_fqns: tuple[str, ...]
-    source: nn.Module
+    source_ref: weakref.ReferenceType[nn.Module]
     spec: ModuleReplacementSpec
+
+    @property
+    def source(self) -> nn.Module:
+        """Resolve the original module or reject a plan whose source expired."""
+        source = self.source_ref()
+        if source is None:
+            raise ValueError(f"replacement target {self.module_fqns[0]!r} no longer exists")
+        return source
 
 
 @dataclass(frozen=True)
@@ -85,6 +233,7 @@ class ModuleReplacementPlan:
     """Immutable result of matching replacement rules against one model tree."""
 
     targets: tuple[ModuleReplacementTarget, ...]
+    specs: tuple[ModuleReplacementSpec, ...] = ()
 
 
 def _all_module_aliases(model: nn.Module) -> dict[int, tuple[nn.Module, tuple[str, ...]]]:
@@ -108,6 +257,8 @@ def _validate_module_type(
     spec: ModuleReplacementSpec,
 ) -> None:
     """Validate one matched module against a replacement specification."""
+    if spec.module_type is None:
+        return
     # exact_type deliberately requires an exact type match, so the type()
     # comparison is intentional and must not become isinstance().
     type_matches = (
@@ -125,6 +276,7 @@ def _validate_module_type(
 
 def _select_replacement_spec(
     spec: ModuleReplacementSpec,
+    spec_index: int,
     aliases: dict[int, tuple[nn.Module, tuple[str, ...]]],
     selected: dict[int, ModuleReplacementTarget],
 ) -> None:
@@ -145,12 +297,21 @@ def _select_replacement_spec(
                 f"module replacement conflict for aliases {fqns}: "
                 "one source module may match only one factory"
             )
-        selected[module_id] = ModuleReplacementTarget(fqns, module, spec)
+        selected[module_id] = ModuleReplacementTarget(fqns, weakref.ref(module), spec)
     unmatched_patterns = [
         pattern for pattern, matched_ids in matched_ids_by_pattern.items() if not matched_ids
     ]
     if unmatched_patterns:
-        raise ValueError(f"module replacement pattern(s) matched no module: {unmatched_patterns}")
+        raise ModuleReplacementMatchError(
+            tuple(
+                {
+                    "rule_id": _replacement_rule_id(spec, spec_index),
+                    "pattern": pattern,
+                    "reason": "matched_no_final_module",
+                }
+                for pattern in unmatched_patterns
+            )
+        )
 
 
 def _validate_non_nested_targets(targets: tuple[ModuleReplacementTarget, ...]) -> None:
@@ -173,16 +334,48 @@ def compile_module_replacements(
 
     specs = tuple(specs)
     if not specs:
-        return ModuleReplacementPlan(())
+        return ModuleReplacementPlan((), specs)
 
     aliases = _all_module_aliases(model)
     selected: dict[int, ModuleReplacementTarget] = {}
-    for spec in specs:
-        _select_replacement_spec(spec, aliases, selected)
+    for spec_index, spec in enumerate(specs):
+        _select_replacement_spec(spec, spec_index, aliases, selected)
 
     targets = tuple(selected.values())
     _validate_non_nested_targets(targets)
-    return ModuleReplacementPlan(targets)
+    return ModuleReplacementPlan(targets, specs)
+
+
+def _symbol_path(symbol: Any) -> str | None:
+    """Return a stable import-like identity without retaining the symbol."""
+    if symbol is None:
+        return None
+    return f"{symbol.__module__}:{symbol.__qualname__}"
+
+
+def _replacement_rule_id(spec: ModuleReplacementSpec, index: int) -> str:
+    """Return the declared rule id or a stable fallback for Python callers."""
+    if spec.declaration_id:
+        return spec.declaration_id
+    return f"python-replacement-{index:04d}"
+
+
+def describe_replacement_declarations(
+    specs: Iterable[ModuleReplacementSpec],
+) -> tuple[dict[str, Any], ...]:
+    """Project normalized replacement rules to JSON-safe declarations."""
+    return tuple(
+        {
+            "rule_id": _replacement_rule_id(spec, index),
+            "match": list(spec.match),
+            "source_type": _symbol_path(spec.module_type),
+            "exact_type": spec.exact_type,
+            "replacement_target": spec.replacement_target or _symbol_path(spec.factory),
+            "static_arguments": dict(spec.static_arguments or {}),
+            "order": index,
+        }
+        for index, spec in enumerate(specs)
+    )
 
 
 def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
@@ -193,6 +386,15 @@ def _parent_and_name(model: nn.Module, fqn: str) -> tuple[nn.Module, str]:
     if not name or parent._modules.get(name) is None:  # pylint: disable=protected-access
         raise ValueError(f"replacement target {fqn!r} is no longer registered on its parent")
     return parent, name
+
+
+def _validate_target_binding(model: nn.Module, target: ModuleReplacementTarget) -> None:
+    """Check all aliases before installing any part of one replacement."""
+    source = target.source
+    for fqn in target.module_fqns:
+        parent, name = _parent_and_name(model, fqn)
+        if parent._modules[name] is not source:  # pylint: disable=protected-access
+            raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
 
 
 def _registered_names(module: nn.Module) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -237,9 +439,17 @@ def _validate_forward_compatibility(
 ) -> None:
     """Ensure replacement accepts every call shape supported by source.forward."""
 
+    _validate_callable_compatibility(source.forward, replacement.forward, fqn, kind="forward")
+
+
+def _validate_callable_compatibility(
+    source: Callable, replacement: Callable, fqn: str, *, kind: str = "call",
+) -> None:
+    """Ensure a replacement callable accepts the source's supported call shapes."""
+
     try:
-        source_signature = inspect.signature(source.forward)
-        replacement_signature = inspect.signature(replacement.forward)
+        source_signature = inspect.signature(source)
+        replacement_signature = inspect.signature(replacement)
         source_parameters = tuple(source_signature.parameters.values())
         source_has_varargs = any(
             parameter.kind is inspect.Parameter.VAR_POSITIONAL
@@ -285,7 +495,9 @@ def _validate_forward_compatibility(
         replacement_signature.bind(*keyword_probe_positional_args, **keyword_args)
     except (TypeError, ValueError) as error:
         raise ValueError(
-            f"replacement for {fqn!r} has an incompatible forward signature"
+            f"replacement for {fqn!r} has an incompatible "
+            f"{kind} signature; preserve the source call contract or add an explicit "
+            "model-owned wrapper"
         ) from error
 
 
@@ -301,29 +513,41 @@ def _validate_replacement(
     if not isinstance(replacement, nn.Module):
         raise TypeError(f"replacement factory for {fqn!r} must return nn.Module")
     if source.training != replacement.training:
-        raise ValueError(f"replacement for {fqn!r} must preserve training state")
+        raise ValueError(
+            f"replacement for {fqn!r} must preserve training state"
+        )
     if not has_weight_transforms:
         if _registered_names(source) != _registered_names(replacement):
-            raise ValueError(f"replacement for {fqn!r} changed registered module/parameter/buffer names")
+            raise ValueError(
+                f"replacement for {fqn!r} changed registered "
+                "module/parameter/buffer names without checkpoint transforms"
+            )
         for kind in ("parameter", "buffer"):
             source_identities = _named_identities(source, kind=kind)
             replacement_identities = _named_identities(replacement, kind=kind)
             if tuple(source_identities) != tuple(replacement_identities):
-                raise ValueError(f"replacement for {fqn!r} changed {kind} names")
+                raise ValueError(
+                    f"replacement for {fqn!r} changed {kind} names"
+                )
             for name, source_value in source_identities.items():
                 if replacement_identities[name] is not source_value:
                     raise ValueError(
-                        f"replacement for {fqn!r} must preserve {kind} {name!r} identity"
+                        f"replacement for {fqn!r} must preserve "
+                        f"{kind} {name!r} identity"
                     )
         if tuple(source.state_dict()) != tuple(replacement.state_dict()):
-            raise ValueError(f"replacement for {fqn!r} changed state_dict keys")
+            raise ValueError(
+                f"replacement for {fqn!r} changed state_dict keys"
+            )
     _validate_forward_compatibility(source, replacement, fqn)
     hook_registries = {
         name: value for name, value in vars(source).items()
         if "hook" in name and isinstance(value, Mapping) and value
     }
     if hook_registries:
-        raise ValueError(f"replacement for {fqn!r} cannot migrate existing module hooks")
+        raise ValueError(
+            f"replacement for {fqn!r} cannot migrate existing module hooks"
+        )
 
 
 def _apply_module_replacement_actions(
@@ -357,7 +581,8 @@ def _apply_module_replacement_actions(
             "Low-precision online training currently requires TP=CP=EP=PP=1; "
             f"active axes: {active_model_parallel_axes}."
         )
-    plan = compile_module_replacements(model, tuple(replacement_rules or ()))
+    specs = tuple(replacement_rules or ())
+    plan = compile_module_replacements(model, specs)
     return apply_module_replacements(
         model,
         plan,
@@ -365,6 +590,52 @@ def _apply_module_replacement_actions(
         context=context,
         capture_checkpoint_metadata=capture_checkpoint_metadata,
     )
+
+
+def _install_replacement_target(
+    model: nn.Module,
+    target: ModuleReplacementTarget,
+    context: Mapping[str, Any],
+    extra_transforms: list[WeightRenaming | WeightConverter],
+    weights_mapping: list[WeightRenaming | WeightConverter] | None,
+) -> None:
+    """Build, validate, and install one replacement target in place."""
+    source = target.source
+    replacement = target.spec.factory(
+        module=source,
+        module_fqn=target.module_fqns[0],
+        context=context,
+    )
+    transforms = []
+    if getattr(replacement, "make_transforms", None) is not None:
+        transforms = replacement.make_transforms()
+    if not isinstance(transforms, list) or any(
+        not isinstance(transform, (WeightRenaming, WeightConverter))
+        for transform in transforms
+    ):
+        raise TypeError(
+            "replacement make_transforms() must return "
+            "list[WeightRenaming | WeightConverter]"
+        )
+    for transform in transforms:
+        transform.scope_prefix = target.module_fqns[0]
+        extra_transforms.append(transform)
+    _validate_replacement(
+        source,
+        replacement,
+        target.module_fqns[0],
+        has_weight_transforms=bool(transforms),
+    )
+    if transforms and callable(getattr(replacement, "reset_parameters", None)):
+        replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
+    _validate_target_binding(model, target)
+    if transforms and weights_mapping is None:
+        raise ValueError(
+            "weights_mapping is required when a replacement defines make_transforms()"
+        )
+    for fqn in target.module_fqns:
+        parent, name = _parent_and_name(model, fqn)
+        parent._modules[name] = replacement  # pylint: disable=protected-access
 
 
 def apply_module_replacements(
@@ -375,56 +646,36 @@ def apply_module_replacements(
     context: Mapping[str, Any] | None = None,
     capture_checkpoint_metadata: bool = True,
 ) -> tuple[nn.Module, list[WeightRenaming | WeightConverter] | None]:
-    """Build all replacements, validate them, then install them atomically."""
+    """Build, validate, and install one target at a time to bound live storage.
 
-    factory_context = MappingProxyType(dict(context or {}))
-    prepared: list[tuple[ModuleReplacementTarget, nn.Module]] = []
+    Plans do not retain replaced source modules. A factory or validation
+    failure may leave earlier targets installed; callers must discard the
+    partially converted model and rebuild rather than retrying this plan.
+    """
+
+    context = MappingProxyType(dict(context or {}))
+    source_shapes = _named_tensor_shapes(model) if plan.targets and capture_checkpoint_metadata else None
     extra_transforms: list[WeightRenaming | WeightConverter] = []
     for target in plan.targets:
-        replacement = target.spec.factory(
-            module=target.source,
-            module_fqn=target.module_fqns[0],
-            context=factory_context,
+        _install_replacement_target(
+            model,
+            target,
+            context,
+            extra_transforms,
+            weights_mapping,
         )
-        make_transforms = getattr(replacement, "make_transforms", None)
-        transforms = [] if make_transforms is None else make_transforms()
-        if not isinstance(transforms, list) or any(
-            not isinstance(transform, (WeightRenaming, WeightConverter))
-            for transform in transforms
-        ):
-            raise TypeError(
-                "replacement make_transforms() must return "
-                "list[WeightRenaming | WeightConverter]"
-            )
-        for transform in transforms:
-            transform.scope_prefix = target.module_fqns[0]
-            extra_transforms.append(transform)
-        _validate_replacement(
-            target.source,
-            replacement,
-            target.module_fqns[0],
-            has_weight_transforms=bool(transforms),
-        )
-        if transforms and callable(getattr(replacement, "reset_parameters", None)):
-            replacement._hp_reset_after_materialization = True  # pylint: disable=protected-access
-        prepared.append((target, replacement))
-
-    for target, _ in prepared:
-        for fqn in target.module_fqns:
-            parent, name = _parent_and_name(model, fqn)
-            if parent._modules[name] is not target.source:  # pylint: disable=protected-access
-                raise ValueError(f"replacement target {fqn!r} changed while plan was being applied")
     if extra_transforms:
-        if weights_mapping is None:
-            raise ValueError(
-                "weights_mapping is required when a replacement defines make_transforms()"
-            )
         if capture_checkpoint_metadata:
-            model._hp_checkpoint_source_shapes = _named_tensor_shapes(model)  # pylint: disable=protected-access
+            model._hp_checkpoint_source_shapes = source_shapes  # pylint: disable=protected-access
             model._hp_replacement_weight_conversions = extra_transforms  # pylint: disable=protected-access
         weights_mapping[:0] = extra_transforms
-    for target, replacement in prepared:
-        for fqn in target.module_fqns:
-            parent, name = _parent_and_name(model, fqn)
-            parent._modules[name] = replacement  # pylint: disable=protected-access
+    previous_replacements = tuple(getattr(model, "_hp_replaced_module_fqns", ()) or ())
+    current_replacements = tuple(
+        fqn
+        for target in plan.targets
+        for fqn in target.module_fqns
+    )
+    model._hp_replaced_module_fqns = tuple(  # pylint: disable=protected-access
+        dict.fromkeys((*previous_replacements, *current_replacements))
+    )
     return model, weights_mapping

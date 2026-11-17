@@ -14,20 +14,25 @@
 # limitations under the License.
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
+__all__ = ["TextTrainer"]
+
 from collections import defaultdict
+import faulthandler
+from itertools import count
 from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
+from hyper_parallel.trainer.runtime.expert_grad_staging import build_expert_gradient_staging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
 
 logger = create_logger(__name__)
@@ -44,6 +49,12 @@ class TextTrainer:
         self.base.config = config
 
         self.base._setup()
+        memory_profiler.reset(
+            self.base.config.memory,
+            global_rank=self.base.global_rank,
+            tp_rank=self.base.mesh.tp_rank,
+            dp_rank=self.base.mesh.dp_rank,
+        )
         self.base._build_model()
         self.base._build_loss()
 
@@ -58,11 +69,15 @@ class TextTrainer:
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self._expert_gradient_staging = build_expert_gradient_staging(self.base)
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
+        self.base._build_graph_compiler()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
@@ -89,8 +104,14 @@ class TextTrainer:
                 self.base.chat_template = build_chat_template(
                     assets_config.chat_template,
                     self.base.tokenizer,
+                    chat_template_kwargs=assets_config.chat_template_kwargs,
+                    log_first_rendered_template=config.debug.log_first_rendered_template,
                 )
             else:
+                if assets_config.chat_template_kwargs or config.debug.log_first_rendered_template:
+                    raise ValueError(
+                        "dataset.model_assets chat-template options require chat_template='tokenizer'"
+                    )
                 self.base.chat_template = assets_config.chat_template.build(
                     tokenizer=self.base.tokenizer,
                 )
@@ -130,12 +151,13 @@ class TextTrainer:
         )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-LLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
         get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
+            dataloader_context=self.base.dataloader_context,
             device=self.base.device,
             tokenizer=self.base.tokenizer,
             data_config=getattr(config.dataset, "data_config", {}),
@@ -178,13 +200,35 @@ class TextTrainer:
         """Dispatch the step-begin lifecycle hook."""
         self.base.on_step_begin()
 
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
+
+        Args:
+            micro_batch: Prepared inputs and lightweight metric metadata.
+        """
+        self.base.on_micro_step_begin(micro_batch)
+
+    def on_micro_step_end(self, loss_dict: dict[str, torch.Tensor]) -> None:
+        """Dispatch the micro-step-end lifecycle hook.
+
+        Args:
+            loss_dict: Named losses and metrics from the completed forward-backward step.
+        """
+        self.base.on_micro_step_end(loss_dict)
+
     def on_step_end(
             self,
             loss: Any = None,
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
@@ -194,38 +238,56 @@ class TextTrainer:
     def forward_backward_step(
             self,
             data_iterator: Any,
-            num_micro_steps: int,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Fetch and execute one forward-backward micro-step.
 
         Args:
             data_iterator: Iterator providing one raw FB batch per call.
-            num_micro_steps: Number of FB steps in the current optimizer step.
 
         Returns:
             Loss tensor and named loss tensors for this FB step.
         """
         model_inputs, loss_inputs = self.base.get_batch(data_iterator)
         self.base.current_token_counts = count_loss_token(loss_inputs)
-        self.base.step_token_counts = {
-            name: token_count * num_micro_steps
-            for name, token_count in self.base.current_token_counts.items()
+        metric_inputs = {
+            **model_inputs,
+            **loss_inputs,
+            "token_count": self.base.current_token_counts["foundation_tokens"],
         }
+        self.on_micro_step_begin(metric_inputs)
+        del metric_inputs
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
+        self.on_micro_step_end(loss_dict)
 
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one text training step."""
-        config = self.base.config
+        """Execute one text training step.
+
+        Args:
+            data_iterator: Iterator providing the step's micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
+        memory_profiler.step()
         num_micro_steps = self.base.num_micro_batches
-        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
+        trace_first_update = (
+            self.base.state.global_step == 0 and self.base.global_rank in (0, 36)
+            and self.base.config.accelerator.cp_size == 1 and self.base.config.training.global_batch_size in (128, 256)
+        )
+        if trace_first_update:
+            faulthandler.dump_traceback_later(90, repeat=True)
+            logger.info("First CP1 training update started")
+        self.base.begin_loss_step()
 
         self.on_step_begin()
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
+        expert_staging = getattr(self, "_expert_gradient_staging", None)
 
         for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
@@ -233,43 +295,38 @@ class TextTrainer:
                 micro_step,
                 num_micro_steps,
             )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
-                num_micro_steps,
             )
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
+            if expert_staging is not None and micro_step == 0:
+                expert_staging.pack()
+                if trace_first_update:
+                    logger.info("First CP1 expert gradient partials staged")
 
-        grad_norm = 0.0
-        if config.training.max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(
-                self.base.model,
-                config.training.max_grad_norm,
-            )
-
-        for optimizer in optimizers:
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
-                optimizer.step()
-            optimizer.zero_grad()
-
-        schedulers = (
-            self.base.lr_scheduler
-            if isinstance(self.base.lr_scheduler, list)
-            else (
-                [self.base.lr_scheduler]
-                if self.base.lr_scheduler is not None
-                else []
-            )
-        )
-        for scheduler in schedulers:
-            scheduler.step()
+        if expert_staging is not None:
+            expert_staging.finish()
+        if trace_first_update:
+            logger.info("First CP1 backward completed")
+        total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
+        if trace_first_update:
+            logger.info("First CP1 optimizer update started")
+        self.base.step_optimizers_and_schedulers()
+        if trace_first_update:
+            faulthandler.cancel_dump_traceback_later()
+            logger.info("First CP1 optimizer update completed")
 
         # Checkpoint and logging callbacks observe the number of completed
         # optimizer updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
@@ -281,47 +338,85 @@ class TextTrainer:
             "grad_norm": grad_norm_value,
         }
 
+    def _train_epoch(self, epoch: int, balanced_loader: bool) -> bool:
+        """Consume complete optimizer steps and report whether the source epoch ended."""
+        train_dataloader = self.base.train_dataloader
+        data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+        start_step = self.base.state.global_step - epoch * self.base.train_steps
+        train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+        if balanced_loader:
+            start_step = 0
+            train_steps = self.base.train_iters - self.base.state.global_step
+        for _ in range(start_step, train_steps):
+            try:
+                self.train_step(data_iterator)
+            except StopIteration:
+                if balanced_loader:
+                    optimizers = self.base.optimizer
+                    for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:
+                        optimizer.zero_grad()
+                logger.info(
+                    "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
+                )
+                return True
+        return False
+
     def train(self) -> None:
         """Run the configured global optimizer steps by Dataset epoch."""
-        config = self.base.config
-        self.on_train_begin()
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.base.local_rank,
-            self.base.state.global_step,
-            self.base.train_iters,
-            self.base.state.epoch,
-            self.base.train_epochs,
-        )
+        try:
+            self.on_train_begin()
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.base.local_rank,
+                self.base.state.global_step,
+                self.base.train_iters,
+                self.base.state.epoch,
+                self.base.train_epochs,
+            )
 
-        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-        for epoch in range(self.base.state.epoch, self.base.train_epochs):
             train_dataloader = self.base.train_dataloader
-            if hasattr(train_dataloader, "set_epoch"):
-                train_dataloader.set_epoch(epoch)
+            balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
+            start_epoch = self.base.state.epoch
+            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+            for epoch in epochs:
+                if self.base.state.global_step >= self.base.train_iters:
+                    break
+                # The first collective iterator may hold a restored checkpoint cursor.
+                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                    train_dataloader.set_epoch(epoch)
 
-            self.base.state.epoch = epoch
-            self.on_epoch_begin()
-            data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-            start_step = self.base.state.global_step - epoch * self.base.train_steps
-            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
+                self.base.state.epoch = epoch
+                self.on_epoch_begin()
+                epoch_start_step = self.base.state.global_step
+                epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+
+                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                    raise ValueError("Indexed source epoch cannot provide one complete optimizer step")
+
+                self.on_epoch_end()
+                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                if self.base.state.global_step >= self.base.train_iters:
                     break
 
-            self.on_epoch_end()
-            self.base.state.epoch = epoch + 1
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
-            if self.base.state.global_step >= self.base.train_iters:
-                break
+            memory_profiler.stop()
+            self.on_train_end()
 
-        self.on_train_end()
+        except BaseException:
+            try:
+                memory_profiler.stop()
+            # Snapshot export must preserve the training error even if interrupted.
+            except BaseException:  # pylint: disable=broad-exception-caught
+                logger.exception("Failed to save memory snapshot after training error.")
+            finally:
+                self.base.abort_profilers()
+            raise
+
+        if balanced_loader:
+            try:
+                train_dataloader.wait_for_prefetch()
+            finally:
+                train_dataloader.close()
 
         synchronize()
         self.base.destroy_distributed()
-
-
-__all__ = ["TextTrainer"]

@@ -30,6 +30,8 @@ from transformers import (
     PreTrainedModel,
 )
 
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
+from hyper_parallel.components.checkpoint.weight_verifier import verify_hf_weights as check_hf_weights
 from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
@@ -37,11 +39,14 @@ from hyper_parallel.models._transformers.model_builder import (
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
 from hyper_parallel.distributed.mesh import DistributedSetup
-from hyper_parallel.models.build_options import get_device_id, get_device_type  # pylint: disable=syntax-error
-from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
+    CompileConfig,
+    get_device_id,
+    get_device_type,
+)
+from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
 
 logger = logging.getLogger(__name__)
-
 
 def _current_device() -> torch.device:
     """Return the current accelerator device, or CPU when no accelerator exists."""
@@ -49,6 +54,120 @@ def _current_device() -> torch.device:
     if device_type == "cpu":
         return torch.device("cpu")
     return torch.device(device_type, get_device_id())
+
+
+_CONFIG_ONLY_KWARGS = {
+    "cache_dir",
+    "config_path",
+    "force_download",
+    "ignore_mismatched_sizes",
+    "local_files_only",
+    "proxies",
+    "resume_download",
+    "revision",
+    "subfolder",
+    "token",
+    "trust_remote_code",
+    "use_auth_token",
+}
+
+
+def _model_init_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    load_base_model: bool,
+) -> dict[str, Any]:
+    """Drop config/download-only kwargs when constructing directly from config."""
+    if load_base_model:
+        return dict(kwargs)
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key not in _CONFIG_ONLY_KWARGS
+    }
+
+
+def _requires_quantized_initialization(
+    hf_config: Any,
+    explicit_quantization: Any,
+    *,
+    load_base_model: bool,
+) -> bool:
+    """Distinguish quantized model construction from DCP decoding into float parameters."""
+    stored_quantization = getattr(hf_config, "quantization_config", None) if load_base_model else None
+    quantized_init = explicit_quantization is not None or stored_quantization is not None
+    if load_base_model and quantized_init and resolve_hf_loader() == "dcp":
+        if explicit_quantization is not None or not supports_hf_dequantization(stored_quantization):
+            raise ValueError(
+                "DCP pretrained loading does not support quantized initialization; "
+                "checkpoint decoding requires a supported format in the checkpoint's own config"
+            )
+        # Storage decoding produces floating-point parameters, not quantized model modules.
+        return False
+    return quantized_init
+
+
+def _model_init_context(is_meta_device: bool) -> Any:
+    """Resolve version-dependent initialization helpers when constructing a model."""
+    # Preserve deferred imports for Transformers versions that moved no_init_weights.
+    # pylint: disable=import-outside-toplevel
+    from contextlib import nullcontext
+    from transformers.modeling_utils import ContextManagers
+    try:
+        from transformers.modeling_utils import no_init_weights
+    except ImportError:
+        from transformers.initialization import no_init_weights
+    from hyper_parallel import init_empty_weights
+    # pylint: enable=import-outside-toplevel
+
+    return ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+
+
+def _load_pretrained_config(
+        pretrained_model_name_or_path: str,
+        attn_implementation: str,
+        torch_dtype: Union[str, torch.dtype],
+        config_overrides: Optional[dict[str, Any]],
+        kwargs: dict[str, Any],
+) -> PretrainedConfig:
+    """Load the HF configuration with call-time overrides."""
+    config_kwargs = dict(kwargs)
+    config_kwargs.update(config_overrides or {})
+    return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+
+
+def _validate_weight_check_options(verify_hf_weights: Optional[str], load_base_model: bool) -> None:
+    """Require pretrained loading when verification is requested."""
+    if verify_hf_weights is not None and not load_base_model:
+        raise ValueError("verify_hf_weights requires load_base_model=True")
+
+
+def _prepare_pretrained_build(
+        distributed_setup: DistributedSetup,
+        compile_config: Optional[Union[CompileConfig, dict]],
+        pretrained_model_name_or_path: str,
+        attn_implementation: str,
+        torch_dtype: Union[str, torch.dtype],
+        config_overrides: Optional[dict[str, Any]],
+        kwargs: dict[str, Any],
+        force_hf: bool,
+) -> tuple[Any, Any, PretrainedConfig, bool]:
+    """Prepare infrastructure, HF configuration and model-path selection."""
+    # ② Instantiate infrastructure
+    sharding_planner, fsdp2_manager = instantiate_infrastructure(
+        distributed_setup=distributed_setup,
+        device=_current_device(),
+        compile_config=compile_config,
+    )
+
+    # ③ Get HF config
+    hf_config = _load_pretrained_config(
+        pretrained_model_name_or_path, attn_implementation, torch_dtype, config_overrides, kwargs,
+    )
+    # ④ Determine model path
+    is_hf_model = get_is_hf_model(hf_config, force_hf)
+
+    return sharding_planner, fsdp2_manager, hf_config, is_hf_model
 
 
 class _BaseHyperAutoModelClass:
@@ -71,7 +190,15 @@ class _BaseHyperAutoModelClass:
     @classmethod
     def _from_config_parent_class(cls, *args, **kwargs):
         """Delegate to the parent Hugging Face AutoModel ``from_config`` path."""
-        return super().from_config(*args, **kwargs)  # pylint: disable=no-member
+        parent_classes = (
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForSequenceClassification,
+        )
+        for parent_class in parent_classes:
+            if issubclass(cls, parent_class):
+                return parent_class.from_config(*args, **kwargs)
+        raise TypeError(f"{cls.__name__} has no supported Hugging Face AutoModel parent")
 
     @classmethod
     def from_pretrained(
@@ -79,7 +206,6 @@ class _BaseHyperAutoModelClass:
         pretrained_model_name_or_path: str,
         *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
-        backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
@@ -91,12 +217,28 @@ class _BaseHyperAutoModelClass:
         freeze_config: Optional[Any] = None,
         activation_checkpoint: Optional[str] = None,
         swap_inputs: bool = False,
+        allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        config_overrides: Optional[dict[str, Any]] = None,
+        load_base_model: bool = True,
+        verify_hf_weights: Optional[str] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
 
+        Unquantized models are constructed from configuration on meta, then
+        the selected HF loader loads their finalized parameters once.
+
+        Args:
+            pretrained_model_name_or_path: HF checkpoint path or model identifier.
+            *model_args: Positional arguments for model construction.
+            verify_hf_weights: Optional report directory for checking all loaded shards
+                against a local HF checkpoint before the first forward. All ranks must opt in.
+            **kwargs: Additional model construction and HF configuration arguments.
+
+        Returns:
+            Constructed and parallelized pretrained model.
         Following design doc 01 §6.2:
         ① resolve distributed_setup → MeshContext
         ② instantiate_infrastructure → ShardingPlanner + FSDP2Manager
@@ -104,26 +246,23 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _validate_weight_check_options(verify_hf_weights, load_base_model)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
-
-        # ② Instantiate infrastructure
-        sharding_planner, fsdp2_manager = instantiate_infrastructure(
-            distributed_setup=distributed_setup,
-            device=_current_device(),
+        prepared = _prepare_pretrained_build(
+            distributed_setup,
+            compile_config,
+            pretrained_model_name_or_path,
+            attn_implementation,
+            torch_dtype,
+            config_overrides,
+            kwargs,
+            force_hf,
         )
-
-        # ③ Get HF config
-        hf_config = get_hf_config(
-            pretrained_model_name_or_path, attn_implementation, torch_dtype, **kwargs
-        )
-
-        # ④ Determine model path
-        is_hf_model = get_is_hf_model(hf_config, force_hf)
-
+        sharding_planner, fsdp2_manager, hf_config, is_hf_model = prepared
         # ⑤ Build model
-        return cls._build_model(
+        model = cls._build_model(
             pretrained_model_name_or_path,
             *model_args,
             is_hf_model=is_hf_model,
@@ -131,12 +270,11 @@ class _BaseHyperAutoModelClass:
             mesh=mesh,
             sharding_planner=sharding_planner,
             fsdp2_manager=fsdp2_manager,
-            backend=backend,
             peft_config=peft_config,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             validate_placement=validate_placement,
-            load_base_model=True,
+            load_base_model=load_base_model,
             distributed_setup=distributed_setup,
             qat_config=qat_config,
             fp8_config=fp8_config,
@@ -144,10 +282,15 @@ class _BaseHyperAutoModelClass:
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
             swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
         )
+        if verify_hf_weights is not None:
+            check_hf_weights(model, pretrained_model_name_or_path, verify_hf_weights,
+                             phase="after_load_before_first_forward")
+        return model
 
     @classmethod
     def from_config(  # pylint: disable=unused-argument
@@ -156,7 +299,6 @@ class _BaseHyperAutoModelClass:
         *model_args: Any,
         distributed_setup: Optional[DistributedSetup] = None,
         device_mesh: Optional[Any] = None,
-        backend: Optional[Any] = None,
         peft_config: Optional[Any] = None,
         torch_dtype: Union[str, torch.dtype] = "auto",
         attn_implementation: str = "sdpa",
@@ -167,6 +309,7 @@ class _BaseHyperAutoModelClass:
         freeze_config: Optional[Any] = None,
         activation_checkpoint: Optional[str] = None,
         swap_inputs: bool = False,
+        allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
@@ -174,6 +317,9 @@ class _BaseHyperAutoModelClass:
         """Build model from PretrainedConfig (no weight loading).
 
         Following design doc 01 §6.1.
+
+        No checkpoint is loaded, so the from-config random initialization path
+        is preserved.
         """
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -182,8 +328,8 @@ class _BaseHyperAutoModelClass:
         sharding_planner, fsdp2_manager = instantiate_infrastructure(
             distributed_setup=distributed_setup,
             device=_current_device(),
+            compile_config=compile_config,
         )
-
         is_hf_model = get_is_hf_model(config, force_hf=False)
 
         return cls._build_model(
@@ -194,7 +340,6 @@ class _BaseHyperAutoModelClass:
             mesh=mesh,
             sharding_planner=sharding_planner,
             fsdp2_manager=fsdp2_manager,
-            backend=backend,
             peft_config=peft_config,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
@@ -207,6 +352,7 @@ class _BaseHyperAutoModelClass:
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
             swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
@@ -222,7 +368,6 @@ class _BaseHyperAutoModelClass:
         mesh,
         sharding_planner,
         fsdp2_manager,
-        backend,
         peft_config,
         torch_dtype,
         attn_implementation,
@@ -234,7 +379,9 @@ class _BaseHyperAutoModelClass:
         compile_config=None,
         freeze_config=None,
         activation_checkpoint: Optional[str] = None,
+        activation_checkpoint_selection: Optional[Any] = None,
         swap_inputs: bool = False,
+        allow_cache_entry_mutation: bool = False,
         activation_swap: str = "none",
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs,
@@ -247,43 +394,37 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
-        # Lazy imports: no_init_weights moved between transformers submodules
-        # across versions (hence the ImportError fallback).
-        # pylint: disable=import-outside-toplevel
-        from contextlib import nullcontext
-        from transformers.modeling_utils import ContextManagers
-        try:
-            from transformers.modeling_utils import no_init_weights
-        except ImportError:
-            from transformers.initialization import no_init_weights
-        from hyper_parallel import init_empty_weights
-        # pylint: enable=import-outside-toplevel
-
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        is_meta_device = (
-            world_size > 1 or not is_hf_model
-        ) and kwargs.get("quantization_config") is None
-
-        init_ctx = (
-            ContextManagers([no_init_weights(), init_empty_weights()])
-            if is_meta_device
-            else nullcontext()
+        quantized_init = _requires_quantized_initialization(
+            hf_config, kwargs.get("quantization_config"), load_base_model=load_base_model,
         )
+        defer_hf_load = load_base_model and not quantized_init
+        is_meta_device = (
+            world_size > 1 or not is_hf_model or defer_hf_load
+        ) and not quantized_init
 
-        # Step 2: Build model
+        init_ctx = _model_init_context(is_meta_device)
+
+        # Step 2: Config-first construction defers pretrained I/O until after sharding.
+        init_pretrained_path = (
+            pretrained_model_name_or_path if load_base_model and not defer_hf_load else None
+        )
+        init_kwargs = _model_init_kwargs(
+            dict(kwargs),
+            load_base_model=init_pretrained_path is not None,
+        )
         with init_ctx:
             _, model = _init_model(
                 cls,
-                pretrained_model_name_or_path,
+                init_pretrained_path,
                 hf_config,
                 attn_implementation,
                 torch_dtype,
                 is_hf_model,
                 *model_args,
-                backend=backend,
-                **kwargs,
+                **init_kwargs,
             )
 
         # Step 3-12: Apply infrastructure
@@ -305,7 +446,9 @@ class _BaseHyperAutoModelClass:
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
+            activation_checkpoint_selection=activation_checkpoint_selection,
             swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
             activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
         )

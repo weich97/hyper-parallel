@@ -66,6 +66,8 @@ When an API accepts list/collection inputs (e.g. `fully_shard([m1, m2])`), verif
 
 - [ ] **Clear abstractions** — State management is explicit; no dynamic attribute setting/getting
 - [ ] **Match existing patterns** — Code follows architectural patterns already in the codebase
+- [ ] **Reuse existing extension paths** — Search `plan_overrides[].replace`, FQN globs, registered adapter providers, and the generic replacement executor before accepting a model or feature-specific hook in framework code; request a recipe rule when those paths already express the behavior
+- [ ] **Shared precision changes have a decision record** — For changes to generic collective accumulation dtype/order or shared cast policy made for model precision, require first-divergence evidence, cross-model forward/backward impact, adapter/recipe alternatives, and an explicit user decision; equality at one SP/non-SP boundary alone is insufficient
 - [ ] **No over-engineering** — Only requested changes are made; no speculative features
 - [ ] **No premature abstraction** — Helpers and utilities are only created when reused; three similar lines is better than a one-use helper
 - [ ] **No trivial helpers** — Avoid 1-2 LOC helper functions used only once (unless significantly improves readability)
@@ -178,7 +180,7 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Patterns
 
 - [ ] **Proper markers** — `@arg_mark(plat_marks=..., level_mark=..., card_mark=..., essential_mark=...)`
-- [ ] **Distributed tests use helpers** — `torchrun_case()` for PyTorch, `msrun_case()` for MindSpore
+- [ ] **Distributed tests use helpers** — `torchrun_case()` for distributed test launch
 - [ ] **Graceful hardware skip** — Tests skip cleanly when required hardware unavailable
 - [ ] **Self-contained** — No shared mutable state between tests
 

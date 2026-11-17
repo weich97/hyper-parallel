@@ -23,11 +23,14 @@ import copy
 import os
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import patch, MagicMock
 
 import numpy as np
 import torch
 from torch import nn
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils.weak import WeakIdKeyDictionary
 
 
 from hyper_parallel.core.fully_shard.hsdp_param import (
@@ -35,7 +38,7 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
     _copy_without_bumping_version,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, clear_device_mesh_cache
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState, ParamModuleInfo
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext
@@ -58,6 +61,8 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.distributed._builder.source_shard import _source_infos_for_fully_shard
+from tests.common.mark_utils import arg_mark
 
 
 Tensor = torch.Tensor
@@ -382,14 +387,14 @@ class TestHSDPParamV2(unittest.TestCase):
             self.assertEqual(param_v2.all_reduce_comm_ctx.all_reduce_output.dtype, grad_dtype)
             self.assertIs(param_v2.all_reduce_comm_ctx.all_reduce_handle, mock_handle)
 
-    @patch.object(DTensor, "from_local")
+    @patch.object(DTensor, "from_local_with_layout")
     @patch.object(HSDPParamV2, "_update_shardedparam_storage_forcely")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
     def test_reset_sharded_param(
         self,
         mock_layout,
         mock_update_storage,
-        mock_dtensor_from_local,
+        mock_dtensor_from_layout,
     ):
         """Test resetting sharded parameters.
 
@@ -399,10 +404,10 @@ class TestHSDPParamV2(unittest.TestCase):
 
         Args:
             mock_layout: Mock for Layout class
-            mock_dtensor_from_local: Mock for DTensor class
+            mock_dtensor_from_layout: Mock for DTensor layout constructor
         """
         sharded_param_data = self.sharded_param_data
-        mock_dtensor_instance = self._create_mock_dtensor(mock_dtensor_from_local, sharded_param_data)
+        self._create_mock_dtensor(mock_dtensor_from_layout, sharded_param_data)
 
         # Create parameter
         param_v2 = self._create_param_v2()
@@ -698,6 +703,13 @@ class TestHSDPParamV2(unittest.TestCase):
     def test_to_accumulated_grad_if_needed_preserves_grad_without_reduce_dtype(self):
         """Verify no-sync paths still move local grad into accumulated buffer even without dtype conversion."""
         param_v2 = object.__new__(HSDPParamV2)
+        previous_grad = torch.full((2, 2), 2.0)
+        param_v2.unsharded_accumulated_grad = previous_grad
+
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+        HSDPParamV2.to_accumulated_grad_if_needed(param_v2)
+        self.assertIs(param_v2.unsharded_accumulated_grad, previous_grad)
+
         grad = torch.ones(2, 2, dtype=torch.float32)
         param_v2._unsharded_param = MagicMock()
         param_v2._unsharded_param.grad = grad
@@ -708,6 +720,13 @@ class TestHSDPParamV2(unittest.TestCase):
 
         self.assertIsNone(param_v2._unsharded_param.grad)
         self.assertTrue(torch.equal(param_v2.unsharded_accumulated_grad, grad))
+
+        next_grad = torch.full((2, 2), 3.0)
+        param_v2._unsharded_param.grad = next_grad
+        HSDPParamV2.accumulate_unsharded_grad_if_needed(param_v2)
+
+        self.assertIsNone(param_v2._unsharded_param.grad)
+        torch.testing.assert_close(param_v2.unsharded_accumulated_grad, torch.full((2, 2), 4.0))
 
 
 class TestFullyShardMeshUtils(unittest.TestCase):
@@ -822,7 +841,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         with patch("hyper_parallel.core.fully_shard.api._validate_module_for_fully_shard"), \
                 patch("hyper_parallel.core.fully_shard.api._extend_module_with_hsdp_interface"), \
-                patch("hyper_parallel.core.fully_shard.api.get_world_size", return_value=8), \
+                patch("hyper_parallel.core.fully_shard.api.dist.get_world_size", return_value=8), \
                 patch("hyper_parallel.core.fully_shard.api.init_device_mesh", return_value=MagicMock()), \
                 self.assertRaisesRegex(ValueError, "not support mesh=None"):
             fully_shard(module, mesh=None)
@@ -884,7 +903,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             "hyper_parallel.core.fully_shard.api._extend_module_with_hsdp_interface",
             side_effect=_attach_mock_hsdp,
         ), patch(
-            "hyper_parallel.core.fully_shard.api.get_world_size",
+            "hyper_parallel.core.fully_shard.api.dist.get_world_size",
             return_value=8,
         ), patch(
             "hyper_parallel.core.fully_shard.api.init_device_mesh",
@@ -1021,6 +1040,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         parameter = nn.Parameter(torch.randn(4, 4))
         module.register_parameter("weight", parameter)
         metadata = SourceShardMetaInfo(mesh, (Replicate(),))
+        source_shard_infos = _source_infos_for_fully_shard({parameter: metadata})
         mock_instance = MagicMock()
         mock_instance.source_shard_info = metadata
         mock_instance.sharded_param.requires_grad = True
@@ -1045,11 +1065,108 @@ class TestFullyShardMeshUtils(unittest.TestCase):
                 set(),
                 HSDPSchedulerContext(),
                 torch.device("cpu"),
-                source_shard_infos={parameter: metadata},
+                source_shard_infos=source_shard_infos,
             )
 
         self.assertIs(mock_hsdp_param_cls.call_args.kwargs["source_shard_info"], metadata)
+        self.assertIs(state.source_shard_infos, source_shard_infos)
         self.assertEqual(state.reduce_op_type, torch.distributed.ReduceOp.AVG)
+
+    @staticmethod
+    def _build_source_sharded_model(shared: bool) -> tuple:
+        """Return a live FSDP model after all original-parameter locals leave scope."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0), \
+                patch.object(DeviceMesh, "get_group", return_value=None), \
+                patch("hyper_parallel.core.fully_shard.utils.get_group_local_rank", return_value=0), \
+                patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh", return_value=torch.device("cpu")):
+            mesh = DeviceMesh(
+                "cpu", np.array([[0], [1]]), mesh_dim_names=("fsdp_shard", "tp"), _init_backend=False,
+            )
+            model = nn.Module()
+            original = nn.Parameter(torch.ones(8, 8))
+            model.register_parameter("weight", original)
+            if shared:
+                model.register_parameter("tied_weight", original)
+            original_ref = weakref.ref(original)
+            storage_ref = StorageWeakRef(original.untyped_storage())
+            metadata = SourceShardMetaInfo(mesh["tp"], (Replicate(),))
+            managed_infos = {original: metadata}
+            fsdp_infos = _source_infos_for_fully_shard(managed_infos)
+            fully_shard(model, mesh=mesh["fsdp_shard"], source_shard_infos=fsdp_infos)
+            return model, original_ref, storage_ref, metadata
+
+    def test_equal_valued_parameters_use_identity_keys(self) -> None:
+        """Feature: Weak source metadata identity lookup.
+        Description: Resolve two multi-element parameters containing identical values.
+        Expectation: Each parameter keeps its own metadata without Tensor equality.
+        """
+        first = nn.Parameter(torch.ones(2, 3))
+        second = nn.Parameter(torch.ones(2, 3))
+        first_metadata = SourceShardMetaInfo(MagicMock(spec=DeviceMesh), (Replicate(),))
+        second_metadata = SourceShardMetaInfo(MagicMock(spec=DeviceMesh), (Replicate(),))
+        managed_infos = {first: first_metadata, second: second_metadata}
+
+        fsdp_infos = _source_infos_for_fully_shard(managed_infos)
+
+        self.assertIsInstance(fsdp_infos, WeakIdKeyDictionary)
+        self.assertIs(fsdp_infos.get(first), first_metadata)
+        self.assertIs(fsdp_infos.get(second), second_metadata)
+        self.assertIn(first, fsdp_infos)
+        self.assertIn(second, fsdp_infos)
+        self.assertEqual(len(managed_infos), 2)
+        self.assertIs(managed_infos[first], first_metadata)
+        self.assertIs(managed_infos[second], second_metadata)
+
+    def test_original_parameter_and_storage_are_released_after_fully_shard(self) -> None:
+        """Feature: Adapter source metadata ownership.
+        Description: Keep a real FSDP model alive after its construction scope exits.
+        Expectation: The original parameter and storage expire and metadata remains.
+        """
+        clear_device_mesh_cache()
+        self.addCleanup(clear_device_mesh_cache)
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                model, original_ref, storage_ref, metadata = self._build_source_sharded_model(shared)
+                scheduler = model.hsdp_scheduler
+                state = scheduler.hsdp_state
+
+                self.assertIsNone(original_ref())
+                self.assertTrue(storage_ref.expired())
+                self.assertIsInstance(scheduler.source_shard_infos, WeakIdKeyDictionary)
+                self.assertIs(scheduler.source_shard_infos, state.source_shard_infos)
+                self.assertEqual(len(state.source_shard_infos), 0)
+                self.assertIs(state.hsdp_params[0].source_shard_info, metadata)
+                self.assertEqual(tuple(model.weight.to_local().shape), (4, 8))
+                torch.testing.assert_close(model.weight.to_local(), torch.ones(4, 8))
+                if shared:
+                    self.assertIs(model.weight, model.tied_weight)
+
+    def test_none_source_metadata_stays_none(self) -> None:
+        """Feature: Missing source metadata compatibility.
+        Description: Convert an absent adapter source mapping.
+        Expectation: FSDP receives None rather than an empty explicit mapping.
+        """
+        self.assertIsNone(_source_infos_for_fully_shard(None))
+
+    def test_native_dtensor_metadata_still_uses_implicit_fsdp_discovery(self) -> None:
+        """Feature: Native DTensor source metadata compatibility.
+        Description: Convert source metadata whose parameters remain native DTensors.
+        Expectation: FSDP receives None and derives layouts from its native parameters.
+        """
+        parameter = nn.Parameter(torch.ones(2, 3))
+        metadata = SourceShardMetaInfo(MagicMock(spec=DeviceMesh), (Replicate(),), origin_is_dtensor=True)
+
+        self.assertIsNone(_source_infos_for_fully_shard({parameter: metadata}))
+
+    def test_empty_explicit_mapping_stays_explicit(self) -> None:
+        """Feature: Empty source mapping compatibility.
+        Description: Convert an explicit mapping for a parameter-free FSDP unit.
+        Expectation: FSDP receives an empty weak mapping rather than None.
+        """
+        fsdp_infos = _source_infos_for_fully_shard({})
+
+        self.assertIsInstance(fsdp_infos, WeakIdKeyDictionary)
+        self.assertEqual(len(fsdp_infos), 0)
 
     @patch("hyper_parallel.core.fully_shard.hsdp_state.DDPMeshInfo")
     def test_replicate_param_flattens_2d_mesh_for_ddp(self, mock_ddp_mesh_info):
@@ -1070,8 +1187,13 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         )
         self.assertIs(result, mock_ddp_mesh_info.return_value)
 
-    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self):
-        """Verify _init_mp_dtypes leaves dtype ownership with each managed parameter."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_state_init_mp_dtypes_initializes_replicate_params_independently(self) -> None:
+        """Feature: Replicated parameter precision refresh.
+        Description: Initialize a replicated parameter from the shared state precision policy.
+        Expectation: The parameter receives the state policy to resolve its own dtype overrides.
+        """
         state = object.__new__(HSDPStateV2)
         state.hsdp_params = []
         state.replicate_params = []

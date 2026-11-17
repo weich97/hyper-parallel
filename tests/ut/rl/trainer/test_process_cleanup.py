@@ -17,15 +17,36 @@
 # pylint: disable=protected-access
 
 import subprocess
+import os
 import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch, sentinel
 
-from rl import process_cleanup as runtime
-from rl.trainer import SyncTrainer
+from rl.utils import process_cleanup as runtime
+from rl.trainer.lifecycle import RunLifecycle
 
 from hyper_parallel.core.dtensor import device_mesh
 from hyper_parallel.core.pipeline_parallel import _p2p
+
+
+class TestLaunchEnvironment(unittest.TestCase):
+    """Service startup must not leak mode flags into later synchronous launches."""
+
+    def test_nested_startup_restores_original_and_missing_values(self):
+        with patch.dict(os.environ, {"HYPER_RL_ASYNC_TRAINING": "original"}, clear=True):
+            with runtime.temporary_environment({"HYPER_RL_ASYNC_TRAINING": "1", "ASYNC_AUDIT_PATH": "capture"}):
+                with runtime.temporary_environment({"HYPER_RL_ASYNC_TRAINING": None}):
+                    self.assertNotIn("HYPER_RL_ASYNC_TRAINING", os.environ)
+                self.assertEqual(os.environ["HYPER_RL_ASYNC_TRAINING"], "1")
+                self.assertEqual(os.environ["ASYNC_AUDIT_PATH"], "capture")
+            self.assertEqual(dict(os.environ), {"HYPER_RL_ASYNC_TRAINING": "original"})
+
+    def test_failed_startup_restores_environment_before_next_service(self):
+        with patch.dict(os.environ, {"MODE": "sync"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                with runtime.temporary_environment({"MODE": "async", "HYPER_RL_ASYNC_TRAINING": "1"}):
+                    raise RuntimeError("startup failed")
+            self.assertEqual(dict(os.environ), {"MODE": "sync"})
 
 
 class TestDistributedTeardown(unittest.TestCase):
@@ -93,7 +114,7 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_trainer_cleanup_calls_the_rl_teardown_without_shared_patches(self) -> None:
         """The real Trainer cleanup must reach the RL helper and close every owned service."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         trainer._tracker = tracker
         trainer.rollout_manager = MagicMock()
@@ -104,7 +125,7 @@ class TestDistributedTeardown(unittest.TestCase):
         order.attach_mock(trainer.rollout_manager.close, "manager")
         order.attach_mock(trainer.rollout_engine.close, "engine")
         order.attach_mock(self.destroy, "distributed")
-        trainer._cleanup()
+        trainer.close()
         self.assertEqual(order.mock_calls, [call.tracker(), call.manager(), call.engine(), call.distributed()])
         tracker.finish.assert_called_once_with()
         trainer.rollout_manager.close.assert_called_once_with()
@@ -116,7 +137,7 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_service_failures_still_release_groups_and_reset_state(self) -> None:
         """A failure at each cleanup stage must not prevent later stages from running."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         tracker.finish.side_effect = RuntimeError("tracker failed")
         trainer._tracker = tracker
@@ -128,7 +149,7 @@ class TestDistributedTeardown(unittest.TestCase):
         self.destroy.side_effect = RuntimeError("backend teardown failed")
 
         with self.assertLogs(runtime.logger, level="WARNING") as logs:
-            trainer._cleanup()
+            trainer.close()
 
         self.assertEqual(len(logs.records), 4)
         tracker.finish.assert_called_once_with()
@@ -141,13 +162,13 @@ class TestDistributedTeardown(unittest.TestCase):
 
     def test_partial_initialization_closes_tracker_without_destroying_groups(self) -> None:
         """Cleanup accepts a Trainer that has not created rollout services or a group."""
-        trainer = object.__new__(SyncTrainer)
+        trainer = object.__new__(RunLifecycle)
         tracker = MagicMock()
         trainer._tracker = tracker
         trainer._runtime_started = False
 
-        trainer._cleanup()
-        trainer._cleanup()
+        trainer.close()
+        trainer.close()
 
         tracker.finish.assert_called_once_with()
         self.destroy.assert_not_called()

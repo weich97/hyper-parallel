@@ -18,7 +18,7 @@ import importlib
 import os
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
@@ -984,6 +984,21 @@ class TestSwapGroup(unittest.TestCase):
         sg.protect_alias_tensors(t)
         self.assertTrue(st._keep_on_device)
 
+    def test_protect_alias_tensors_keeps_all_output_aliases(self):
+        """Every registered tensor aliasing a layer output should stay on device."""
+        group = SwapGroup("group0")
+        storage = MagicMock()
+        group._storages.append(storage)
+
+        with patch.object(
+            swap_module,
+            "_collect_device_storage_ptrs",
+            return_value={1, 2, 3},
+        ):
+            group.protect_alias_tensors(sentinel.output)
+
+        storage.protect_alias_storage_ptrs.assert_called_once_with({1, 2, 3})
+
     def test_collect_packable_tensors_empty(self):
         """Test _collect_packable_tensors returns 0 when no tensors are packable."""
         sg = SwapGroup("test_group")
@@ -1267,6 +1282,15 @@ class TestSwapManager(unittest.TestCase):
         self.assertEqual(mgr.get_current_group_name(), "")
         self.assertEqual(mgr._layer_count, 0)
         self.assertIsNone(mgr._copy_stream)
+
+    def test_warn_missing_group_once_is_idempotent(self):
+        """Test warn_missing_group_once emits a single warning per process."""
+        mgr = SwapManager()
+        with patch.object(swap_module.warnings, "warn") as warn_mock:
+            mgr.warn_missing_group_once()
+            mgr.warn_missing_group_once()
+        warn_mock.assert_called_once()
+        self.assertIn("outside an active swap group", warn_mock.call_args.args[0])
 
     def test_ensure_group_creates(self):
         """Test ensure_group creates a new SwapGroup."""

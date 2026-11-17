@@ -29,6 +29,7 @@ class ModelAssetsConfig:
     """Tokenizer and chat-template configuration for text datasets."""
 
     chat_template: Optional[Union[str, Target[Any]]] = None
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     tokenizer: Optional[Target[Any]] = None
 
 
@@ -37,12 +38,14 @@ class DatasetConfig:
     """Dataset target with its model assets and sample transform."""
 
     target: Target[Any]
-    model_assets: ModelAssetsConfig = field(default_factory=ModelAssetsConfig)
+    model_assets: Union[ModelAssetsConfig, Target[Any]] = field(default_factory=ModelAssetsConfig)
     data_transform: Optional[Target[Any]] = None
+    training_mode: Optional[Literal["sft", "pretrain"]] = None
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the Dataset target with runtime Trainer arguments."""
-        return self.target.build(**runtime_kwargs)
+        dataset = self.target.build(**runtime_kwargs)
+        return dataset
 
     def __getattr__(self, name: str) -> Any:
         """Expose configured Dataset options through the wrapped target."""
@@ -53,19 +56,29 @@ class DatasetConfig:
         config = self.target.to_dict()
         config["model_assets"] = _serialize_config_value(self.model_assets)
         config["data_transform"] = _serialize_config_value(self.data_transform)
+        if self.training_mode is not None:
+            config["training_mode"] = self.training_mode
         return config
 
 
 @dataclass
 class DataLoaderConfig:
-    """DataLoader target and its text-batch assembly components."""
+    """DataLoader target and its text-batch assembly components.
+
+    ``load_balance=None`` retains the native loader. A mapping, including an
+    empty one, enables distributed balancing with those configuration options.
+    """
 
     target: Target[Any]
     collate_fn: Optional[Target[Any]] = None
     get_batch: Optional[Target[Any]] = None
-    dataloader_type: Literal["single", "cyclic"] = "single"
+    cost_model: Optional[Target[Any]] = None
+    balancing_algorithm: Optional[Target[Any]] = None
+    load_balance: Optional[dict[str, Any]] = None
+    sampler_type: Literal["single", "cyclic"] = "single"
     data_rearrange_map: Any = None
     data_sharding: bool = False
+    use_background_prefetcher: bool = False
 
     def build(self, **runtime_kwargs: Any) -> Any:
         """Build the DataLoader target with runtime Dataset arguments."""
@@ -80,7 +93,12 @@ class DataLoaderConfig:
         config = self.target.to_dict()
         config["collate_fn"] = _serialize_config_value(self.collate_fn)
         config["get_batch"] = _serialize_config_value(self.get_batch)
-        config["dataloader_type"] = self.dataloader_type
+        config["cost_model"] = _serialize_config_value(self.cost_model)
+        config["balancing_algorithm"] = _serialize_config_value(self.balancing_algorithm)
+        if self.load_balance is not None:
+            config["load_balance"] = _serialize_config_value(self.load_balance)
+        config["sampler_type"] = self.sampler_type
         config["data_rearrange_map"] = _serialize_config_value(self.data_rearrange_map)
         config["data_sharding"] = self.data_sharding
+        config["use_background_prefetcher"] = self.use_background_prefetcher
         return config

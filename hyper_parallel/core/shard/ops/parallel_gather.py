@@ -19,7 +19,7 @@ Distributed implementation for Gather operator.
 from typing import Tuple
 
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.shard.utils import get_group_local_rank
+from hyper_parallel.core.utils.communication import get_group_local_rank
 from .parallel_ops import DistributedOp
 
 
@@ -385,11 +385,6 @@ class GatherNdDistributedOp(DistributedOp):
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for GatherNd operator.
-
-        NOTE: aclop packed-args normalization (for MindSpore aclop operators
-        that pack args as ``(prim, name, (real_args...))``) is handled
-        upstream in ``OpDispatcher._dispatch_layout_infer`` via
-        ``_normalize_aclop_args``. This method receives clean unpacked args.
 
         Args:
             args (tuple): Input arguments (input, indices).

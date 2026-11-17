@@ -14,6 +14,7 @@
 # ============================================================================
 """Activation checkpointing related interfaces (PyTorch backend only)."""
 from .checkpoint import CheckpointError
+from .cpu_offload import PageableSaveOnCpu, copy_to_pageable_cpu
 from .pinned_memory_pool import PinnedMemoryPool
 from .recompute_state import get_recompute_state, is_recomputing
 from .swap import SwapManager
@@ -35,6 +36,7 @@ from .api import (
     recompute_handle,
     recompute_handle_collector_ctx,
     recompute_session_ctx,
+    reentrant_checkpoint_scope,
     swap,
     swap_tensor_wrapper,
     swap_wrapper,
@@ -48,10 +50,12 @@ __all__ = [
     "CheckpointPolicy",
     "CheckpointWrapper",
     "PinnedMemoryPool",
+    "PageableSaveOnCpu",
     "SwapManager",
     "SwapWrapper",
     "base_check_fn",
     "clear_recompute_session",
+    "copy_to_pageable_cpu",
     "checkpoint",
     "checkpoint_exclude_wrapper",
     "checkpoint_wrapper",
@@ -61,6 +65,7 @@ __all__ = [
     "recompute_handle",
     "recompute_handle_collector_ctx",
     "recompute_session_ctx",
+    "reentrant_checkpoint_scope",
     "swap",
     "swap_tensor_wrapper",
     "swap_wrapper",

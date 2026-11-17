@@ -13,11 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpointing helpers for distributed model components."""
+# pylint: disable=forbidden-backend-import
 
+import fnmatch
 import logging
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import torch
@@ -25,6 +28,7 @@ from torch import nn
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
+    checkpoint_exclude_wrapper,
     checkpoint_wrapper,
     create_selective_checkpoint_contexts,
     ignore_sac_ops as _ignore_sac_ops,
@@ -33,7 +37,8 @@ from hyper_parallel.core.activation_memory.swap import (
     SwapManager,
     _teardown_wired_swap_layers,
 )
-
+from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -376,8 +381,9 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
         if func in _SELECTIVE_AC_FORCE_RECOMPUTE_OPS:
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MATMUL_OPS:
-            matmul_counts[ctx.is_recompute] += 1
-            if matmul_counts[ctx.is_recompute] % 2:
+            matmul_count = matmul_counts.get(ctx.is_recompute, 0) + 1
+            matmul_counts[ctx.is_recompute] = matmul_count
+            if matmul_count % 2:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.MUST_RECOMPUTE
         if func in _SELECTIVE_AC_MUST_SAVE_OPS:
@@ -387,13 +393,19 @@ def _make_selective_checkpoint_policy_fn() -> Callable:
     return selective_checkpointing_policy
 
 
-def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]]:
+def make_selective_checkpoint_context_fn(
+        allow_cache_entry_mutation: bool = False,
+) -> Callable[[], tuple[object, object]]:
     """Create a per-checkpoint-region selective activation policy context.
 
     Expensive operations are saved, ordinary operations are recomputed, and
     matmul operations alternate between the two decisions. A new counter is
     created every time the returned factory is invoked, matching the
     ``context_fn`` contract of non-reentrant checkpointing.
+
+    Args:
+        allow_cache_entry_mutation: Whether to accept deterministic in-place
+            rewrites of cached tensors instead of raising.
 
     Returns:
         A no-argument factory that creates the forward and recompute contexts.
@@ -409,7 +421,8 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
             non-reentrant checkpointing ``context_fn`` contract.
         """
         return create_selective_checkpoint_contexts(
-            _make_selective_checkpoint_policy_fn()
+            _make_selective_checkpoint_policy_fn(),
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
 
     return selective_checkpoint_context_fn
@@ -728,7 +741,7 @@ def _detect_kv_sharing_and_maybe_disable_cache(model: nn.Module) -> bool:
 def _try_disable_use_cache(sub_config: Any) -> None:
     """Best-effort disable of ``use_cache`` on one config object."""
     try:
-        sub_config.use_cache = False
+        setattr(sub_config, "use_cache", False)
     except Exception:  # pylint: disable=broad-exception-caught
         # Configuration objects may reject assignment with custom errors.
         pass
@@ -767,6 +780,289 @@ def _validate_activation_checkpoint_config(
         )
 
 
+def _adapter_recompute_spec(model: nn.Module, *, required: bool = True):
+    """Resolve a model-owned recompute declaration without family branches."""
+    config = getattr(model, "config", None)
+    identities = [getattr(config, "model_type", None)]
+    identities.extend(getattr(config, "architectures", None) or ())
+    adapter_spec = None
+    for identity in identities:
+        if not identity:
+            continue
+        adapter_spec = get_model_adapter(identity)
+        if adapter_spec is not None:
+            break
+    provider = getattr(adapter_spec, "recompute", None)
+    if provider is None or not callable(provider):
+        if not required:
+            return None
+        raise ValueError(
+            "activation_checkpoint.selection.source=model_adapter_safe_regions "
+            "requires ModelAdapterSpec.recompute"
+        )
+    recompute_policy = provider()  # pylint: disable=not-callable
+    if not isinstance(recompute_policy, RecomputePolicy):
+        raise TypeError("ModelAdapterSpec.recompute must return RecomputePolicy")
+    return recompute_policy
+
+
+def _validate_selected_layer_indices(
+    layer_indices: Any,
+    blocks: list,
+) -> None:
+    """Validate an explicit list of layer indices against the blocks."""
+    if not isinstance(layer_indices, (list, tuple)) or not layer_indices:
+        raise ValueError(
+            "model-adapter safe recompute layer_indices must be a non-empty sequence"
+        )
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in layer_indices
+    ):
+        raise ValueError(
+            "model-adapter safe recompute layer_indices must contain only "
+            "non-negative integers"
+        )
+    if len(set(layer_indices)) != len(layer_indices):
+        raise ValueError(
+            "model-adapter safe recompute layer_indices must not contain duplicates"
+        )
+    if max(layer_indices) >= len(blocks):
+        raise ValueError(
+            "model-adapter safe recompute layer index "
+            f"{max(layer_indices)} exceeds the maximum index {len(blocks) - 1}"
+        )
+
+
+def _validate_selected_layer_count(
+    layer_count: Any,
+    blocks: list,
+) -> None:
+    """Validate a leading layer count against the blocks."""
+    if isinstance(layer_count, bool) or not isinstance(layer_count, int) or layer_count < 0:
+        raise ValueError(
+            "model-adapter safe recompute layer_count must be a non-negative integer"
+        )
+    if layer_count > len(blocks):
+        raise ValueError(
+            f"adapter recompute layer_count {layer_count} exceeds discovered layers {len(blocks)}"
+        )
+
+
+def _selected_checkpoint_layer_fqns(
+    containers: list[_LayerContainerInfo],
+    selection: Any,
+) -> set[str]:
+    """Select a leading layer count or exact layer indices."""
+    blocks = [block for container in containers for block in container.blocks]
+    layer_count = getattr(selection, "layer_count", None)
+    layer_indices = getattr(selection, "layer_indices", None)
+    if (layer_count is None) == (layer_indices is None):
+        raise ValueError(
+            "model-adapter safe recompute requires exactly one of "
+            "selection.layer_count or selection.layer_indices"
+        )
+    if layer_indices is not None:
+        _validate_selected_layer_indices(layer_indices, blocks)
+        return {blocks[index].fqn for index in layer_indices}
+
+    _validate_selected_layer_count(layer_count, blocks)
+    if layer_count == 0:
+        return set()
+    return {blocks[index].fqn for index in range(layer_count)}
+
+
+def _select_layer_region_roots(
+    module_by_fqn: dict,
+    selected_layer_fqns: set[str],
+    recompute_spec: Any,
+) -> list:
+    """Return the outermost checkpoint region roots inside the selected layers."""
+    matched = [
+        (module_fqn, module)
+        for module_fqn, module in module_by_fqn.items()
+        if module_fqn
+        and any(
+            fnmatch.fnmatchcase(module_fqn, pattern)
+            for pattern in recompute_spec.region_patterns
+        )
+    ]
+    outermost = [
+        (module_fqn, module)
+        for module_fqn, module in matched
+        if not any(
+            module_fqn != other_fqn and module_fqn.startswith(f"{other_fqn}.")
+            for other_fqn, _ in matched
+        )
+    ]
+    return [
+        (module_fqn, module)
+        for module_fqn, module in outermost
+        if any(
+            module_fqn == layer_fqn or module_fqn.startswith(f"{layer_fqn}.")
+            for layer_fqn in selected_layer_fqns
+        )
+    ]
+
+
+def _matches_exclusion(module_fqn: str, module: nn.Module, recompute_spec: Any) -> bool:
+    """Return whether one module is declared to stay outside the recompute region."""
+    if any(
+        fnmatch.fnmatchcase(module_fqn, pattern)
+        for pattern in recompute_spec.exclude_patterns
+    ):
+        return True
+    predicate = recompute_spec.exclude_predicate
+    return bool(predicate is not None and predicate(module_fqn, module))
+
+
+def _select_excluded_targets(
+    module_by_fqn: dict,
+    region_roots: list,
+    recompute_spec: Any,
+) -> list:
+    """Collect the declared descendants that must stay outside the recompute region."""
+    root_fqns = tuple(root_fqn for root_fqn, _ in region_roots)
+    selected_targets = []
+    for module_fqn, module in module_by_fqn.items():
+        if not any(
+            module_fqn == root_fqn or module_fqn.startswith(f"{root_fqn}.")
+            for root_fqn in root_fqns
+        ):
+            continue
+        if _matches_exclusion(module_fqn, module, recompute_spec):
+            selected_targets.append((module_fqn, module))
+    return selected_targets
+
+
+def _wrap_excluded_targets(module_by_fqn: dict, exclude_targets: list) -> int:
+    """Install exclusion wrappers deepest-first; return the wrapped count."""
+    wrapped_count = 0
+    for module_fqn, module in sorted(
+        exclude_targets,
+        key=lambda item: item[0].count("."),
+        reverse=True,
+    ):
+        if _is_checkpoint_wrapped(module):
+            continue
+        parent_fqn, child_name = module_fqn.rsplit(".", 1)
+        setattr(
+            module_by_fqn[parent_fqn],
+            child_name,
+            checkpoint_exclude_wrapper(module),
+        )
+        wrapped_count += 1
+    return wrapped_count
+
+
+def _validate_region_exclusions(roots: list, exclude_targets: list) -> None:
+    """Reject region shapes that would recompute an excluded module or swallow it."""
+    root_fqns = {root_fqn for root_fqn, _ in roots}
+    for module_fqn, _ in exclude_targets:
+        if module_fqn in root_fqns:
+            raise ValueError(
+                f"recompute region root {module_fqn!r} is also excluded "
+                "from the recompute"
+            )
+    root_ids = {id(module) for _, module in roots}
+    for module_fqn, module in exclude_targets:
+        if any(
+            child is not module and id(child) in root_ids
+            for child in module.modules()
+        ):
+            raise ValueError(
+                f"excluded recompute region {module_fqn!r} contains a recompute region root"
+            )
+
+
+def _apply_model_adapter_regions_checkpointing(
+    model: nn.Module,
+    containers: list[_LayerContainerInfo],
+    ac_layers: list[nn.Module],
+    selection: Any,
+    *,
+    enable_compile: bool,
+    swap_inputs: bool,
+    recompute_spec: Optional[RecomputePolicy] = None,
+) -> nn.Module:
+    """Wrap the adapter-declared recompute regions of the selected layers.
+
+    The outermost pattern match inside every selected layer becomes one
+    checkpoint region, so a layer pattern keeps a single saved copy of the layer
+    input. Declared exclusions stay outside the recompute region, which is what
+    lets a cross-layer state producer or consumer live inside a checkpointed
+    layer.
+    """
+    if recompute_spec is None:
+        recompute_spec = _adapter_recompute_spec(model)
+    if not recompute_spec.region_patterns:
+        raise ValueError(
+            "activation_checkpoint.selection.source=model_adapter_safe_regions "
+            "requires RecomputePolicy.region_patterns"
+        )
+    selected_layer_fqns = _selected_checkpoint_layer_fqns(containers, selection)
+    if not selected_layer_fqns:
+        logger.info("Model-adapter recompute selected zero layers")
+        return model
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    checkpoint_kwargs = {"swap_inputs": swap_inputs} if not enable_compile else {}
+
+    module_by_fqn = dict(model.named_modules())
+    roots = _select_layer_region_roots(module_by_fqn, selected_layer_fqns, recompute_spec)
+    if not roots:
+        raise ValueError(
+            "model adapter recompute patterns matched no region in the selected layers"
+        )
+    excluded_count = _wrap_declared_exclusions(module_by_fqn, roots, recompute_spec)
+    wrapped_count = _wrap_region_roots(model, module_by_fqn, roots, checkpoint_kwargs)
+    if swap_inputs and not enable_compile:
+        _register_forward_prefetch_layers(containers)
+    if recompute_spec.on_applied is not None:
+        recompute_spec.on_applied(model)
+    logger.info(
+        "Model-adapter recompute wrapped %d region(s) and excluded %d region(s) "
+        "across %d/%d discovered layers",
+        wrapped_count,
+        excluded_count,
+        len(selected_layer_fqns),
+        len(ac_layers),
+    )
+    return model
+
+
+def _wrap_declared_exclusions(module_by_fqn: dict, roots: list, recompute_spec: Any) -> int:
+    """Validate the declared exclusions of the selected regions and wrap them."""
+    exclude_targets = _select_excluded_targets(module_by_fqn, roots, recompute_spec)
+    # A predicate may select decoder-only exclusions while the chosen regions are visual blocks.
+    if recompute_spec.exclude_patterns and not exclude_targets:
+        raise ValueError(
+            "model adapter recompute exclusions matched no module "
+            "inside the selected regions"
+        )
+    _validate_region_exclusions(roots, exclude_targets)
+    return _wrap_excluded_targets(module_by_fqn, exclude_targets)
+
+
+def _wrap_region_roots(model: nn.Module, module_by_fqn: dict, roots: list, checkpoint_kwargs: dict) -> int:
+    """Wrap every selected region root, deepest first, and return the count."""
+    wrapped_count = 0
+    for module_fqn, module in sorted(
+        roots,
+        key=lambda item: item[0].count("."),
+        reverse=True,
+    ):
+        if _is_checkpoint_wrapped(module):
+            continue
+        parent_fqn, child_name = module_fqn.rsplit(".", 1)
+        parent = module_by_fqn[parent_fqn] if parent_fqn else model
+        setattr(parent, child_name, checkpoint_wrapper(module, **checkpoint_kwargs))
+        wrapped_count += 1
+    if wrapped_count == 0:
+        raise ValueError("model adapter recompute matched no region to wrap")
+    return wrapped_count
+
+
 def _resolve_activation_checkpoint_containers(
     model: nn.Module,
 ) -> list[_LayerContainerInfo]:
@@ -797,6 +1093,7 @@ def _apply_selective_checkpointing(
     *,
     enable_compile: bool,
     swap_inputs: bool,
+    allow_cache_entry_mutation: bool = False,
 ) -> int:
     """Wrap every discovered layer for selective recomputation.
 
@@ -811,6 +1108,8 @@ def _apply_selective_checkpointing(
         enable_compile: Whether the wrapped regions will be compiled.
         swap_inputs: Whether checkpoint inputs should be offloaded in eager
             execution. Ignored in compile mode.
+        allow_cache_entry_mutation: Whether to accept deterministic in-place
+            rewrites of cached tensors instead of raising.
 
     Returns:
         The number of layers, or submodules in the KV-shared fallback, wrapped.
@@ -848,7 +1147,8 @@ def _apply_selective_checkpointing(
     return _wrap_layer_containers(
         containers,
         eager_checkpoint_wrapper,
-        context_fn=make_selective_checkpoint_context_fn(),
+        context_fn=make_selective_checkpoint_context_fn(
+            allow_cache_entry_mutation),
     )
 
 
@@ -881,7 +1181,7 @@ def _apply_full_checkpointing(
         implementation was enabled instead, in which case no per-layer wrapping
         happened and swap prefetch chains must not be registered.
     """
-    if _should_use_hf_native_gradient_checkpointing(
+    if not has_kv_sharing and _should_use_hf_native_gradient_checkpointing(
         model,
         ac_layers,
         enable_compile=enable_compile,
@@ -917,6 +1217,8 @@ def _apply_activation_checkpointing(
     activation_checkpoint: Optional[str],
     enable_compile: bool = False,
     swap_inputs: bool = False,
+    selection: Optional[Any] = None,
+    allow_cache_entry_mutation: bool = False,
 ) -> nn.Module:
     """Apply full or selective recomputation to discovered transformer layers.
 
@@ -934,9 +1236,31 @@ def _apply_activation_checkpointing(
     ac_layers = _flatten_layer_container_infos(containers)
     has_kv_sharing = _detect_kv_sharing_and_maybe_disable_cache(model)
 
+    selection_source = getattr(selection, "source", "default")
+    recompute_spec = None
+    if selection_source == "default" and activation_checkpoint == "full" and not enable_compile:
+        recompute_spec = _adapter_recompute_spec(model, required=False)
+        if recompute_spec is not None:
+            # Model-owned regions also cover non-decoder towers and their replay state.
+            selection = SimpleNamespace(layer_count=len(ac_layers), layer_indices=None)
+            selection_source = "model_adapter_safe_regions"
+    if selection_source == "model_adapter_safe_regions":
+        return _apply_model_adapter_regions_checkpointing(
+            model,
+            containers,
+            ac_layers,
+            selection,
+            enable_compile=enable_compile,
+            swap_inputs=swap_inputs,
+            recompute_spec=recompute_spec,
+        )
+
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
+    # Selective recomputation normally wraps whole layers. KV-shared models
+    # instead use submodule checkpointing so attention does not write the cache
+    # again during backward recomputation.
     if activation_checkpoint == "selective":
         wrapped_count = _apply_selective_checkpointing(
             containers,
@@ -944,6 +1268,7 @@ def _apply_activation_checkpointing(
             has_kv_sharing,
             enable_compile=enable_compile,
             swap_inputs=swap_inputs,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
         _warn_if_nothing_wrapped(wrapped_count, activation_checkpoint, containers)
         logger.info(

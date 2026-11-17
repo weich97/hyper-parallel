@@ -1,0 +1,32 @@
+# Dense MLA CP recipe fragment. Merge into a DeepSeek-V3 training configuration.
+# The model factory/checkpoint, data pipeline and optimizer remain caller choices.
+accelerator:
+  tp_size: 2
+  cp_size: 4
+  sequence_parallel: false  # Optional TP sequence parallelism; both MLA strategies support enabling it.
+  loss_parallel: false
+
+plan_overrides:
+  - match: "model.layers.*.self_attn"
+    replace:
+      kind: module
+      implementation:
+        _target_: hyper_parallel.components.modules.mla_attention.MLAAttention
+  - match: "model.layers.*.self_attn.forward"
+    region_dispatch: false
+    replace:
+      kind: method
+      implementation:
+        _target_: hyper_parallel.models.deepseek_v3.adapter.distributed.context_parallel.mla_cp_wrapper
+        strategy: expanded_ulysses
+        overlap: false  # Enable forward communication overlap for either MLA strategy.
+        # At TP1: 1 selects KV AllGather; intermediate CP divisors select Ulysses x AllGather.
+        # ulysses_degree: 2
+
+fsdp_config:
+  dp_shard_size: 4
+  reshard_after_forward: true
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16

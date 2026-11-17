@@ -21,24 +21,31 @@ plan/apply sharding -> activation checkpoint/swap -> FSDP2 ->
 materialize/load -> compile. This module consumes only normalized
 AutoModels objects and never imports trainer config (05 §15.2.6).
 """
+# pylint: disable=forbidden-backend-import
 
+import fnmatch
 import logging
 from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
-from transformers import PreTrainedModel
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+)
 from hyper_parallel.components.checkpoint.weight_conversion import (
     get_model_conversion_mapping,
 )
 
 from hyper_parallel.models._transformers.checkpoint_loader import (
-    CheckpointManager,
     _finalize_model_loading,
 )
 from hyper_parallel.models.build_options import CompileConfig
+from hyper_parallel.models.materialization import (
+    MaterializationContext,
+    rebuild_materialized_state,
+)
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
@@ -58,8 +65,16 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.models.registry import _resolve_custom_model_cls
-from hyper_parallel.models.replacement import _apply_module_replacement_actions
+from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
+from hyper_parallel.models.external_state import (
+    ExternalBuildContext,
+    ExternalLoadContext,
+    get_model_external_state,
+)
+from hyper_parallel.models.replacement import (
+    _apply_module_replacement_actions,
+    apply_method_replacements,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +82,24 @@ logger = logging.getLogger(__name__)
 def instantiate_infrastructure(
     distributed_setup: Optional[DistributedSetup] = None,
     device: Optional[torch.device] = None,
+    compile_config: Optional[CompileConfig] = None,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
     """Instantiate distributed infrastructure components.
 
     Following design doc 01 §8.2.
 
+    Args:
+        distributed_setup: Normalized topology and planner settings.
+        device: Device selected for later model materialization.
+        **kwargs: Reserved build options.
+
     Returns:
         (sharding_planner, fsdp2_manager) tuple.
+
+    Args:
+        distributed_setup: Distributed training configuration.
+        device: Target device.
     """
     del kwargs, device
     # ShardingPlanner — already implemented in distributed/_builder.
@@ -91,10 +116,18 @@ def instantiate_infrastructure(
         allow_uncovered_params=getattr(
             distributed_setup, "allow_uncovered_params", False))
 
+    graph_mode_requested = (
+        compile_config.selects_graph_compiler()
+        if compile_config is not None
+        else False
+    )
+
     # FSDP2Manager: build from strategy config if available
     fsdp2_manager = None
     mesh = distributed_setup.mesh_context if distributed_setup is not None else None
     strategy_cfg = distributed_setup.strategy_config if distributed_setup is not None else None
+    if graph_mode_requested:
+        strategy_cfg = None
     if strategy_cfg is not None:
         fsdp2_manager = _instantiate_fsdp2(
             config=strategy_cfg,
@@ -118,9 +151,8 @@ def _init_model(
     torch_dtype,
     is_hf_model: bool,
     *model_args,
-    backend=None,
     **kwargs,
-) -> tuple[bool, PreTrainedModel]:
+) -> tuple[bool, nn.Module]:
     """Initialize model — dispatching to custom or HF path.
 
     Following design doc 01 §7.
@@ -133,14 +165,11 @@ def _init_model(
         torch_dtype: "auto" / "bfloat16" / etc.
         is_hf_model: True = HF native, False = custom implementation.
         *model_args: Extra positional args for model constructor.
-        backend: Backend configuration (reserved for interface compatibility
-            with HyperAutoModel.from_pretrained; not used yet).
         **kwargs: Extra keyword args.
 
     Returns:
         (is_custom_model, model)
     """
-    _ = backend  # Reserved for interface compatibility; not used yet.
     architectures = getattr(hf_config, "architectures", []) or []
     arch_name = architectures[0] if architectures else ""
 
@@ -283,8 +312,11 @@ def _initialize_model_weights(model: nn.Module) -> None:
     """Initialize materialized state through the model's native contract."""
     for module in model.modules():
         module._is_hf_initialized = False  # pylint: disable=W0212
+    external = get_model_external_state(model)
+    external_ids = {id(parameter) for parameter in external.parameters.values()} if external else set()
     for tensor in (*model.parameters(), *model.buffers()):
-        tensor._is_hf_initialized = False  # pylint: disable=W0212
+        if id(tensor) not in external_ids:
+            tensor._is_hf_initialized = False  # pylint: disable=W0212
 
     initialize_weights = getattr(model, "initialize_weights", None)
     native_initialization = callable(initialize_weights)
@@ -331,11 +363,11 @@ def _build_replacement_context(
         "cp": getattr(mesh_context, "cp_size", 1) > 1,
         "ep": getattr(mesh_context, "ep_size", 1) > 1,
         "pp": getattr(mesh_context, "pp_size", 1) > 1,
+        "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
     }
 
 
 def _apply_pre_sharding_features(
-    model: nn.Module,
     peft_config: Optional[Any],
     qat_config: Optional[Any],
     fp8_config: Optional[Any],
@@ -349,6 +381,74 @@ def _apply_pre_sharding_features(
         logger.warning("FP8 not implemented in stub")
 
 
+def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
+    """Freeze the parameters of every module whose FQN matches ``freeze_config``.
+
+    Runs after module replacement and **before** plan/FSDP derivation: FSDP decides
+    which parameters join the gradient reduction from ``requires_grad``, so freeing
+    the tower later would leave it in the all-reduce while its weights never move.
+    A frozen tower also stops autograd at its output, so its backward pass and its
+    saved activations disappear entirely -- which is the point when comparing
+    against a pipeline that freezes the same tower.
+
+    Args:
+        model: The model being built.
+        freeze_config: One module-name glob or a list of them (``fnmatch`` against
+            the fully qualified module name), e.g. ``["model.vision_tower*"]``.
+
+    Raises:
+        ValueError: If no module matches. A silently unfrozen tower would invalidate
+            any A/B built on top of it, so fail loudly instead.
+    """
+    patterns = [freeze_config] if isinstance(freeze_config, str) else list(freeze_config)
+    if not patterns:
+        return
+    matched, frozen_tensors, frozen_numel = [], 0, 0
+    for name, module in model.named_modules():
+        if not name or not any(fnmatch.fnmatch(name, pattern) for pattern in patterns):
+            continue
+        # Track the match itself, not "did we newly freeze something": an already-frozen
+        # tower must not be reported as a misspelled pattern on a second call.
+        matched.append(name)
+        for parameter in module.parameters(recurse=True):
+            if parameter.requires_grad:
+                parameter.requires_grad = False
+                frozen_tensors += 1
+                frozen_numel += parameter.numel()
+    if not matched:
+        raise ValueError(
+            f"freeze_config={patterns!r} matched no parameter in the model; the names are "
+            "matched with fnmatch against each module's fully qualified name "
+            "(e.g. 'model.vision_tower*')"
+        )
+    logger.info(
+        "Froze %d parameter tensors (%.1fM elements) under %d module(s) matching %s",
+        frozen_tensors, frozen_numel / 1e6, len(matched), patterns,
+    )
+
+
+def _apply_materialization_adapter(model: nn.Module) -> None:
+    """Let a family adapter declare derived state on native or custom models."""
+    config = getattr(model, "config", None)
+    identities = [getattr(config, "model_type", None)]
+    identities.extend(getattr(config, "architectures", None) or ())
+    adapter_spec = None
+    for identity in identities:
+        if not identity:
+            continue
+        adapter_spec = get_model_adapter(identity)
+        if adapter_spec is not None:
+            break
+    provider = getattr(adapter_spec, "materialization", None)
+    if provider is None:
+        return
+    if not callable(provider):
+        raise TypeError("ModelAdapterSpec.materialization must be callable")
+    result = provider(model)  # pylint: disable=not-callable
+    if result is not None:
+        raise TypeError("ModelAdapterSpec.materialization must mutate the model and return None")
+
+
 def _apply_activation_features(
     model: nn.Module,
     activation_checkpoint: Optional[str],
@@ -356,14 +456,25 @@ def _apply_activation_features(
     compile_for_execution: bool,
     mesh: Optional[MeshContext],
     swap_inputs: bool = False,
+    selection: Optional[Any] = None,
+    allow_cache_entry_mutation: bool = False,
+    apply_checkpoint: bool = True,
 ) -> nn.Module:
-    """Apply activation checkpointing and attention swap in execution order."""
-    if activation_checkpoint not in (None, "off"):
+    """Apply activation checkpointing and attention swap in execution order.
+
+    ``apply_checkpoint`` is False in graph mode: the joint-graph
+    ``ActivationCheckpointPass`` owns recompute, so the live model must stay
+    unwrapped. The requested mode is still passed to the attention-swap
+    validation so incompatible combinations keep failing.
+    """
+    if apply_checkpoint and activation_checkpoint not in (None, "off"):
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
             swap_inputs=swap_inputs,
+            selection=selection,
+            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
     validate_attention_swap(
         activation_swap,
@@ -387,13 +498,172 @@ def _materialize_and_load_model(
     model = _move_model_to_device(model, is_meta_device, device)
     if not is_meta_device:
         return model
+    external = get_model_external_state(model)
+    external_result = None
+    if external is not None:
+        external_result = external.materialize(ExternalLoadContext(
+            load_base_model=load_base_model,
+            pretrained_path=pretrained_path,
+            weights_mapping=weights_mapping,
+        ))
+        if external_result.target_fqns != frozenset(external.parameters):
+            raise RuntimeError("External materialization did not cover exactly its parameters")
     if load_base_model:
-        load_report = CheckpointManager(model).load_checkpoint(
-            pretrained_path, strict=False, weights_mapping=weights_mapping
+        state = {"model": model}
+        HuggingFaceCheckpointer(weights_mapping=weights_mapping).load(
+            pretrained_path, state, strict_model=False,
+            external_target_fqns=(external_result.target_fqns if external_result else frozenset()),
+            claimed_source_keys=(external_result.source_keys if external_result else frozenset()),
         )
-        _finalize_model_loading(model, load_report, strict=True)
+        load_report = state["load_report"]
+        if external_result is not None:
+            load_report = type(load_report)(
+                loaded_keys=tuple(sorted(set(load_report.loaded_keys) | external_result.target_fqns)),
+                missing_keys=load_report.missing_keys,
+                unexpected_keys=load_report.unexpected_keys,
+            )
+        load_report = _finalize_model_loading(model, load_report, strict=True)
+        model._hp_checkpoint_load_report = load_report  # pylint: disable=protected-access
+        reason = "checkpoint_load"
     else:
+        fingerprint = getattr(external, "weight_digests", None)
+        before_init = fingerprint() if fingerprint is not None else None
         _initialize_model_weights(model)
+        if fingerprint is not None and fingerprint() != before_init:
+            raise RuntimeError("External model parameters changed during ordinary weight initialization")
+        reason = "random_init"
+    rebuild_materialized_state(
+        model,
+        MaterializationContext(
+            reason=reason,
+            device=torch.device(device),
+            strict=True,
+        ),
+    )
+    if external is not None:
+        external.check_identities()
+    return model
+
+
+def _validate_external_state_build(external: Any, compile_for_execution: bool,
+                                   distributed_setup: Any,
+                                   fsdp2_manager: Optional[FSDP2Manager],
+                                   model_init_dtype: Optional[torch.dtype]) -> None:
+    """Reject unsupported optimizer, compile, and FSDP precision settings."""
+    if external is None:
+        return
+    if compile_for_execution:
+        raise ValueError("External Host state does not support torch.compile")
+    fp32_main_params = getattr(distributed_setup, "fp32_main_params", None)
+    expected_reduce_dtype = {
+        (torch.float32, True): "float32",
+        (torch.bfloat16, False): "bfloat16",
+    }.get((model_init_dtype, fp32_main_params))
+    if expected_reduce_dtype is None:
+        raise ValueError("External Host state requires float32 with fp32 main parameters "
+                         "or bfloat16 without fp32 main parameters")
+    precision = getattr(getattr(fsdp2_manager, "config", None), "mix_precision", None)
+    if (precision is None or precision.param_dtype != "bfloat16"
+            or precision.reduce_dtype != expected_reduce_dtype
+            or precision.cast_forward_inputs or precision.output_dtype is not None):
+        raise ValueError(f"External Host state requires BF16 forward and {expected_reduce_dtype} reduction policy")
+
+
+def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
+                           source_shard_info: Any, device: Optional[torch.device],
+                           is_meta_device: bool, model_init_dtype: Optional[str],
+                           validate_placement: bool, compile_for_execution: bool,
+                           distributed_setup: Any, fsdp2_manager: Optional[FSDP2Manager]) -> Any:
+    """Create and validate the model-owned external state after sharding."""
+    config = getattr(model, "config", None)
+    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
+    adapter_spec = None
+    for identity in identities:
+        if identity:
+            adapter_spec = get_model_adapter(identity)
+            if adapter_spec is not None:
+                break
+    provider = getattr(adapter_spec, "external_state", None)
+    if provider is None:
+        return None
+    resolved_dtype = _resolve_model_init_dtype(model_init_dtype)
+    external = provider(model, ExternalBuildContext(  # pylint: disable=not-callable
+        mesh_context=mesh,
+        source_shard_info=source_shard_info,
+        init_device=device if is_meta_device else None,
+        model_init_dtype=resolved_dtype,
+        validate_placement=validate_placement,
+    ))
+    model._hp_external_state = external  # pylint: disable=protected-access
+    _validate_external_state_build(external, compile_for_execution, distributed_setup, fsdp2_manager, resolved_dtype)
+    return external
+
+
+def _maybe_apply_module_replacements(
+    model: nn.Module,
+    distributed_setup: Optional[Any],
+    low_precision_config: Optional[Any],
+    load_base_model: bool,
+    weights_mapping: Any,
+) -> tuple:
+    """Apply native structure-preserving replacements."""
+    return _apply_module_replacement_actions(
+        model,
+        getattr(distributed_setup, "module_replacements", None),
+        weights_mapping=weights_mapping,
+        context=_build_replacement_context(distributed_setup, low_precision_config),
+        capture_checkpoint_metadata=load_base_model,
+    )
+
+
+def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
+    """Establish declared parameter aliases before distributed wrapping.
+
+    Args:
+        model: Constructed model whose static tied-weight mapping is available.
+
+    Raises:
+        ValueError: If the model cannot establish its declared parameter aliases.
+    """
+    tied_mapping = getattr(model, "all_tied_weights_keys", None) or {}
+    if not tied_mapping:
+        return
+    tie_weights = getattr(model, "tie_weights", None)
+    if not callable(tie_weights):
+        raise ValueError("Model declares tied weights but has no callable tie_weights()")
+    tie_weights(recompute_mapping=False)
+    for target_name, source_name in tied_mapping.items():
+        target = model.get_parameter_or_buffer(target_name)
+        source = model.get_parameter_or_buffer(source_name)
+        if target is not source:
+            raise ValueError(
+                "Model tie_weights() did not establish parameter identity for "
+                f"{target_name} and {source_name}"
+            )
+
+
+def _apply_fsdp2_with_external(
+    model: nn.Module,
+    fsdp2_manager: Optional[FSDP2Manager],
+    source_shard_info: Any,
+    external: Optional[Any],
+) -> nn.Module:
+    """Wrap FSDP2 around the model, excluding external-state parameters."""
+    ignored_params = set(external.parameters.values()) if external is not None else None
+    # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
+    # as DTensors, and FSDP derives their source layouts directly.
+    model = _apply_fsdp2(
+        model,
+        fsdp2_manager,
+        source_shard_info,
+        ignored_params=ignored_params,
+    )
+    if fsdp2_manager is None and source_shard_info is not None:
+        # Local graph parameters retain the planner's source layout for
+        # gradient synchronization and global norm accounting.
+        setattr(model, "_source_shard_info", source_shard_info)
+    if external is not None:
+        model._hp_external_state = external  # pylint: disable=protected-access
     return model
 
 
@@ -408,8 +678,10 @@ def apply_model_infrastructure(
     freeze_config: Optional[Any] = None,
     compile_config: Optional[Union[CompileConfig, dict]] = None,
     activation_checkpoint: Optional[str] = None,
+    activation_checkpoint_selection: Optional[Any] = None,
     activation_swap: str = "none",
     swap_inputs: bool = False,
+    allow_cache_entry_mutation: bool = False,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -420,35 +692,43 @@ def apply_model_infrastructure(
     model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
     **kwargs: Any,
 ) -> nn.Module:
-    """Apply model infrastructure (sharding, recompute, FSDP2, and compile).
+    """Apply sharding, activation wrappers, FSDP2, initialization and compilation.
 
-    The execution order is: parallel layout -> recompute wrappers -> FSDP2 ->
-    materialization/loading -> per-layer compile. Placement validation keeps
-    the DTensor placement path and skips compile, while FSDP2 consumes DTensor
-    parameter layouts in both modes.
+    The execution order is: parallel layout -> activation wrappers -> FSDP2 ->
+    materialization/loading -> model_init_dtype conversion -> per-layer compile.
+    Placement validation keeps the DTensor placement path and skips compile;
+    FSDP2 consumes DTensor parameter layouts in both modes.
     """
 
     distributed_setup = kwargs.get("distributed_setup")
-
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
     )
-    _apply_pre_sharding_features(
-        model, peft_config, qat_config, fp8_config
+    graph_mode_requested = bool(
+        compile_config is not None and compile_config.selects_graph_compiler()
     )
+    _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
 
-    # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
-    model, weights_mapping = _apply_module_replacement_actions(
-        model,
-        getattr(distributed_setup, "module_replacements", None),
-        weights_mapping=weights_mapping,
-        context=_build_replacement_context(distributed_setup, low_precision_config),
-        capture_checkpoint_metadata=load_base_model,
+    model, weights_mapping = _maybe_apply_module_replacements(
+        model, distributed_setup, low_precision_config,
+        load_base_model, weights_mapping,
     )
+    if is_meta_device:
+        _apply_materialization_adapter(model)
+
+    _tie_model_weights_before_parallelism(model)
 
     if freeze_config is not None:
-        logger.warning("Parameter freezing not implemented in stub")
+        _apply_parameter_freezing(model, freeze_config)
+
+    method_context = _build_replacement_context(distributed_setup, low_precision_config)
+    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
+    apply_method_replacements(
+        model,
+        getattr(distributed_setup, "method_replacements", None) or (),
+        context=method_context,
+    )
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
@@ -460,22 +740,16 @@ def apply_model_infrastructure(
     )
 
     model = _apply_activation_features(
-        model,
-        activation_checkpoint,
-        activation_swap,
-        compile_for_execution,
-        mesh,
-        swap_inputs=swap_inputs,
+        model, activation_checkpoint, activation_swap, compile_for_execution, mesh,
+        swap_inputs=swap_inputs, selection=activation_checkpoint_selection,
+        allow_cache_entry_mutation=allow_cache_entry_mutation, apply_checkpoint=not graph_mode_requested,
     )
-    # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
-    # as DTensors, and FSDP derives their source layouts directly.
-    model = _apply_fsdp2(
-        model,
-        fsdp2_manager,
-        source_shard_info,
+    external = _create_external_state(
+        model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
+        validate_placement, compile_for_execution, distributed_setup, fsdp2_manager,
     )
+    model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
-    # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _materialize_and_load_model(
         model,
         is_meta_device=is_meta_device,
@@ -488,8 +762,9 @@ def apply_model_infrastructure(
     # Final dtype conversion belongs to the atomic build (05 stage-5 item
     # 5): the Trainer never patches model dtype after construction.
     apply_model_init_dtype(model, model_init_dtype)
+    if external is not None:
+        external.check_identities()
 
-    # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:
         model = apply_compile(model, compile_config)
 
@@ -553,24 +828,60 @@ def _refresh_hsdp_precision_state(model: nn.Module) -> None:
             hsdp_param.init_dtype_attrs(hsdp_state.mp_policy)
 
 
-def _validate_model_init_dtype(
+def _model_fp32_parameter_ids(model: nn.Module) -> set[int]:
+    """Collect parameters declared by modules through local ``fp32_parameter_names``."""
+    return {
+        id(parameter)
+        for module in model.modules()
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False)
+        if name in getattr(module, "fp32_parameter_names", ())
+    }
+
+
+def _validate_model_state_dtype(
         model: nn.Module,
         target_dtype: torch.dtype,
 ) -> None:
-    """Validate floating model parameters and buffers after conversion."""
+    """Validate floating model parameters and buffers against a resolved dtype."""
+    external = get_model_external_state(model)
+    external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
+    fp32_ids = _model_fp32_parameter_ids(model)
     mismatched = [
         name
-        for name, tensor in (
-            list(model.named_parameters(remove_duplicate=False))
-            + list(model.named_buffers(remove_duplicate=False))
-        )
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
+        for name, tensor in model.named_parameters(remove_duplicate=False)
+        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
+        and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
     ]
+    mismatched.extend(
+        name for name, tensor in model.named_buffers(remove_duplicate=False)
+        if tensor.is_floating_point() and tensor.dtype != target_dtype
+    )
     if mismatched:
         raise RuntimeError(
-            "Model initialization dtype conversion failed for: "
+            "Model initialization dtype validation failed for: "
             f"{', '.join(sorted(mismatched))}"
         )
+
+
+def validate_model_init_dtype(
+        model: nn.Module,
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]],
+) -> None:
+    """Validate model state without converting live parameters.
+
+    Use this after checkpoint restore, when FSDP and optimizer objects already
+    reference the model parameters. Dtype conversion belongs to the atomic model
+    build before those runtime relationships are established.
+
+    Args:
+        model: Model whose floating parameters and buffers are validated.
+        model_init_dtype: Required initialization dtype, or ``None`` to disable
+            validation.
+    """
+    target_dtype = _resolve_model_init_dtype(model_init_dtype)
+    if target_dtype is None:
+        return
+    _validate_model_state_dtype(model, target_dtype)
 
 
 def apply_model_init_dtype(
@@ -617,4 +928,34 @@ def apply_model_init_dtype(
             )
 
     _refresh_hsdp_precision_state(model)
-    _validate_model_init_dtype(model, target_dtype)
+    _validate_model_state_dtype(model, target_dtype)
+
+
+def _validate_optimize_dtype(
+        model: nn.Module,
+        fp32_main_params: bool,
+) -> None:
+    """Reject FP16 parameters without FP32 main parameters.
+
+    This check runs after model loading and ``model_init_dtype`` conversion,
+    before optimizer construction, so model initialization choices determine
+    whether optimizer updates use fp32 parameters.
+    """
+    if fp32_main_params:
+        return
+
+    fp16_parameters = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.dtype == torch.float16
+    ]
+    if not fp16_parameters:
+        return
+
+    parameter_summary = ", ".join(fp16_parameters[:5])
+    if len(fp16_parameters) > 5:
+        parameter_summary += ", ..."
+    raise ValueError(
+        "FP16 optimizer updates require optimizer.fp32_main_params=true; "
+        f"found FP16 parameters: {parameter_summary}. Set model_init_dtype: bfloat16 or float32."
+    )

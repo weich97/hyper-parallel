@@ -1,0 +1,481 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""CPU tests for the DeepSeek-V4.1 clamped grouped-GEMM EP adapter."""
+# pylint: disable=wrong-import-position
+
+import copy
+import unittest
+from itertools import product
+from types import MethodType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
+import yaml
+from torch.nn import functional
+
+try:
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
+except ImportError as exc:
+    raise unittest.SkipTest(f"DeepSeek-V4 Transformers dependency unavailable: {exc}") from exc
+
+from hyper_parallel.components import functional as hp_functional
+from hyper_parallel.distributed._builder.rule_resolver import _resolve_local_compute_fn
+from hyper_parallel.distributed.expert_parallel.experts import _local_swiglu_expert_forward
+from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
+    _checkpointed_grouped_expert_forward,
+    _deepseek_v41_grouped_expert_forward,
+    _routed_and_shared_forward,
+    deepseek_v41_ep_compute_fn,
+)
+from hyper_parallel.trainer.config.parallelism import PlanOverride, entries_to_plan_overrides
+from hyper_parallel.trainer.config.resolver import resolve_component
+from tests.common.mark_utils import arg_mark
+
+
+# This fixture exercises the installed package's configuration contract, not the
+# contents of repository-only training examples.
+_EP_OVERRIDE_YAML = """
+match: "*.mlp.forward"
+when: ep
+region_dispatch: false
+replace:
+  kind: method
+  implementation:
+    _target_: >-
+      hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+    use_grouped_gemm: {use_grouped_gemm}
+"""
+
+
+def _expert_config() -> DeepseekV4Config:
+    """Build an expert-only configuration independent of the native LM and aux loss."""
+    return DeepseekV4Config(  # pylint: disable=unexpected-keyword-arg
+        hidden_size=16, moe_intermediate_size=24, n_routed_experts=4, swiglu_limit=1.5,
+    )
+
+
+class TestV41ClampedGroupedGemm(unittest.TestCase):
+    """Verify grouped GEMM retains the authoritative V4.1 clamp semantics."""
+
+    @staticmethod
+    def _cpu_grouped_matmul(
+            inputs: torch.Tensor,
+            weight: torch.Tensor,
+            *,
+            bias: None,
+            group_list: torch.Tensor,
+            group_type: int,
+            group_list_type: int,
+    ) -> torch.Tensor:
+        """Emulate m-axis grouped GEMM while retaining ordinary autograd."""
+        del bias, group_type, group_list_type
+        outputs = []
+        group_start = 0
+        for expert_id, group_end in enumerate(group_list.tolist()):
+            outputs.append(inputs[group_start:group_end] @ weight[expert_id])
+            group_start = group_end
+        return torch.cat(outputs, dim=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_single_local_expert_avoids_permutation_and_recomputes_math(self) -> None:
+        """
+        Feature: Single-expert dispatch and bounded local recomputation.
+        Description: Run the actual local EP entry with one expert and checkpointed grouped math.
+        Expectation: No permutation occurs and all outputs and gradients match the uncheckpointed oracle.
+        """
+        torch.manual_seed(87)
+        for rows in (0, 7):
+            with self.subTest(rows=rows):
+                config = _expert_config()
+                config.n_routed_experts = config.num_local_experts = 1
+                experts = DeepseekV4Experts(config)
+                for parameter in experts.parameters():
+                    torch.nn.init.normal_(parameter)
+                reference = copy.deepcopy(experts)
+                experts.local_expert_count = 1
+                experts._ep_use_grouped_gemm = True
+                experts.use_fused_swiglu = True
+                experts.forward_expert_major = MethodType(_checkpointed_grouped_expert_forward, experts)
+                inputs = torch.randn(rows, config.hidden_size, requires_grad=True)
+                oracle_inputs = inputs.detach().clone().requires_grad_()
+                indices = torch.zeros(rows, dtype=torch.long)
+                grouped = Mock(side_effect=self._cpu_grouped_matmul)
+                with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}), patch(
+                        "hyper_parallel.distributed.expert_parallel.experts._argsort_keys",
+                        side_effect=AssertionError("Single local expert must not sort")):
+                    actual = _local_swiglu_expert_forward(experts, inputs, indices)
+                    self.assertEqual(grouped.call_args_list[0].args[0].data_ptr(), inputs.data_ptr())
+                    actual.sum().backward()
+                gate, up = functional.linear(  # pylint: disable=not-callable
+                    oracle_inputs, reference.gate_up_proj[0],
+                ).chunk(2, dim=-1)
+                expected = functional.linear(  # pylint: disable=not-callable
+                    functional.silu(gate.clamp(max=experts.limit)) * up.clamp(-experts.limit, experts.limit),
+                    reference.down_proj[0],
+                )
+                expected.sum().backward()
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(inputs.grad, oracle_inputs.grad)
+                for parameter, oracle in zip(experts.parameters(), reference.parameters()):
+                    torch.testing.assert_close(parameter.grad, oracle.grad)
+                self.assertGreater(grouped.call_count, 2)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ep_preserves_shared_checkpoint_without_replaying_dispatch(self) -> None:
+        """
+        Feature: DSpark shared-expert checkpoint policy after EP replacement.
+        Description: Recompute the shared branch while keeping routed communication outside its region.
+        Expectation: Dispatch runs once and shared expert values and gradients match direct execution.
+        """
+        module = torch.nn.Module()
+        module.shared_experts = torch.nn.Sequential(torch.nn.Linear(6, 12), torch.nn.SiLU(), torch.nn.Linear(12, 6))
+        module.recompute_shared_experts = True
+        oracle = copy.deepcopy(module)
+        inputs = torch.randn(1, 4, 6, requires_grad=True)
+        oracle_inputs = inputs.detach().clone().requires_grad_()
+        shared_calls = []
+        handle = module.shared_experts.register_forward_pre_hook(lambda *_args: shared_calls.append(True))
+        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        with patch(prefix + ".ep_routed_forward", side_effect=lambda _module, states, **_kwargs: states * .25) as route:
+            actual = _routed_and_shared_forward(module, inputs, None, None, ep_size=1)
+            actual.sum().backward()
+        handle.remove()
+        expected = oracle_inputs * .25 + oracle.shared_experts(oracle_inputs)
+        expected.sum().backward()
+        self.assertEqual(route.call_count, 1)
+        self.assertEqual(len(shared_calls), 2)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(inputs.grad, oracle_inputs.grad)
+        for parameter, reference in zip(module.parameters(), oracle.parameters()):
+            torch.testing.assert_close(parameter.grad, reference.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_hf_grouped_forward_and_backward_preserve_clamp(self) -> None:
+        """
+        Feature: Native grouped expert activation clamping.
+        Description: Compare the CPU grouped-mm fallback with an explicit clamped expert oracle.
+        Expectation: Outputs and input, routing weight, and parameter gradients match the oracle.
+        """
+        torch.manual_seed(82)
+        config = _expert_config()
+        config._experts_implementation = "grouped_mm"  # pylint: disable=protected-access
+        experts = DeepseekV4Experts(config)
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter)
+        reference = copy.deepcopy(experts)
+        inputs = torch.randn(3, config.hidden_size, requires_grad=True)
+        expected_inputs = inputs.detach().clone().requires_grad_()
+        indices = torch.tensor([[0, 1], [1, 2], [2, 0]])  # Expert 3 is empty.
+        weights = torch.rand(3, 2, requires_grad=True)
+        expected_weights = weights.detach().clone().requires_grad_()
+        output = experts(inputs, indices, weights)
+        expected = torch.zeros_like(expected_inputs)
+        for expert_id in range(config.n_routed_experts):
+            gate, up = functional.linear(  # pylint: disable=not-callable
+                expected_inputs, reference.gate_up_proj[expert_id],
+            ).chunk(2, dim=-1)
+            intermediate = functional.silu(gate.clamp(max=config.swiglu_limit)) * up.clamp(
+                min=-config.swiglu_limit, max=config.swiglu_limit,
+            )
+            projected = functional.linear(intermediate, reference.down_proj[expert_id])  # pylint: disable=not-callable
+            route_weight = ((indices == expert_id) * expected_weights).sum(-1, keepdim=True)
+            expected = expected + projected * route_weight
+        upstream = torch.randn_like(output)
+        (output * upstream).sum().backward()
+        (expected * upstream).sum().backward()
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(inputs.grad, expected_inputs.grad)
+        torch.testing.assert_close(weights.grad, expected_weights.grad)
+        for actual, oracle in zip(experts.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, oracle.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_grouped_forward_and_backward_match_clamped_oracle(self) -> None:
+        """
+        Feature: Model-owned grouped expert activation.
+        Description: Exercise FP32 and BF16 grouped execution with enabled and disabled clamps.
+        Expectation: Outputs and gradients match an independent FP32 activation oracle.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            for limit in (-1.0, 0.0, 1.5, 10.0):
+                with self.subTest(dtype=dtype, limit=limit):
+                    self._check_grouped_parity(dtype, limit)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_packed_grouped_forward_and_backward_match_oracle(self) -> None:
+        """
+        Feature: Packed activation in the grouped expert adapter.
+        Description: Enable bounded activation between the grouped GEMMs.
+        Expectation: Input and expert parameter gradients match the ordinary clamped path.
+        """
+        for dtype in (torch.float32, torch.bfloat16):
+            for limit in (-1.0, 1.5, 10.0):
+                with self.subTest(dtype=dtype, limit=limit):
+                    self._check_grouped_parity(dtype, limit, fused=True)
+
+    def _check_grouped_parity(self, dtype: torch.dtype, limit: float, fused: bool = False) -> None:
+        """Compare packed projections around the official FP32 activation formula."""
+        torch.manual_seed(83)
+        config = _expert_config()
+        config.swiglu_limit = limit
+        experts = DeepseekV4Experts(config).to(dtype=dtype)
+        experts.use_fused_swiglu = fused
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter)
+        reference = copy.deepcopy(experts)
+        counts = torch.tensor([2, 0, 3, 1])
+        inputs = torch.randn(counts.sum(), experts.hidden_dim, dtype=dtype, requires_grad=True)
+        expected_inputs = inputs.detach().clone().requires_grad_()
+        grouped = Mock(side_effect=self._cpu_grouped_matmul)
+        # Patch the lazy export without importing the optional NPU backend on CPU.
+        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
+            output = _deepseek_v41_grouped_expert_forward(experts, inputs, counts)
+        self.assertEqual(grouped.call_count, 2)
+        self.assertEqual(output.dtype, dtype)
+        for call in grouped.call_args_list:
+            self.assertEqual(call.args[0].dtype, dtype)
+            self.assertIsNone(call.kwargs["bias"])
+            self.assertEqual(call.kwargs["group_type"], 0)
+            self.assertEqual(call.kwargs["group_list_type"], 0)
+            torch.testing.assert_close(call.kwargs["group_list"], counts.cumsum(0))
+
+        expected_parts = []
+        group_start = 0
+        for expert_id, token_count in enumerate(counts.tolist()):
+            group_end = group_start + token_count
+            gate, up = functional.linear(  # pylint: disable=not-callable
+                expected_inputs[group_start:group_end], reference.gate_up_proj[expert_id],
+            ).chunk(2, dim=-1)
+            gate, up = gate.float(), up.float()
+            if limit > 0:
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            intermediate = functional.silu(gate) * up
+            expected_parts.append(
+                functional.linear(  # pylint: disable=not-callable
+                    intermediate.to(dtype),
+                    reference.down_proj[expert_id],
+                )
+            )
+            group_start = group_end
+        expected = torch.cat(expected_parts, dim=0)
+        upstream = torch.randn_like(output)
+        (output * upstream).sum().backward()
+        (expected * upstream).sum().backward()
+        torch.testing.assert_close(output, expected)
+        torch.testing.assert_close(inputs.grad, expected_inputs.grad)
+        for actual, oracle in zip(experts.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, oracle.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ep_nonpositive_limit_matches_unclamped_oracle(self) -> None:
+        """
+        Feature: Disabled expert activation clamping.
+        Description: Exercise eager and grouped EP bindings with nonpositive clamp limits.
+        Expectation: Outputs and gradients match the unclamped oracle, including an empty expert.
+        """
+        for dtype, limit, grouped in product((torch.float32, torch.bfloat16), (-1.0, 0.0), (False, True)):
+            with self.subTest(dtype=dtype, limit=limit, grouped=grouped):
+                self._check_nonpositive_ep_parity(dtype, limit, grouped)
+
+    def _check_nonpositive_ep_parity(self, dtype: torch.dtype, limit: float, grouped: bool) -> None:
+        """Compare unsorted local tokens and an empty expert through the real binder."""
+        torch.manual_seed(84)
+        config = _expert_config()
+        config.swiglu_limit = limit
+        experts = DeepseekV4Experts(config).to(dtype=dtype)
+        for parameter in experts.parameters():
+            torch.nn.init.normal_(parameter)
+        reference = copy.deepcopy(experts)
+        parameters = dict(experts.named_parameters())
+        state_keys = set(experts.state_dict())
+        module = SimpleNamespace(
+            gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 1))
+        deepseek_v41_ep_compute_fn(
+            module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+            ep_mesh=ep_mesh, use_grouped_gemm=grouped,
+        )
+        self.assertEqual(set(experts.state_dict()), state_keys)
+        for name, parameter in experts.named_parameters():
+            self.assertIs(parameter, parameters[name])
+        indices = torch.tensor([2, 0, 2, 3, 0, 2])
+        inputs = torch.randn(len(indices), config.hidden_size, dtype=dtype, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_()
+        matmul = Mock(side_effect=self._cpu_grouped_matmul)
+        with patch.dict(hp_functional.__dict__, {"grouped_matmul": matmul}):
+            actual = experts(inputs, indices)
+        self.assertEqual(matmul.call_count, 2 if grouped else 0)
+        expected = torch.zeros_like(reference_inputs)
+        for expert_id in range(config.n_routed_experts):
+            selected = (indices == expert_id).nonzero(as_tuple=True)[0]
+            gate, up = functional.linear(  # pylint: disable=not-callable
+                reference_inputs[selected], reference.gate_up_proj[expert_id],
+            ).float().chunk(2, dim=-1)
+            projected = functional.linear(  # pylint: disable=not-callable
+                (functional.silu(gate) * up).to(dtype), reference.down_proj[expert_id],
+            )
+            expected = expected.index_add(0, selected, projected)
+        upstream = torch.randn_like(actual)
+        (actual * upstream).sum().backward()
+        (expected * upstream).sum().backward()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+        for actual_parameter, reference_parameter in zip(experts.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual_parameter.grad, reference_parameter.grad)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_grouped_bfloat16_rounds_only_after_swiglu(self) -> None:
+        """
+        Feature: Grouped expert BF16 activation precision.
+        Description: Use a BF16 witness that distinguishes FP32 activation from early BF16 rounding.
+        Expectation: Rounding occurs after SwiGLU and matches the exact expected value.
+        """
+        config = SimpleNamespace(
+            num_local_experts=1, hidden_size=1, intermediate_size=1,
+            hidden_act="silu", swiglu_limit=10.0,
+        )
+        experts = DeepseekV4Experts(config).to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            experts.gate_up_proj.copy_(torch.tensor([[[2.421875], [-4.40625]]]))
+            experts.down_proj.fill_(1.0)
+        grouped = Mock(side_effect=self._cpu_grouped_matmul)
+        with patch.dict(hp_functional.__dict__, {"grouped_matmul": grouped}):
+            actual = _deepseek_v41_grouped_expert_forward(
+                experts, torch.ones(1, 1, dtype=torch.bfloat16), torch.tensor([1]),
+            )
+        expected = torch.tensor([[-9.8125]], dtype=torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        gate, up = experts.gate_up_proj.flatten().unbind()
+        old_result = functional.silu(gate) * up
+        self.assertNotEqual(actual.item(), old_result.item())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_ep_grouped_path_binds_model_owned_forward(self) -> None:
+        """
+        Feature: Model-owned grouped EP execution.
+        Description: Enable grouped GEMM through the DeepSeek V4.1 EP factory.
+        Expectation: The factory binds the model-owned clamped grouped callable.
+        """
+        experts = DeepseekV4Experts(_expert_config())
+        module = SimpleNamespace(
+            gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
+        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        with patch(f"{prefix}.bind_local_expert_forward") as bind:
+            compute = deepseek_v41_ep_compute_fn(
+                module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+                ep_mesh=ep_mesh, use_grouped_gemm=True,
+            )
+        self.assertTrue(callable(compute))
+        self.assertEqual(experts.forward_expert_major, MethodType(_deepseek_v41_grouped_expert_forward, experts))
+        bind.assert_called_once_with(module, 2, use_grouped_gemm=True, apply_gate=None)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_yaml_override_selects_grouped_or_eager_factory(self) -> None:
+        """
+        Feature: DSV4.1 EP factory selection.
+        Description: Resolve typed grouped/eager YAML for text and VLM contracts.
+        Expectation: Both contracts keep the benchmark router disabled by default.
+        """
+        for grouped, multimodal in product((True, False), (False, True)):
+            with self.subTest(grouped=grouped, multimodal=multimodal):
+                raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm=str(grouped).lower()))
+                entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
+                spec = entries_to_plan_overrides([entry], ep_size=2)["*.mlp"]
+                self.assertIs(spec.local_compute_fn.callable, deepseek_v41_ep_compute_fn)
+                self.assertIs(spec.local_compute_fn.use_grouped_gemm, grouped)
+                self.assertIs(spec.region_dispatch, False)
+                module = SimpleNamespace(
+                    gate=Mock(), experts=DeepseekV4Experts(_expert_config()), shared_experts=Mock(), is_hash=False,
+                    forward=lambda hidden_states, input_ids=None: hidden_states,
+                )
+                if multimodal:
+                    module.forward = lambda hidden_states, input_ids=None, image_mask=None: hidden_states
+                ep_mesh = Mock()
+                ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
+                prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+                with patch(f"{prefix}.bind_local_expert_forward") as bind:
+                    compute = _resolve_local_compute_fn(
+                        module, spec, mesh=None, mesh_dim_names=(), expert_mesh=ep_mesh,
+                    )
+                self.assertTrue(callable(compute))
+                bind.assert_called_once()
+                self.assertEqual(bind.call_args.args, (module, 2))
+                self.assertIs(bind.call_args.kwargs["use_grouped_gemm"], grouped)
+                states = torch.randn(1, 2, 16)
+                mask = torch.tensor([[False, True]]) if multimodal else None
+                with patch(f"{prefix}._routed_and_shared_forward", return_value=states) as routed:
+                    output = compute(states, image_mask=mask) if multimodal else compute(states)
+                self.assertIs(output, states)
+                routed.assert_called_once_with(
+                    module, states, mask, ep_mesh.get_group.return_value, ep_size=2, fix_router=False,
+                )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_yaml_override_requires_active_ep(self) -> None:
+        """
+        Feature: Conditional EP configuration.
+        Description: Resolve the same typed YAML override with EP disabled and enabled.
+        Expectation: The override is applied only when expert parallelism is active.
+        """
+        raw = yaml.safe_load(_EP_OVERRIDE_YAML.format(use_grouped_gemm="true"))
+        entry = resolve_component(raw, annotation=PlanOverride, path="$.plan_overrides[0]")
+        self.assertEqual(entries_to_plan_overrides([entry], ep_size=1), {})
+        self.assertIn("*.mlp", entries_to_plan_overrides([entry], ep_size=2))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_eager_path_retains_source_gate(self) -> None:
+        """
+        Feature: Eager expert activation compatibility.
+        Description: Disable grouped GEMM through the DeepSeek V4.1 EP factory.
+        Expectation: The factory retains the source clamped eager activation.
+        """
+        experts = DeepseekV4Experts(_expert_config())
+        module = SimpleNamespace(
+            gate=Mock(), experts=experts, shared_experts=Mock(), is_hash=False,
+            forward=lambda hidden_states, input_ids=None: hidden_states,
+        )
+        ep_mesh = Mock()
+        ep_mesh.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
+        prefix = "hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel"
+        with patch(f"{prefix}.bind_local_expert_forward") as bind:
+            deepseek_v41_ep_compute_fn(
+                module=module, mesh=None, tp_mesh=None, cp_mesh=None,
+                ep_mesh=ep_mesh, use_grouped_gemm=False,
+            )
+        self.assertFalse(hasattr(experts, "forward_expert_major"))
+        bind.assert_called_once_with(
+            module, 2, use_grouped_gemm=False,
+            apply_gate=experts._apply_gate,  # pylint: disable=protected-access
+        )

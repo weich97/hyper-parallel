@@ -15,6 +15,12 @@
 """Architecture identity and GDN sharding rules for Qwen3.5."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3_5.adapter.checkpoint import export_text_checkpoint
+from hyper_parallel.models.qwen3_5.adapter.materialization import register_rotary_materialization
+from hyper_parallel.models.qwen3_5.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+)
+from hyper_parallel.models.qwen3_5_moe.adapter.policies.sharding import get_fsdp_execution_order
 from hyper_parallel.models.registry import register_model_adapter
 
 
@@ -26,31 +32,45 @@ def _load_context_parallel():
     return context_parallel
 
 
-def _load_sharding_rules():
-    """Return GDN parameter roles not covered by generic naming rules."""
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
+def _load_loss():
+    """Load the optional text-only output-loss adapter lazily."""
+    from hyper_parallel.models.qwen3_5.adapter import chunk_loss  # pylint: disable=C0415
+    return chunk_loss
+
+
+def _load_vlm_loss():
+    """Load the shared Qwen VLM loss provider without eager optional imports."""
+    from hyper_parallel.models.qwen3_5_moe.adapter import vlm_chunk_loss  # pylint: disable=C0415
+    return vlm_chunk_loss
+
+
+def _load_encoder_parallel():
+    """Reuse the shared Qwen visual ownership contract through a lazy provider."""
+    from hyper_parallel.models.qwen3_5_moe.adapter.encoder_parallel import (  # pylint: disable=C0415
+        get_encoder_parallel_spec,
     )
-    return [
-        ("in_proj_qkv", ParamRole.FUSED_QKV),
-        (["in_proj_z", "in_proj_b", "in_proj_a", "conv1d"], ParamRole.COLWISE),
-        (["A_log", "dt_bias"], ParamRole.COLWISE),
-        ("out_proj", ParamRole.ROWWISE),
-    ]
+    return get_encoder_parallel_spec()
 
 
 QWEN3_5_ADAPTER_SPEC = ModelAdapterSpec(
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
+    loss=_load_vlm_loss,
+    encoder_parallel=_load_encoder_parallel,
+    fsdp_execution_order=get_fsdp_execution_order,
     context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 
 QWEN3_5_TEXT_ADAPTER_SPEC = ModelAdapterSpec(
+    checkpoint_export=export_text_checkpoint,
+    materialization=register_rotary_materialization,
     architecture="Qwen3_5ForCausalLM",
     model_type="qwen3_5_text",
+    loss=_load_loss,
     context_parallel=_load_context_parallel,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
 )
 
 register_model_adapter(QWEN3_5_ADAPTER_SPEC)

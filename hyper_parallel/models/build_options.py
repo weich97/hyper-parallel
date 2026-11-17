@@ -27,7 +27,21 @@ device API (synchronize, cache/RNG management, ...) lives in
 ``hyper_parallel.trainer.runtime.device`` and re-uses these primitives.
 """
 
+__all__ = [
+    "CompileConfig",
+    "FSDP2Config",
+    "FSDP2MixedPrecisionConfig",
+    "ModelBuildOptions",
+    "normalize_build_options",
+    "IS_CUDA_AVAILABLE",
+    "IS_NPU_AVAILABLE",
+    "get_device_type",
+    "get_torch_device",
+    "get_device_id",
+]
+
 import logging
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
@@ -46,7 +60,14 @@ logger = logging.getLogger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = torch_npu is not None and torch.npu.is_available()
+# ``torch_npu`` can be importable yet leave ``torch.npu`` unregistered
+# (an x86 CI host with the wheel installed but no CANN runtime), so probe
+# the attribute before touching it.
+IS_NPU_AVAILABLE = (
+    torch_npu is not None
+    and getattr(torch, "npu", None) is not None
+    and torch.npu.is_available()
+)
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
@@ -85,28 +106,55 @@ def get_device_id() -> int:
 # whose module chain (via ``checkpoint``) reaches modules that import the
 # device primitives from here; keeping the primitives defined first makes
 # that circular edge resolve against already-defined names.
-from hyper_parallel.components.quantization.config import (  # noqa: E402
+from hyper_parallel.components.quantization.config import (  # pylint: disable=C0413
     LowPrecisionConfig,
 )
 
 
 @dataclass
 class CompileConfig:
-    """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
+    """Decoder-layer and joint-graph compile options exposed by the Trainer.
+
+    In joint-graph mode, ``dynamic`` symbolizes user tensor dimensions.
+    ``dynamic_arg_dims`` optionally selects dimensions by dotted input path;
+    a mapping enables dynamic tracing and takes precedence over ``dynamic``.
+    ``fsdp_allgather_prefetch`` and ``fsdp_overlap_grad_reduce`` independently
+    schedule FSDP parameter gathers and gradient reductions, including wait sinking.
+    ``max_in_flight_gb`` follows PyTorch's overlap scheduler naming and binary
+    units; here it bounds early all-gather replicas until first use, per phase.
+    Eager FSDP2 module prefetch depths do not configure these graph passes.
+    """
 
     enabled: bool = False
+    use_joint_graph: bool = False
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
     backend: Optional[str] = None
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
+    # Joint-graph input paths, e.g. model_inputs.input_ids: [0, 1].
+    dynamic_arg_dims: Optional[dict[str, int | list[int]]] = None
+    fsdp_allgather_prefetch: bool = True
+    fsdp_overlap_grad_reduce: bool = True
+    max_in_flight_gb: float = 0.25
+
+    def selects_graph_compiler(self) -> bool:
+        """Return whether this config selects the graph-compiler trainer path."""
+        return self.enabled and self.use_joint_graph
 
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
-        for name in ("enabled", "fullgraph", "dynamic"):
+        boolean_fields = (
+            "enabled", "use_joint_graph", "fullgraph", "dynamic", "fsdp_allgather_prefetch",
+            "fsdp_overlap_grad_reduce",
+        )
+        for name in boolean_fields:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
+        self._validate_max_in_flight_gb()
+        if self.dynamic_arg_dims is not None and not isinstance(self.dynamic_arg_dims, dict):
+            raise ValueError("compile.dynamic_arg_dims must be a mapping or None")
         if not isinstance(self.mode, str) or not self.mode.strip():
             raise ValueError("compile.mode must be a non-empty string")
         if self.backend is not None and (
@@ -115,7 +163,7 @@ class CompileConfig:
             raise ValueError("compile.backend must be None or a non-empty string")
         if self.options is not None and not isinstance(self.options, dict):
             raise TypeError("compile.options must be a mapping or None")
-        if self.options and self.mode != "default":
+        if self.options and self.mode != "default" and not self.selects_graph_compiler():
             raise ValueError(
                 "compile.options cannot be combined with a non-default compile.mode"
             )
@@ -126,6 +174,17 @@ class CompileConfig:
         ):
             raise ValueError("compile.dynamo_cache_size_limit must be a positive integer")
 
+    def _validate_max_in_flight_gb(self) -> None:
+        """Validate the GiB bound on speculative FSDP all-gather replicas."""
+        value = self.max_in_flight_gb
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError("compile.max_in_flight_gb must be a finite non-negative number")
+
 
 @dataclass
 class FSDP2MixedPrecisionConfig:
@@ -133,19 +192,57 @@ class FSDP2MixedPrecisionConfig:
 
     All dtypes default to None, which means no mixed precision at all;
     the core ``MixedPrecisionPolicy`` then falls back to framework
-    defaults. Dtype strings are resolved to platform dtypes when the
-    FSDP2 manager builds the core policy.
+    defaults. Dtype strings are resolved to Torch dtypes when the FSDP2 manager
+    builds the core policy. ``custom_params`` maps exact root-relative parameter
+    names or case-sensitive ``fnmatch`` patterns to ``param_dtype`` and/or
+    ``reduce_dtype`` overrides. Missing fields
+    inherit the policy; explicit None uses the stored compute dtype or the
+    gradient's reduction dtype instead of the corresponding policy field.
+    Names are resolved to Parameter objects before any FSDP unit is wrapped.
+    Every key must match a parameter; overlapping keys must specify identical overrides.
     """
 
     param_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     reduce_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     output_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     cast_forward_inputs: bool = True
+    custom_params: dict[str, dict[str, Optional[Literal["bfloat16", "float16", "float32"]]]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        """Validate YAML overrides before model construction."""
+        self._check_custom_param()
+
+    def _check_custom_param(self) -> None:
+        """Validate parameter names and dtype strings without changing the configuration."""
+        if not isinstance(self.custom_params, Mapping):
+            raise ValueError("mix_precision.custom_params must map parameter names to dtype dictionaries")
+        for parameter_name, custom_dtypes in self.custom_params.items():
+            if not isinstance(parameter_name, str) or not parameter_name:
+                raise ValueError("mix_precision.custom_params keys must be non-empty parameter names or patterns")
+            if not isinstance(custom_dtypes, Mapping):
+                raise ValueError("mix_precision.custom_params values must be dtype dictionaries")
+            if custom_dtypes.keys() - {"param_dtype", "reduce_dtype"}:
+                raise ValueError("mix_precision.custom_params only supports param_dtype and reduce_dtype overrides")
+            for dtype_name, dtype in custom_dtypes.items():
+                if dtype not in (None, "bfloat16", "float16", "float32"):
+                    raise ValueError(
+                        f"mix_precision.custom_params[{parameter_name!r}].{dtype_name} "
+                        f"must be bfloat16, float16, float32 or None, got {dtype!r}"
+                    )
 
 
 @dataclass
 class FSDP2Config:
-    """FSDP2 strategy configuration (06 §4.1)."""
+    """FSDP2 strategy configuration (06 §4.1).
+
+    ``wrapper_class`` selects child units by exact runtime class name. An empty
+    list retains automatic decoder discovery; expert units are discovered in
+    either mode.
+
+    ``reshard_after_forward`` also controls the remaining root parameters.
+    """
     dp_shard_size: int = 1
     edp_shard_size: int = 1
     replicate_params: list[str] = field(default_factory=list)
@@ -160,9 +257,15 @@ class FSDP2Config:
     forward_prefetch_depth: int = 1
     comm_fusion: bool = False
     comm_fusion_zero_copy: Optional[bool] = None
+    # Exact runtime class names; empty preserves automatic decoder discovery.
+    wrapper_class: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate topology sizes and prefetch depths."""
+        if not isinstance(self.wrapper_class, list) or any(
+            not isinstance(name, str) or not name.isidentifier() for name in self.wrapper_class
+        ):
+            raise ValueError("wrapper_class must be a list of module class names")
         if self.dp_shard_size < 1:
             raise ValueError("dp_shard_size must be greater than or equal to 1")
         if self.edp_shard_size < 1:
@@ -171,6 +274,9 @@ class FSDP2Config:
             raise ValueError("backward_prefetch_depth must be greater than or equal to 0")
         if self.forward_prefetch_depth < 0:
             raise ValueError("forward_prefetch_depth must be greater than or equal to 0")
+        if not isinstance(self.reshard_after_forward, bool):
+            raise TypeError("reshard_after_forward must be a bool")
+
 
 
 _MODEL_INIT_DTYPES = ("float16", "bfloat16", "float32")
@@ -279,17 +385,3 @@ def normalize_build_options(
         "build options must be a ModelBuildOptions, a mapping, or None; "
         f"got {type(value).__name__}"
     )
-
-
-__all__ = [
-    "CompileConfig",
-    "FSDP2Config",
-    "FSDP2MixedPrecisionConfig",
-    "ModelBuildOptions",
-    "normalize_build_options",
-    "IS_CUDA_AVAILABLE",
-    "IS_NPU_AVAILABLE",
-    "get_device_type",
-    "get_torch_device",
-    "get_device_id",
-]

@@ -27,9 +27,8 @@ from torch import nn
 from hyper_parallel.components.checkpoint.weight_conversion import WeightConverter
 
 from hyper_parallel.components.checkpoint import ConcatenateWithSections
+from hyper_parallel.components.functional.npu_fusion_attention import npu_fusion_attention_forward
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import apply_rotary_pos_emb, apply_rotary_pos_emb_interleave
-from hyper_parallel.components.functional import npu_fusion_attention_forward
 
 
 @dataclass
@@ -197,16 +196,30 @@ class MLAAttention(nn.Module):
             )
         return transforms
 
-    def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
-        """Project hidden states into query and compressed KV latent states."""
-        batch_size, sequence_length = hidden_states.shape[:-1]
+    def project_latent_inputs(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute shared latent inputs before head expansion.
+
+        Args:
+            hidden_states: Input tokens with shape [batch, sequence, hidden].
+
+        Returns:
+            Normalized query and KV latents, and the unrotated shared RoPE key.
+        """
         latent_states = self.linear_qkv(hidden_states)
         query_latent, kv_nope, key_rope = torch.split(
             latent_states,
             (self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim),
             dim=-1,
         )
-        query_states = self.q_b_proj(self.q_a_layernorm(query_latent)).view(
+        return self.q_a_layernorm(query_latent), self.kv_a_layernorm(kv_nope), key_rope
+
+    def _project_latents(self, hidden_states: torch.Tensor) -> _MLALatents:
+        """Project hidden states into query and compressed KV latent states."""
+        batch_size, sequence_length = hidden_states.shape[:-1]
+        query_latent, kv_nope, key_rope = self.project_latent_inputs(hidden_states)
+        query_states = self.q_b_proj(query_latent).view(
             batch_size,
             sequence_length,
             self.num_heads,
@@ -222,7 +235,7 @@ class MLAAttention(nn.Module):
             sequence_length,
             query_pass,
             query_rope.transpose(1, 2),
-            self.kv_a_layernorm(kv_nope).view(
+            kv_nope.view(
                 batch_size, 1, sequence_length, self.kv_lora_rank
             ),
             key_rope.view(batch_size, 1, sequence_length, self.qk_rope_head_dim),
@@ -238,6 +251,11 @@ class MLAAttention(nn.Module):
         latents = self._project_latents(hidden_states)
         query_rope, key_rope = latents.query_rope, latents.key_rope
         if position_embeddings is not None:
+            # Defer the optional NPU dependency until rotary embedding is used.
+            from hyper_parallel.components.functional import (  # pylint: disable=C0415
+                apply_rotary_pos_emb, apply_rotary_pos_emb_interleave,
+            )
+
             cos, sin = position_embeddings
             rope_fn = apply_rotary_pos_emb_interleave if self.rotary_interleaved else apply_rotary_pos_emb
             query_rope, key_rope = rope_fn(query_rope, key_rope, cos, sin)
@@ -261,6 +279,23 @@ class MLAAttention(nn.Module):
             value_states,
         )
 
+    def project_output(self, attention_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project [B, local_tokens, heads * value_dim] to [B, local_tokens, hidden].
+
+        This model-math extension point lets gated MLA multiply its gate before
+        Wo; the default MLA keeps the original output projection unchanged.
+        This method owns model math only; CP communication belongs to its adapter.
+
+        Args:
+            attention_output: Flattened local-token attention output.
+            hidden_states: Original local-token input, available to gated variants.
+
+        Returns:
+            Projected local hidden states.
+        """
+        del hidden_states
+        return self.o_proj(attention_output)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -270,7 +305,19 @@ class MLAAttention(nn.Module):
         actual_seq_len: torch.Tensor | Sequence[int] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run MLA with the same external contract as Transformers attention."""
+        """Run MLA with the same external contract as Transformers attention.
+
+        Args:
+            hidden_states: Input tokens in batch, sequence, hidden order.
+            position_embeddings: Optional precomputed RoPE cosine and sine.
+            attention_mask: Optional mask in the attention interface convention.
+            past_key_values: Optional cache for incremental decoding.
+            actual_seq_len: Optional cumulative packed document ends.
+            **kwargs: Additional arguments for the attention interface.
+
+        Returns:
+            Projected attention output and optional attention weights.
+        """
         batch_size, seq_length = hidden_states.shape[:-1]
         query_states, key_states, value_states = self._project_attention_inputs(
             hidden_states,
@@ -291,5 +338,7 @@ class MLAAttention(nn.Module):
             **kwargs,
         )
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        # Gated MLA derives its gate from the original input before Wo; ordinary
+        # MLA only applies Wo. Keep this math extension shared by CP1 and CP.
+        attn_output = self.project_output(attn_output, hidden_states)
         return attn_output, attn_weights

@@ -34,11 +34,19 @@ git log upstream/master..HEAD --oneline
 1. **Fetch** diff + file list + commits (branch or PR).
 2. **Classify** risk — table in [review-checklist.md](review-checklist.md) / patterns below.
 3. **Deep review** CRITICAL/HIGH using [review-checklist.md](review-checklist.md).
+   For model or feature work, audit whether an existing YAML glob, adapter
+   provider, or generic executor already handles each new special case.
+   Flag any shared precision-policy change made to pass a model integration
+   unless its first divergent intermediate, cross-model effect, and explicit
+   user decision are documented. SP/non-SP equality from FP32 summation of BF16
+   Partial terms alone does not establish that the change is acceptable.
 4. **Distributed** implications via [distributed-guidelines.md](distributed-guidelines.md).
 5. **Pylint (PR stage):**
+
    ```bash
    python3 .agent/skills/autogit/scripts/autogit.py pylint-review
    ```
+
    Paste into Code Quality. Suppress via `.jenkins/check/config/filter_pylint.txt`, not inline `# pylint: disable=`.
 6. **Formulate** output (template below). `code-style` violations need corrected snippets.
 

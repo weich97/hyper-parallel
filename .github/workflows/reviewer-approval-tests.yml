@@ -1,0 +1,27 @@
+name: Reviewer approval gate tests
+
+on:
+  pull_request:
+    paths:
+      - .github/reviewer-approval-policy.json
+      - .github/scripts/reviewer-approval-gate*.mjs
+      - .github/workflows/reviewer-approval-*.yml
+  push:
+    branches: [master]
+    paths:
+      - .github/reviewer-approval-policy.json
+      - .github/scripts/reviewer-approval-gate*.mjs
+      - .github/workflows/reviewer-approval-*.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: node --test .github/scripts/reviewer-approval-gate.test.mjs

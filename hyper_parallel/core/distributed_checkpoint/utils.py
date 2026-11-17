@@ -119,7 +119,7 @@ def narrow_tensor_by_index(tensor: Any, offsets: tuple, lengths: tuple) -> Any:
     Narrow the tensor by (offsets, lengths) per dimension.
 
     Used for resharding operations to extract a slice from a tensor.
-    Compatible with both torch and mindspore (uses slice indexing).
+    Uses plain slice indexing so any tensor-like object works.
 
     Args:
         tensor (Any): The tensor to narrow (tensor-like object supporting indexing).
@@ -269,10 +269,11 @@ def plan_ownership_masks(
     """
     Decide which plan writes each item, as one keep-mask per plan.
 
-    An item present in several plans is redundant: only one plan should write it. The owner is
-    the plan with the smallest planned storage so far, or the lowest plan index when
+    An item present in several plans is redundant: only one plan should write it. Empty
+    uneven shards can share an offset with a nonempty shard; the nonempty shard must win.
+    The owner is the plan with the smallest planned storage so far, or the lowest plan index when
     ``save_to_minimum_rank`` is True. Ownership is resolved from the plan order and the item
-    sizes alone, so every rank running this over the same gathered plans reaches the same answer.
+    metadata and sizes, so every rank running this over the same gathered plans reaches the same answer.
 
     Duplicates are assigned largest first (longest-processing-time): placing the big shards while
     the plans are still evenly loaded leaves the small ones to even out the remainder. Assigning
@@ -298,9 +299,16 @@ def plan_ownership_masks(
     for plan_idx, plan in enumerate(all_plans):
         for position, entry in enumerate(plan.items):
             occurrences = occurrences_by_index.get(entry.index)
-            if occurrences is None:
+            entry_size = entry.tensor_storage_size()
+            if entry_size == 0:
+                if occurrences is None:
+                    occurrences_by_index[entry.index] = [entry, plan_idx, position]
+                continue
+            if occurrences is None or occurrences[0].tensor_storage_size() == 0:
                 occurrences_by_index[entry.index] = [entry, plan_idx, position]
             else:
+                if entry.tensor_data != occurrences[0].tensor_data:
+                    raise ValueError(f"Checkpoint chunks share {entry.index} with different nonempty metadata")
                 occurrences.append(plan_idx)
                 occurrences.append(position)
 

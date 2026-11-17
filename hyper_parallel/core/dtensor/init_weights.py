@@ -15,6 +15,7 @@
 """Empty / on-device weight initialization utilities."""
 # pylint: disable=C9006,C9007
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 import torch
@@ -23,7 +24,7 @@ from hyper_parallel.core.dtensor._utils import init_on_device as _init_on_device
 
 
 @contextmanager
-def init_empty_weights(include_buffers=False):
+def init_empty_weights(include_buffers: bool = False) -> Iterator[None]:
     """Context manager that initializes model parameters (and optionally
     buffers) on the meta device.
 
@@ -45,9 +46,19 @@ def init_empty_weights(include_buffers=False):
     Note:
         A model initialised under this context has **no weights**.  You cannot
         call ``model.to(some_device)`` directly; load a checkpoint first.
+
+        Deterministic memory filling is suspended only inside this context:
+        factories may allocate CPU tensors before registration moves them to
+        meta. Filling that discarded storage defeats empty initialization.
+        The deterministic algorithm setting is unchanged.
     """
-    with _init_on_device(torch.device("meta"), include_buffers=include_buffers):
-        yield
+    fill_uninitialized_memory = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        with _init_on_device(torch.device("meta"), include_buffers=include_buffers):
+            yield
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = fill_uninitialized_memory
 
 
 @contextmanager

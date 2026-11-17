@@ -1,0 +1,57 @@
+name: Reset CI pass labels
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+concurrency:
+  group: reset-ci-pass-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  reset-ci-pass-labels:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # The base-repository token can update fork PR labels. No PR code is executed.
+      - name: Remove CI results from the previous head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for label in ci-pipeline-passed ci-pipeline-passed-but-overtime; do
+            pull_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}")"
+            current_head="$(jq -r '.head.sha' <<< "${pull_json}")"
+            current_state="$(jq -r '.state' <<< "${pull_json}")"
+
+            if [[ "${current_state}" != "open" || "${current_head}" != "${EVENT_HEAD_SHA}" ]]; then
+              echo "The PR is closed or has a newer head; skip this outdated event."
+              exit 0
+            fi
+
+            has_label="$(jq -r --arg label_name "${label}" '.labels | any(.name == $label_name)' <<< "${pull_json}")"
+            if [[ "${has_label}" != "true" ]]; then
+              continue
+            fi
+
+            if gh api --method DELETE "repos/${GH_REPO}/issues/${PR_NUMBER}/labels/${label}" >/dev/null; then
+              echo "Removed ${label}; the new head needs a fresh CI result."
+            else
+              # Another actor may have removed it already. Re-read instead of
+              # hiding permission or network failures with an unconditional fallback.
+              pull_json="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}")"
+              has_label="$(jq -r --arg label_name "${label}" '.labels | any(.name == $label_name)' <<< "${pull_json}")"
+              if [[ "${has_label}" == "true" ]]; then
+                echo "::error::Unable to remove ${label}."
+                exit 1
+              fi
+            fi
+          done

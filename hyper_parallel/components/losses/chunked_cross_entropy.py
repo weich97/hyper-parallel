@@ -305,11 +305,15 @@ class ChunkedCausalLMLoss(nn.Module):
 
         model_type = getattr(getattr(model, "config", None), "model_type", "")
         adapter_spec = get_model_adapter(model_type)
+        if adapter_spec is None:
+            architectures = getattr(model.config, "architectures", None) or ()
+            if architectures:
+                adapter_spec = get_model_adapter(architectures[0])
         provider = None if adapter_spec is None else adapter_spec.loss
         if provider is None:
             raise ValueError(
                 "ChunkedCausalLMLoss requires a registered model-family loss "
-                f"adapter, but model_type={model_type!r} provides none"
+                f"adapter, but model_type={model_type!r} and its architecture provide none"
             )
         adapter = provider()
         bind_chunk_loss = getattr(adapter, "bind_chunk_loss", None)

@@ -18,8 +18,7 @@ Covers the rules the dataclass asserts and that have regressed before:
 
 1. Defaults match the documented intent (FSDP on, overlap on, degrees
    unresolved until runtime).
-2. ``__post_init__`` rejects negative ``tp_size`` and non-positive explicit
-   ``fsdp_degree``.
+2. ``__post_init__`` rejects non-positive explicit ``fsdp_degree``.
 3. ``validate()`` re-runs the same checks after a caller mutates a field
    (the compiler back-fills ``fsdp_degree`` from the mesh in
    ``GraphCompiler._init_device_mesh``).
@@ -54,7 +53,16 @@ class TestPassConfigDefaults(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            cfg.tp_size, 1, (f"tp_size default should be 1, got {cfg.tp_size}")
+            cfg.dp_mode,
+            "fsdp",
+            f"dp_mode default should be 'fsdp' (fully_shard), got {cfg.dp_mode!r}",
+        )
+        self.assertIsNone(
+            cfg.dp_replicate_degree,
+            (
+                f"dp_replicate_degree default should be None, "
+                f"got {cfg.dp_replicate_degree}"
+            ),
         )
         # PP defaults: off by default (opt-in), degrees unresolved, safe
         # microbatch of 1.
@@ -73,6 +81,16 @@ class TestPassConfigDefaults(unittest.TestCase):
             1,
             (f"pp_microbatch_size default should be 1, got {cfg.pp_microbatch_size}"),
         )
+        self.assertEqual(
+            cfg.pp_schedule,
+            "gpipe",
+            (f"pp_schedule default should be 'gpipe', got {cfg.pp_schedule!r}"),
+        )
+        self.assertEqual(
+            cfg.pp_chunks,
+            1,
+            (f"pp_chunks default should be 1, got {cfg.pp_chunks}"),
+        )
 
     def test_explicit_construction(self):
         """Test explicit construction forwards every kwarg."""
@@ -80,36 +98,54 @@ class TestPassConfigDefaults(unittest.TestCase):
             enable_overlap=False,
             fsdp_enabled=False,
             fsdp_degree=8,
-            tp_size=2,
+            dp_mode="hsdp",
+            dp_replicate_degree=4,
             pp_enabled=True,
             pp_degree=4,
             pp_microbatch_size=2,
+            pp_schedule="1f1b",
         )
         self.assertFalse(cfg.enable_overlap)
         self.assertFalse(cfg.fsdp_enabled)
         self.assertEqual(cfg.fsdp_degree, 8)
-        self.assertEqual(cfg.tp_size, 2)
+        self.assertEqual(cfg.dp_mode, "hsdp")
+        self.assertEqual(cfg.dp_replicate_degree, 4)
         self.assertTrue(cfg.pp_enabled)
         self.assertEqual(cfg.pp_degree, 4)
         self.assertEqual(cfg.pp_microbatch_size, 2)
+        self.assertEqual(cfg.pp_schedule, "1f1b")
+
+
+class TestPassConfigDpMode(unittest.TestCase):
+    """``dp_mode`` canonicalization + validation (simplefsdp parity)."""
+
+    def test_accepts_canonical_modes(self):
+        """Test the three canonical modes pass through unchanged."""
+        for mode in ("fsdp", "ddp", "hsdp"):
+            self.assertEqual(PassConfig(dp_mode=mode).dp_mode, mode)
+
+    def test_normalizes_simplefsdp_aliases(self):
+        """Test simplefsdp spellings normalize to the canonical modes."""
+        self.assertEqual(PassConfig(dp_mode="fully_shard").dp_mode, "fsdp")
+        self.assertEqual(PassConfig(dp_mode="replicate").dp_mode, "ddp")
+        self.assertEqual(PassConfig(dp_mode="hybrid_shard").dp_mode, "hsdp")
+        self.assertEqual(PassConfig(dp_mode="HSDP").dp_mode, "hsdp")
+
+    def test_rejects_unknown_mode(self):
+        """Test an unknown ``dp_mode`` raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            PassConfig(dp_mode="tensor_parallel")
+        self.assertIn("dp_mode", str(ctx.exception))
+
+    def test_rejects_non_positive_replicate_degree(self):
+        """Test explicit ``dp_replicate_degree < 1`` raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            PassConfig(dp_mode="ddp", dp_replicate_degree=0)
+        self.assertIn("dp_replicate_degree", str(ctx.exception))
 
 
 class TestPassConfigValidation(unittest.TestCase):
     """``__post_init__`` catches misconfigurations early."""
-
-    def test_rejects_non_positive_tp_size(self):
-        """Test ``tp_size < 1`` raises ValueError at construction."""
-        for bad in (0, -1, -4):
-            with self.assertRaises(ValueError) as ctx:
-                PassConfig(tp_size=bad)
-            self.assertIn(
-                "tp_size",
-                str(ctx.exception),
-                (
-                    f"error for tp_size={bad} should mention tp_size, "
-                    f"got: {ctx.exception}"
-                ),
-            )
 
     def test_rejects_non_positive_fsdp_degree(self):
         """Test explicit ``fsdp_degree < 1`` raises ValueError."""
@@ -129,6 +165,32 @@ class TestPassConfigValidation(unittest.TestCase):
         """Test ``fsdp_degree=None`` is the documented auto-resolve sentinel."""
         cfg = PassConfig(fsdp_degree=None)
         self.assertIsNone(cfg.fsdp_degree)
+
+    def test_rejects_unknown_pp_schedule(self):
+        """Test an unknown ``pp_schedule`` name raises ValueError."""
+        for bad in ("zbv", "1F-1B", ""):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_schedule=bad)
+            self.assertIn(
+                "pp_schedule",
+                str(ctx.exception),
+                f"error for pp_schedule={bad!r} should mention pp_schedule",
+            )
+
+    def test_pp_chunks_validation(self):
+        """Test ``pp_chunks`` bounds and its interleaved-schedule requirement."""
+        for bad in (0, -1):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=bad)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for bad_schedule in ("gpipe", "1f1b"):
+            with self.assertRaises(ValueError) as ctx:
+                PassConfig(pp_chunks=2, pp_schedule=bad_schedule)
+            self.assertIn("pp_chunks", str(ctx.exception))
+        for good in ("vpp", "interleaved_1f1b"):
+            cfg = PassConfig(pp_chunks=2, pp_schedule=good)
+            self.assertEqual(cfg.pp_chunks, 2)
+            self.assertEqual(cfg.pp_schedule, good)
 
     def test_validate_after_mutation(self):
         """Test ``validate()`` re-runs checks after a caller mutates a field.
@@ -160,7 +222,7 @@ class TestPassConfigTorchFree(unittest.TestCase):
 
     def test_module_does_not_import_torch_at_top(self):
         """Test no top-level torch import in ``pass_config`` module."""
-        import hyper_parallel.compile.pass_config as mod
+        import hyper_parallel.compile.pass_config as mod  # pylint: disable=C0415
 
         # torch / torch.distributed must not be a side-effect of importing
         # the config module. (It may be imported by *something else* in the

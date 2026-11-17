@@ -16,9 +16,9 @@
 
 import os
 
-from tests.common.distributed_launcher import torchrun_case
 from tests.common.mark_utils import arg_mark
 from tests.common.port_utils import allocate_port
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import prepare_multicore_test_environment
 
 
@@ -27,7 +27,7 @@ _WORKER = os.path.join(os.path.dirname(__file__), "_test_all_gather.py")
 
 def _run(case_name: str, num_proc: int) -> None:
     prepare_multicore_test_environment()
-    torchrun_case(_WORKER, case_name, num_proc=num_proc)
+    run_multicore_case(_WORKER, case_name, num_proc=num_proc, timeout=None)
 
 
 def _set_unique_bootstrap_endpoint(monkeypatch) -> None:

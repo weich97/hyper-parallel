@@ -31,19 +31,19 @@ from rl.agentic.core.types import (
     TurnContext,
 )
 from rl.agentic.envs.environment import Environment
-from rl.dataset.contracts import PromptRecord, Trajectory, Turn
+from rl.data.contracts import PromptRecord, RouterTrace, Trajectory, Turn, resize_router_trace
 
 _TOOL_COUNTER_NAMES = ("tool_call_count", "tool_success_count", "tool_error_count")
 _RESERVED_TRANSITION_INFO = frozenset(("reward_components", *_TOOL_COUNTER_NAMES))
 
 
 class AgentSession:
-    """Own one Environment and accumulate its token-exact trajectory."""
+    """Own or mirror one environment and accumulate its token-exact trajectory."""
 
     def __init__(
         self,
         prompt: PromptRecord,
-        environment: Environment,
+        environment: Optional[Environment],
         policy_version: int,
         sample_index: int,
         max_turns: int,
@@ -66,10 +66,10 @@ class AgentSession:
                 observation_encoder=observation_encoder,
             )
         elif (
-            episode_context.prompt.prompt_id != prompt.prompt_id
-            or episode_context.policy_version != policy_version
-            or episode_context.sample_index != sample_index
-            or episode_context.max_turns != max_turns
+            (episode_context.prompt.prompt_id, episode_context.policy_version)
+            != (prompt.prompt_id, policy_version)
+            or (episode_context.sample_index, episode_context.max_turns)
+            != (sample_index, max_turns)
         ):
             raise ValueError(
                 "AgentSession arguments must match the provided EpisodeContext"
@@ -105,6 +105,7 @@ class AgentSession:
         self._log_prob_parts: list[Any] = []
         self._collecting_log_probs: Optional[bool] = None
         self._worker_policy_version: Optional[int] = None
+        self._router_trace = None
         # Rewards and termination belong to the whole episode. Per-turn values
         # are retained for diagnostics and future credit-assignment strategies.
         self.reward = 0.0
@@ -157,15 +158,19 @@ class AgentSession:
             return None
         return self.max_episode_tokens - self._token_count
 
-    async def start(self) -> None:
-        """Reset the environment and append its initial observation."""
+    async def start(self, observation: Optional[Observation] = None) -> Observation:
+        """Reset the owned environment or replay its synchronized initial observation."""
         if self._started:
             raise RuntimeError("AgentSession.start() may be called only once")
         self._started = True
-        observation = await self.environment.reset(self.episode_context)
+        if observation is None:
+            if self.environment is None:
+                raise RuntimeError("Replica session requires an owner observation")
+            observation = await self.environment.reset(self.episode_context)
         if observation.token_ids.numel() == 0:
             raise ValueError("The initial environment observation must not be empty")
         self._append_observation(observation, initial=True)
+        return observation
 
     def _prepare_observation_tokens(self, observation: Observation, initial: bool) -> Any:
         """Validate one observation and move it to the trajectory device."""
@@ -248,6 +253,26 @@ class AgentSession:
         self._append_observation_turn(observation, token_ids, *span)
         return True
 
+    def _record_router_trace(self, trace: Optional[RouterTrace], token_count: int) -> None:
+        """Replace a full capture only when every previously captured input stays identical."""
+        previous = self._router_trace
+        if self.turn_count and (trace is None) != (previous is None):
+            raise ValueError("Every action must consistently provide router traces or omit them")
+        if trace is None:
+            return
+        if trace.expert_ids.shape[0] != token_count:
+            raise ValueError("Action router trace must include the exact prompt and action input positions")
+        if previous is not None:
+            if previous.layer_ids != trace.layer_ids or previous.expert_ids.shape[1:] != trace.expert_ids.shape[1:]:
+                raise ValueError("Action router trace layers/top-k changed across turns")
+            for start in range(0, previous.expert_ids.shape[0], 4096):
+                stop = min(start + 4096, previous.expert_ids.shape[0])
+                valid = previous.valid_mask[start:stop]
+                if (not bool(trace.valid_mask[start:stop][valid].all()) or not torch.equal(
+                        previous.expert_ids[start:stop][valid], trace.expert_ids[start:stop][valid])):
+                    raise ValueError("Action router trace changed previously captured input positions")
+        self._router_trace = trace
+
     def _append_action(self, action: Action) -> None:
         """Append one trainable model action and its optional log-probabilities."""
         if action.token_ids.ndim != 1:
@@ -265,6 +290,7 @@ class AgentSession:
             self._record_encoded_action(action)
         start = self._token_count
         end = start + int(action.token_ids.numel())
+        self._record_router_trace(action.router_trace, end)
         self._token_parts.append(action.token_ids)
         self._token_count = end
         self._cached_token_ids = None
@@ -343,8 +369,8 @@ class AgentSession:
         elif self.truncated and self.terminal_reason is not TerminationReason.CONTEXT_LIMIT:
             self.terminal_reason = TerminationReason.ENVIRONMENT_TRUNCATED
 
-    async def apply(self, action: Action) -> None:
-        """Apply one action and accumulate its resulting transition."""
+    async def apply(self, action: Action, transition: Optional[Transition] = None) -> Transition:
+        """Apply an owned environment action or replay its synchronized transition."""
         if not self.active:
             raise RuntimeError("Cannot apply an action to an inactive AgentSession")
         if self.turn_count >= self.max_turns:
@@ -353,20 +379,24 @@ class AgentSession:
         self._append_action(action)
         # Environment.step is the round boundary: it turns the latest inference
         # output into reward, terminal state, and possibly the next model input.
-        transition = (
-            await self.environment.step(action, context)
-            if self._step_accepts_context
-            else await self.environment.step(action)
-        )
+        if transition is None:
+            if self.environment is None:
+                raise RuntimeError("Replica session requires an owner transition")
+            transition = (
+                await self.environment.step(action, context)
+                if self._step_accepts_context
+                else await self.environment.step(action)
+            )
         self.turn_results.append(transition)
         self._record_transition(transition)
         self.done = bool(transition.done)
         self.truncated = bool(transition.truncated)
-        self._append_observation(
+        _ = self._append_observation(
             transition.observation,
             terminal=self.done or self.truncated,
         )
         self._update_terminal_reason()
+        return transition
 
     def finish_max_turns(self) -> None:
         """Truncate an active session after the configured turn limit."""
@@ -383,7 +413,8 @@ class AgentSession:
     async def close(self) -> None:
         """Close the environment at most once."""
         if not self._closed:
-            await self.environment.close()
+            if self.environment is not None:
+                await self.environment.close()
             self._closed = True
 
     def result(self) -> EpisodeResult:
@@ -437,6 +468,9 @@ class AgentSession:
             truncated=self.truncated,
             terminal_reason=self.terminal_reason.value,
             worker_policy_version=self._worker_policy_version,
+            router_trace=(None if self._router_trace is None else resize_router_trace(
+                self._router_trace, int(token_ids.numel()),
+            )),
             metadata={
                 **self.metadata,
                 "sample_index": self.sample_index,

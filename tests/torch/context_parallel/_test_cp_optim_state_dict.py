@@ -31,7 +31,6 @@ Key design decisions for CP optimizer state dict testing:
     attention module and FSDP applied on the full model.
 """
 import math
-import os
 
 
 import torch  # noqa: E402
@@ -43,11 +42,10 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E4
 from hyper_parallel import (  # noqa: E402
     ContextParallel,
     SkipDTensorDispatch,
-    get_optim_state_dict,
     init_device_mesh,
     parallelize_module,
-    set_optim_state_dict,
 )
+from hyper_parallel.core.distributed_checkpoint import get_optim_state_dict, set_optim_state_dict
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy  # noqa: E402
@@ -68,7 +66,8 @@ class SimpleAttention(nn.Module):
     the sequence and head dimensions inside ``core_attn``.
     """
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int) -> None:
+        """Initialize attention projections and the CP attention boundary."""
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -120,7 +119,8 @@ class _CoreAttn(nn.Module):
 class CPTestModel(nn.Module):
     """Two-layer model: attention (with CP) + linear."""
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int) -> None:
+        """Initialize the small model used by optimizer-state tests."""
         super().__init__()
         self.attn = SimpleAttention(dim, num_heads)
         self.linear = nn.Linear(dim, dim, bias=False)
@@ -281,7 +281,7 @@ def test_c3_cp_fsdp_optim_state_dict_flatten():
     opts = StateDictOptions(flatten_optimizer_state_dict=True)
     sd = get_optim_state_dict(model, optimizer, options=opts)
 
-    for key in sd.keys():
+    for key in sd:
         assert key.startswith("state.") or key.startswith("param_group."), (
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )

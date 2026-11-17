@@ -55,6 +55,10 @@ class CheckpointerBase(ABC):
     ) -> None:
         """Write ``state`` into the checkpoint directory ``path``.
 
+        A successful return releases the caller to mutate or reuse ``state``.
+        Async backends must snapshot both its structure and tensor values before
+        returning; only persistence may continue in the background.
+
         Args:
             path: Directory for this checkpoint; created if absent.
             state: Payload to persist (``model`` / ``optimizer`` /
@@ -97,6 +101,16 @@ class CheckpointerBase(ABC):
 
         Safe to call when nothing is pending. Backends without async support
         inherit this no-op.
+        """
+        return
+
+    def raise_for_failed_async_save(self) -> None:
+        """Re-raise an in-flight async save's failure, without waiting for it.
+
+        Callers use this to learn about a failure at their next convenient point
+        rather than at their next save, which may be thousands of steps away. A
+        save still running is left alone, so it is cheap enough to call every
+        step. Backends without async support inherit this no-op.
         """
         return
 

@@ -20,13 +20,25 @@
 # pylint: disable=abstract-method,arguments-differ
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]
+
+import functools
+import inspect
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
+
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+
+from hyper_parallel.components.functional.linear_attention_convolution import (
+    fused_causal_conv1d,
+)
+from hyper_parallel.components.functional.linear_attention_packed import (
+    PackedSequenceInfo, packed_causal_conv1d, resolve_packed_sequence,
+)
 
 from hyper_parallel.core.context_parallel.context_parallel import (
     _ensure_1d,
@@ -38,10 +50,11 @@ from hyper_parallel.components.modules.gated_delta_net import (
     is_triton_gdn_available,
     torch_chunk_gated_delta_rule,
 )
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.distributed.context_parallel.collectives import ulysses_head_to_seq, ulysses_seq_to_head
+from hyper_parallel.core.utils import communication
 
 
-_GDN_BACKENDS = frozenset({"eager", "triton"})
+_GDN_BACKENDS = frozenset({"eager", "triton", "ascendc"})
 
 
 def _global_peer_rank(cp_mesh: DeviceMesh, local_rank: int) -> int:
@@ -161,7 +174,7 @@ def _all_to_all_previous_rank_halo(
     if cp_rank > 0:
         output_splits[rank_to_group_index[rank_list[cp_rank - 1]]] = halo_width
 
-    exchange_output = _collectives.differentiable_all_to_all_single(
+    exchange_output = communication.differentiable_all_to_all_single(
         exchange_input,
         input_splits,
         output_splits,
@@ -178,11 +191,20 @@ def _causal_conv1d_with_cp_halo(
     cp_mesh: DeviceMesh,
     cp_rank: int,
     cp_size: int,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run causal depthwise Conv1d with only the previous rank's boundary."""
     kernel_size = conv1d.kernel_size[0]
     dilation = conv1d.dilation[0]
     halo_width = (kernel_size - 1) * dilation
+    if sequence_info is not None:
+        halo = None
+        if halo_width and cp_size > 1:
+            if mixed_qkv.shape[1] < halo_width:
+                raise ValueError("Packed CP requires a local interval at least as long as its convolution halo.")
+            halo = _all_to_all_previous_rank_halo(
+                mixed_qkv[:, -halo_width:].contiguous(), cp_mesh, cp_rank, cp_size)
+        return packed_causal_conv1d(mixed_qkv, conv1d, sequence_info, halo)
     if halo_width == 0 or cp_size == 1:
         conv_out = conv1d(mixed_qkv.transpose(1, 2))
         return F.silu(conv_out[:, :, : mixed_qkv.shape[1]]).transpose(1, 2)
@@ -448,6 +470,7 @@ class _RecvInitialStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_state: Optional[torch.Tensor]):
+        """Return the incoming state gradient to the preceding CP rank."""
         if grad_state is None:
             raise RuntimeError("linear attention P2P backward missing initial-state grad.")
         dist.send(grad_state.contiguous(), dst=ctx.prev_rank, group=ctx.cp_group)
@@ -474,6 +497,7 @@ class _SendFinalStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_token: torch.Tensor):
+        """Receive the final-state gradient from the succeeding CP rank."""
         grad_state = torch.empty(
             ctx.state_shape,
             device=grad_token.device,
@@ -506,6 +530,7 @@ def _gdn_state_p2p_summary(
     *,
     chunk_size: int,
     use_qk_l2norm_in_kernel: bool,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run local GDN with an affine-summary state wavefront.
 
@@ -514,6 +539,24 @@ def _gdn_state_p2p_summary(
     the small state transfer. Token outputs retain the ordinary PyTorch graph,
     while the two custom autograd boundaries reverse the state communication.
     """
+    if sequence_info is not None:
+        cp_group = None if cp_mesh is None else cp_mesh.get_group()
+        incoming = None
+        if cp_rank > 0:
+            incoming = _RecvInitialStateP2PFunction.apply(
+                query, cp_group, _global_peer_rank(cp_mesh, cp_rank - 1),
+                (1, value.shape[2], query.shape[-1], value.shape[-1]))
+        output, finals = torch_chunk_gated_delta_rule(
+            query, key, value, g, beta, chunk_size=chunk_size,
+            initial_state=sequence_info.first_state(incoming), output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, cu_seqlens=sequence_info.local_offsets)
+        if incoming is not None:
+            output = output + incoming.sum().to(output.dtype) * 0
+        if cp_rank < cp_size - 1:
+            token = _SendFinalStateP2PFunction.apply(
+                finals[-1:].contiguous(), cp_group, _global_peer_rank(cp_mesh, cp_rank + 1))
+            output = output + token.to(output.dtype) * 0
+        return output
     if cp_size == 1:
         core_attn_out, _ = torch_chunk_gated_delta_rule(
             query,
@@ -588,6 +631,7 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
         cp_group,
         prev_rank: int,
         next_rank: int,
+        sequence_info: Optional[PackedSequenceInfo],
     ) -> torch.Tensor:
         """Run fused local GDN and forward its affine state across CP ranks."""
         from hyper_parallel.components.functional.gated_delta_net import (  # pylint: disable=import-outside-toplevel
@@ -600,6 +644,20 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             chunk_gated_delta_rule_state_summary_fwd,
         )
 
+        receive_previous = cp_rank > 0 and (sequence_info is None or sequence_info.continues_previous)
+        send_next = cp_rank < cp_size - 1 and (sequence_info is None or sequence_info.continues_next)
+        initial_state = None
+        recv_buffer = None
+        recv_handle = None
+        if receive_previous:
+            recv_buffer = torch.empty(
+                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            recv_handle = dist.irecv(recv_buffer, src=prev_rank, group=cp_group)
+
+        cu_seqlens = None if sequence_info is None else sequence_info.materialize(query.device, 64).cu_seqlens
         (
             query_norm,
             key_norm,
@@ -617,49 +675,44 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             g,
             beta,
             use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens,
         )
-        initial_state = None
-        recv_buffer = None
-        recv_work = None
-        if cp_rank > 0:
-            recv_buffer = torch.empty(
-                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
-                device=query.device,
-                dtype=torch.float32,
-            )
-            recv_work = dist.irecv(recv_buffer, src=prev_rank, group=cp_group)
 
         state_ext = None
         transition = None
-        if cp_rank < cp_size - 1:
+        if send_next:
+            tail = slice(None) if sequence_info is None else sequence_info.tail
             state_ext, transition = chunk_gated_delta_rule_state_summary_fwd(
-                key_norm,
-                w,
-                u,
-                g_cumsum,
+                key_norm[:, tail], w[:, tail], u[:, tail], g_cumsum[:, tail],
+                output_transition=sequence_info is None or sequence_info.transfer_active,
             )
 
-        if recv_work is not None:
-            recv_work.wait()
+        if recv_handle is not None and (sequence_info is None or sequence_info.transfer_active):
+            recv_handle.wait()
             initial_state = recv_buffer
+            recv_handle = None
 
         send_buffer = None
-        send_work = None
-        if cp_rank < cp_size - 1:
+        send_handle = None
+        if send_next:
             send_buffer = apply_gdn_state_summary(
                 state_ext,
                 transition,
-                initial_state,
+                initial_state if transition is not None else None,
             ).contiguous()
-            send_work = dist.isend(send_buffer, dst=next_rank, group=cp_group)
+            send_handle = dist.isend(send_buffer, dst=next_rank, group=cp_group)
 
+        if recv_handle is not None:
+            recv_handle.wait()
+            initial_state = recv_buffer
         h, v_new, _ = chunk_gated_delta_rule_fwd_apply_state_saved(
             key_norm,
             g_cumsum,
             w,
             u,
-            initial_state=initial_state,
+            initial_state=initial_state if sequence_info is None else sequence_info.first_state(initial_state),
             output_final_state=False,
+            cu_seqlens=cu_seqlens,
         )
         output = chunk_gated_delta_rule_fwd_output_saved(
             query_norm,
@@ -668,10 +721,12 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             h,
             v_new,
             scale,
+            cu_seqlens=cu_seqlens,
         ).to(query.dtype)
 
-        if send_work is not None:
-            send_work.wait()
+        if send_handle is not None:
+            send_handle.wait()
+        del send_buffer
 
         empty = query.new_empty(0)
         ctx.save_for_backward(
@@ -683,8 +738,13 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             matrix_a,
             initial_state if initial_state is not None else empty,
             transition if transition is not None else empty,
+            cu_seqlens if cu_seqlens is not None else query.new_empty(0, dtype=torch.int64),
         )
+        ctx.sequence_info = sequence_info
         ctx.has_initial_state = initial_state is not None
+        ctx.has_transition = transition is not None
+        ctx.receive_previous = receive_previous
+        ctx.send_next = send_next
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         ctx.cp_group = cp_group
@@ -715,10 +775,28 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             matrix_a,
             initial_state,
             transition,
+            saved_cu_seqlens,
         ) = ctx.saved_tensors
+        sequence_info = ctx.sequence_info
+        cu_seqlens = None if sequence_info is None else saved_cu_seqlens
         if not ctx.has_initial_state:
             initial_state = None
 
+        grad_final_state = None
+        recv_handle = None
+        if ctx.send_next:
+            recv_buffer = torch.empty(
+                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
+                device=grad_output.device,
+                dtype=torch.float32,
+            )
+            recv_handle = dist.irecv(
+                recv_buffer,
+                src=ctx.next_rank,
+                group=ctx.cp_group,
+            )
+
+        kernel_initial = initial_state if sequence_info is None else sequence_info.first_state(initial_state)
         w, h, v_new, dv = chunk_gated_delta_rule_bwd_prepare_saved(
             query,
             key,
@@ -726,64 +804,53 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             g_cumsum,
             beta,
             matrix_a,
-            initial_state,
+            kernel_initial,
             grad_output,
             ctx.scale,
+            cu_seqlens=cu_seqlens,
         )
 
         grad_state_ext = None
-        if ctx.cp_rank > 0:
+        if ctx.receive_previous:
+            head = slice(None) if sequence_info is None else sequence_info.head
             grad_state_ext = chunk_gated_delta_rule_state_gradient_summary_bwd(
-                query,
-                key,
-                w,
-                g_cumsum,
-                grad_output,
-                dv,
-                ctx.scale,
-            )
+                query[:, head], key[:, head], w[:, head], g_cumsum[:, head],
+                grad_output[:, head], dv[:, head], ctx.scale)
 
-        grad_final_state = None
-        recv_work = None
-        if ctx.cp_rank < ctx.cp_size - 1:
-            recv_buffer = torch.empty(
-                (query.shape[0], query.shape[2], query.shape[3], value.shape[3]),
-                device=grad_output.device,
-                dtype=torch.float32,
-            )
-            recv_work = dist.irecv(
-                recv_buffer,
-                src=ctx.next_rank,
-                group=ctx.cp_group,
-            )
-        if recv_work is not None:
-            recv_work.wait()
+        if recv_handle is not None and (sequence_info is None or sequence_info.transfer_active):
+            recv_handle.wait()
             grad_final_state = recv_buffer
+            recv_handle = None
 
         send_buffer = None
-        send_work = None
-        if ctx.cp_rank > 0:
+        send_handle = None
+        if ctx.receive_previous:
             send_buffer = apply_gdn_state_gradient_summary(
                 grad_state_ext,
                 transition,
-                grad_final_state,
+                grad_final_state if ctx.has_transition else None,
             ).contiguous()
-            send_work = dist.isend(
+            send_handle = dist.isend(
                 send_buffer,
                 dst=ctx.prev_rank,
                 group=ctx.cp_group,
             )
 
+        if recv_handle is not None:
+            recv_handle.wait()
+            grad_final_state = recv_buffer
+        kernel_grad_final = grad_final_state if sequence_info is None else sequence_info.last_state(grad_final_state)
         dh, _, dv = chunk_gated_delta_rule_bwd_state_saved(
             query,
             key,
             g_cumsum,
             w,
-            initial_state,
-            grad_final_state,
+            kernel_initial,
+            kernel_grad_final,
             grad_output,
             dv,
             ctx.scale,
+            cu_seqlens=cu_seqlens,
         )
         empty = query.new_empty(0)
         dq, dk, dv, dg, dbeta = chunk_gated_delta_rule_bwd_finish_saved(
@@ -805,11 +872,12 @@ class _GDNStateP2PTritonFunction(torch.autograd.Function):
             empty,
             ctx.scale,
             use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens,
         )
 
-        if send_work is not None:
-            send_work.wait()
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None
+        if send_handle is not None:
+            send_handle.wait()
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
 
 
 def _gdn_state_p2p_triton(
@@ -821,6 +889,7 @@ def _gdn_state_p2p_triton(
     cp_mesh: DeviceMesh,
     cp_rank: int,
     cp_size: int,
+    sequence_info: Optional[PackedSequenceInfo] = None,
 ) -> torch.Tensor:
     """Run fused local GDN with an affine state wavefront."""
     if cp_size == 1:
@@ -833,6 +902,7 @@ def _gdn_state_p2p_triton(
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
             backend="triton",
+            cu_seqlens=None if sequence_info is None else sequence_info.materialize(query.device, 64).cu_seqlens,
         )
         return output
 
@@ -853,6 +923,7 @@ def _gdn_state_p2p_triton(
         cp_mesh.get_group(),
         prev_rank,
         next_rank,
+        sequence_info,
     )
 
 
@@ -907,7 +978,7 @@ def _differentiable_all_to_all_shard(
     split_len = a2a_input.shape[0] // split_count
     input_splits = [split_len] * split_count
     output_splits = [split_len] * split_count
-    output = _collectives.differentiable_all_to_all_single(
+    output = communication.differentiable_all_to_all_single(
         a2a_input,
         input_splits,
         output_splits,
@@ -944,16 +1015,20 @@ class GatedDeltaNetUlyssesCP(nn.Module):
 
     ``[B, S_local, full_heads] -> [B, S_full, local_heads] ->
     [B, S_local, full_heads]``.
+
+    ``backend`` selects both the local attention core and convolution for dense
+    and packed inputs.
     """
 
     def __init__(
         self,
         module: nn.Module,
-        device_mesh: DeviceMesh,
+        device_mesh: Optional[DeviceMesh],
         *,
         backend: str = "eager",
         chunk_size: int = 64,
-    ):
+    ) -> None:
+        """Initialize the shared attention and convolution backend."""
         super().__init__()
         self.module = module
         backend = backend.lower()
@@ -964,16 +1039,19 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             )
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
-        if backend == "triton" and chunk_size != 64:
-            raise NotImplementedError("GDN Triton backend requires chunk_size=64.")
+        if backend in ("triton", "ascendc") and chunk_size != 64:
+            raise NotImplementedError("Fused GDN backends require chunk_size=64.")
         self.gdn_backend = backend
         self.chunk_size = chunk_size
-        self.cp_mesh = _ensure_1d(device_mesh)
-        self.cp_size = self.cp_mesh.size()
-        self.cp_rank = self.cp_mesh.get_local_rank()
+        self.cp_mesh = None if device_mesh is None else _ensure_1d(device_mesh)
+        self.cp_size = 1 if self.cp_mesh is None else self.cp_mesh.size()
+        self.cp_rank = 0 if self.cp_mesh is None else self.cp_mesh.get_local_rank()
         self.seq_dim = 1
         self.head_dim = 2
         self._validate_module()
+        if self.gdn_backend != "eager":
+            _validate_gdn_activation(self.module)
+            self._validate_fused_conv()
 
     def _validate_module(self) -> None:
         """Validate the wrapped GDN module and Ulysses layout constraints."""
@@ -989,8 +1067,6 @@ class GatedDeltaNetUlyssesCP(nn.Module):
                 "Qwen3.5 GDN layer is missing required attributes: "
                 + ", ".join(missing)
             )
-        if self.cp_size <= 1:
-            return
         if self.module.num_k_heads % self.cp_size != 0:
             raise ValueError(
                 f"linear attention num_k_heads ({self.module.num_k_heads}) must be "
@@ -1005,7 +1081,19 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             raise ValueError("GDN num_v_heads must be divisible by num_k_heads.")
         _validate_gdn_activation(self.module)
 
+    def _validate_fused_conv(self) -> None:
+        """Reject source convolutions whose semantics differ from a causal depthwise kernel."""
+        convolution = self.module.conv1d
+        if convolution.stride != (1,) or convolution.dilation != (1,):
+            raise ValueError("GDN fused convolution requires stride=1 and dilation=1.")
+        if convolution.groups != convolution.in_channels or convolution.out_channels != convolution.in_channels:
+            raise ValueError("GDN fused convolution requires equal input/output channels and depthwise groups.")
+        if convolution.padding != (convolution.kernel_size[0] - 1,) or convolution.padding_mode != "zeros":
+            raise ValueError("GDN fused convolution requires causal zero padding.")
+
     def _seq_to_head(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.cp_size == 1:
+            return tensor
         return _differentiable_all_to_all_shard(
             tensor,
             self.cp_mesh,
@@ -1014,6 +1102,8 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         )
 
     def _head_to_seq(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.cp_size == 1:
+            return tensor
         return _differentiable_all_to_all_shard(
             tensor,
             self.cp_mesh,
@@ -1084,6 +1174,32 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             cp_size=self.cp_size,
         )
 
+    def _convolve_exchanged_qkv(self, q_proj, k_proj, v_proj, exchanged_info, full_seq_len, local_conv_dim):
+        """Apply head-local ShortConv with the restored document boundaries."""
+        base = self.module
+        mixed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=-1)
+        weight, bias = self._local_conv_weight(), self._local_conv_bias()
+        if exchanged_info is not None:
+            return packed_causal_conv1d(
+                mixed_qkv, base.conv1d, exchanged_info,
+                weight=weight, bias=bias, backend=self.gdn_backend,
+            )
+        if self.gdn_backend != "eager":
+            return fused_causal_conv1d(
+                mixed_qkv, weight, bias, backend=self.gdn_backend,
+                dilation=base.conv1d.dilation[0],
+            )
+        conv_out = F.conv1d(
+            input=mixed_qkv.transpose(1, 2),
+            weight=weight,
+            bias=bias,
+            stride=base.conv1d.stride,
+            padding=base.conv1d.padding,
+            dilation=base.conv1d.dilation,
+            groups=local_conv_dim,
+        )
+        return F.silu(conv_out[:, :, :full_seq_len]).transpose(1, 2)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1094,17 +1210,14 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         """Run Gated DeltaNet with pure Ulysses context parallel."""
         if cache_params is not None:
             raise NotImplementedError("GDN Ulysses CP currently supports training without cache only.")
-        if (
-            kwargs.get("cu_seq_lens_q") is not None
-            or kwargs.get("seq_idx") is not None
-        ):
-            raise NotImplementedError("Packed variable-length GDN Ulysses CP is not implemented.")
         hidden_states = _local_tensor_at_cp_boundary(hidden_states)
-        if self.gdn_backend == "triton" and hidden_states.shape[1] % 64:
-            raise NotImplementedError(
-                "GDN Ulysses Triton backend requires each rank's local "
-                f"sequence length ({hidden_states.shape[1]}) divisible by 64."
-            )
+        is_flat_input = hidden_states.ndim == 2
+        if is_flat_input:
+            hidden_states = hidden_states.unsqueeze(0)
+        sequence_info = resolve_packed_sequence(
+            kwargs, hidden_states.shape[1], cp_rank=self.cp_rank, cp_size=self.cp_size)
+        if sequence_info is not None and hidden_states.shape[0] != 1:
+            raise ValueError("Packed GDN requires batch dimension one.")
 
         base = self.module
         hidden_states = _apply_local_padding_mask(hidden_states, attention_mask)
@@ -1136,17 +1249,10 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         local_num_v_heads = base.num_v_heads // self.cp_size
         local_conv_dim = local_key_dim * 2 + local_value_dim
 
-        mixed_qkv = torch.cat((q_proj, k_proj, v_proj), dim=-1).transpose(1, 2)
-        conv_out = F.conv1d(
-            input=mixed_qkv,
-            weight=self._local_conv_weight(),
-            bias=self._local_conv_bias(),
-            stride=base.conv1d.stride,
-            padding=base.conv1d.padding,
-            dilation=base.conv1d.dilation,
-            groups=local_conv_dim,
+        exchanged_info = None if sequence_info is None else sequence_info.ulysses(self.cp_size, self.cp_rank)
+        mixed_qkv = self._convolve_exchanged_qkv(
+            q_proj, k_proj, v_proj, exchanged_info, full_seq_len, local_conv_dim,
         )
-        mixed_qkv = F.silu(conv_out[:, :, :full_seq_len]).transpose(1, 2)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -1167,6 +1273,10 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             query = query.repeat_interleave(kv_groups, dim=2)
             key = key.repeat_interleave(kv_groups, dim=2)
 
+        cu_seqlens = None
+        if exchanged_info is not None:
+            cu_seqlens = (exchanged_info.local_offsets if self.gdn_backend == "ascendc" else
+                          exchanged_info.materialize(query.device, self.chunk_size).cu_seqlens)
         core_attn_out, _ = chunk_gated_delta_rule(
             query,
             key,
@@ -1178,6 +1288,7 @@ class GatedDeltaNetUlyssesCP(nn.Module):
             chunk_size=self.chunk_size,
             use_qk_l2norm_in_kernel=True,
             backend=self.gdn_backend,
+            cu_seqlens=cu_seqlens,
         )
 
         core_attn_out = self._head_to_seq(core_attn_out)
@@ -1187,7 +1298,8 @@ class GatedDeltaNetUlyssesCP(nn.Module):
         core_attn_out = core_attn_out.reshape(bsz, local_seq_len, base.value_dim)
         if hasattr(base, "out_proj_input"):
             core_attn_out = base.out_proj_input(core_attn_out)
-        return base.out_proj(core_attn_out)
+        output = base.out_proj(core_attn_out)
+        return output.squeeze(0) if is_flat_input else output
 
 
 class GatedDeltaNetP2PCP(nn.Module):
@@ -1204,6 +1316,8 @@ class GatedDeltaNetP2PCP(nn.Module):
         super().__init__()
         self.module = module
         backend = backend.lower()
+        if backend == "ascendc":
+            raise NotImplementedError("GDN Ascend C state P2P is not supported; select the pure Ulysses wrapper.")
         if backend not in _GDN_BACKENDS:
             raise ValueError(
                 f"unsupported GDN backend {backend!r}; "
@@ -1215,9 +1329,9 @@ class GatedDeltaNetP2PCP(nn.Module):
             raise NotImplementedError("GDN Triton backend requires chunk_size=64.")
         self.gdn_backend = backend
         self.chunk_size = chunk_size
-        self.cp_mesh = _ensure_1d(device_mesh)
-        self.cp_size = self.cp_mesh.size()
-        self.cp_rank = self.cp_mesh.get_local_rank()
+        self.cp_mesh = None if device_mesh is None else _ensure_1d(device_mesh)
+        self.cp_size = 1 if self.cp_mesh is None else self.cp_mesh.size()
+        self.cp_rank = 0 if self.cp_mesh is None else self.cp_mesh.get_local_rank()
         self._validate_module()
 
     def _validate_module(self) -> None:
@@ -1261,7 +1375,9 @@ class GatedDeltaNetP2PCP(nn.Module):
                 "linear attention P2P CP expects conv1d channels to match conv_dim."
             )
 
-    def _conv1d_with_halo(self, mixed_qkv: torch.Tensor) -> torch.Tensor:
+    def _conv1d_with_halo(
+        self, mixed_qkv: torch.Tensor, sequence_info: Optional[PackedSequenceInfo] = None,
+    ) -> torch.Tensor:
         """Run local Conv1d after exchanging only the previous-rank halo."""
         return _causal_conv1d_with_cp_halo(
             mixed_qkv,
@@ -1269,6 +1385,7 @@ class GatedDeltaNetP2PCP(nn.Module):
             self.cp_mesh,
             self.cp_rank,
             self.cp_size,
+            sequence_info=sequence_info,
         )
 
     def forward(
@@ -1281,12 +1398,14 @@ class GatedDeltaNetP2PCP(nn.Module):
         """Run Gated DeltaNet on local sequence shards with recurrent-state P2P."""
         if cache_params is not None:
             raise NotImplementedError("GDN P2P CP currently supports training without cache only.")
-        if (
-            kwargs.get("cu_seq_lens_q") is not None
-            or kwargs.get("seq_idx") is not None
-        ):
-            raise NotImplementedError("Packed variable-length GDN P2P is not implemented.")
         hidden_states = _local_tensor_at_cp_boundary(hidden_states)
+        is_flat_input = hidden_states.ndim == 2
+        if is_flat_input:
+            hidden_states = hidden_states.unsqueeze(0)
+        sequence_info = resolve_packed_sequence(
+            kwargs, hidden_states.shape[1], cp_rank=self.cp_rank, cp_size=self.cp_size)
+        if sequence_info is not None and hidden_states.shape[0] != 1:
+            raise ValueError("Packed GDN requires batch dimension one.")
 
         base = self.module
         hidden_states = _apply_local_padding_mask(hidden_states, attention_mask)
@@ -1302,7 +1421,7 @@ class GatedDeltaNetP2PCP(nn.Module):
         b = base.in_proj_b(hidden_states)
         a = base.in_proj_a(hidden_states)
 
-        mixed_qkv = self._conv1d_with_halo(mixed_qkv)
+        mixed_qkv = self._conv1d_with_halo(mixed_qkv, sequence_info=sequence_info)
         query, key, value = torch.split(
             mixed_qkv,
             [base.key_dim, base.key_dim, base.value_dim],
@@ -1321,12 +1440,6 @@ class GatedDeltaNetP2PCP(nn.Module):
             key = key.repeat_interleave(kv_groups, dim=2)
 
         if self.gdn_backend == "triton":
-            if local_seq_len % 64 != 0:
-                raise NotImplementedError(
-                    "linear attention P2P Triton backend requires each CP "
-                    f"rank's local sequence length ({local_seq_len}) to be "
-                    "divisible by 64."
-                )
             if not is_triton_gdn_available(query, key, value, g, beta):
                 raise RuntimeError(
                     "linear attention P2P Triton backend requires an NPU "
@@ -1342,6 +1455,7 @@ class GatedDeltaNetP2PCP(nn.Module):
                 self.cp_mesh,
                 self.cp_rank,
                 self.cp_size,
+                sequence_info=sequence_info,
             )
         else:
             core_attn_out = _gdn_state_p2p_summary(
@@ -1355,6 +1469,7 @@ class GatedDeltaNetP2PCP(nn.Module):
                 self.cp_size,
                 chunk_size=self.chunk_size,
                 use_qk_l2norm_in_kernel=True,
+                sequence_info=sequence_info,
             )
 
         core_attn_out = core_attn_out.reshape(-1, base.head_v_dim)
@@ -1363,8 +1478,319 @@ class GatedDeltaNetP2PCP(nn.Module):
         core_attn_out = core_attn_out.reshape(bsz, local_seq_len, base.value_dim)
         if hasattr(base, "out_proj_input"):
             core_attn_out = base.out_proj_input(core_attn_out)
-        return base.out_proj(core_attn_out)
+        output = base.out_proj(core_attn_out)
+        return output.squeeze(0) if is_flat_input else output
 
 
+def _exchange_previous_cp_halo(tail: torch.Tensor, cp_mesh: Any) -> torch.Tensor:
+    """Adapt channel-first convolution boundaries to the shared halo exchange."""
+    halo = _all_to_all_previous_rank_halo(
+        tail.transpose(1, 2).contiguous(), cp_mesh, cp_mesh.get_local_rank(), cp_mesh.size())
+    return halo.transpose(1, 2).contiguous()
 
-__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]
+
+def _gdn_cp_causal_conv1d(
+        original_conv: Callable[..., Any], cp_mesh: Any,
+        hidden_states: torch.Tensor, weight: torch.Tensor,
+        bias: Any = None, activation: Any = None, **kwargs: Any) -> Any:
+    """Run the original causal Conv1d with the previous CP rank's halo."""
+    halo_width = weight.shape[-1] - 1
+    if halo_width <= 0 or cp_mesh.size() <= 1:
+        return original_conv(
+            hidden_states, weight, bias, activation, **kwargs)
+    if hidden_states.shape[-1] < halo_width:
+        raise ValueError(
+            "GDN CP requires local sequence length "
+            f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
+            f"({halo_width})"
+        )
+    tail = hidden_states[..., -halo_width:].contiguous()
+    halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    conv_input = torch.cat((halo, hidden_states), dim=-1)
+    output = original_conv(
+        conv_input, weight, bias, activation, **kwargs)
+    return output[..., halo_width:].contiguous()
+
+
+def _gdn_cp_conv1d_module(
+        original_forward: Callable[..., Any], conv_module: Any,
+        cp_mesh: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the Transformers Conv1d fallback with the previous CP halo."""
+    kernel_size = conv_module.kernel_size[0]
+    dilation = conv_module.dilation[0]
+    halo_width = (kernel_size - 1) * dilation
+    if halo_width <= 0 or cp_mesh.size() <= 1:
+        return original_forward(hidden_states)
+    if hidden_states.shape[-1] < halo_width:
+        raise ValueError(
+            "GDN CP requires local sequence length "
+            f"({hidden_states.shape[-1]}) to be at least Conv1d halo width "
+            f"({halo_width})"
+        )
+    tail = hidden_states[..., -halo_width:].contiguous()
+    halo = _exchange_previous_cp_halo(tail, cp_mesh)
+    conv_input = torch.cat((halo, hidden_states), dim=-1)
+    output = original_forward(conv_input)
+    local_length = hidden_states.shape[-1]
+    return output[..., halo_width:halo_width + local_length].contiguous()
+
+
+def _gdn_rule_cp_to_hp(
+        query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+        decay: torch.Tensor, beta: torch.Tensor,
+        cp_mesh: Any) -> tuple[torch.Tensor, ...]:
+    """Convert local-sequence GDN rule inputs into local-head layouts."""
+    tensors = (query, key, value, decay, beta)
+    expected_dims = (4, 4, 4, 3, 3)
+    if any(
+            tensor.dim() != expected
+            for tensor, expected in zip(tensors, expected_dims)):
+        shapes = [tuple(tensor.shape) for tensor in tensors]
+        raise ValueError(
+            "GDN CP expects 4-D Q/K/V and 3-D g/beta, got "
+            f"{shapes}"
+        )
+    if any(tensor.shape[1] != query.shape[1] for tensor in tensors[1:]):
+        raise ValueError("GDN CP inputs must share the sequence length")
+    return tuple(
+        ulysses_seq_to_head(
+            tensor, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
+        for tensor in tensors
+    )
+
+
+def _gdn_rule_hp_to_cp(
+        output: torch.Tensor, cp_mesh: Any) -> torch.Tensor:
+    """Restore one GDN rule output to the local-sequence layout."""
+    if output.dim() != 4:
+        raise ValueError(
+            "GDN CP expects a 4-D GDN rule output, got "
+            f"shape {tuple(output.shape)}"
+        )
+    return ulysses_head_to_seq(
+        output, seq_dim=1, head_dim=2, cp_mesh=cp_mesh)
+
+
+def _validate_gdn_cp(target_module: Any, cp_mesh: Any) -> None:
+    """Validate the GDN interface required by CP interception."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        raise ValueError("GDN CP requires an active CP mesh")
+    module_name = type(target_module).__name__
+    if "GatedDeltaNet" not in module_name:
+        raise TypeError(
+            "GDN CP wrapper requires a GatedDeltaNet module, got "
+            f"{module_name}"
+        )
+    num_value_heads = getattr(target_module, "num_v_heads", None)
+    if not isinstance(num_value_heads, int) or num_value_heads <= 0:
+        raise ValueError(
+            "GDN CP requires target_module.num_v_heads to be a "
+            "positive integer"
+        )
+    if num_value_heads % cp_mesh.size():
+        raise ValueError(
+            f"GDN value heads ({num_value_heads}) must be divisible "
+            f"by CP size ({cp_mesh.size()})"
+        )
+
+
+def _resolve_gdn_forward_implementation(
+        original_forward: Callable[..., Any]) -> Callable[..., Any]:
+    """Resolve the GDN implementation beneath Transformers hook wrappers."""
+    supported_rule_names = {
+        "torch_chunk_gated_delta_rule",
+        "chunk_gated_delta_rule",
+    }
+    implementation = inspect.unwrap(original_forward)
+    visited = set()
+    while id(implementation) not in visited:
+        visited.add(id(implementation))
+        referenced_names = set(implementation.__code__.co_names)
+        if supported_rule_names & referenced_names:
+            return implementation
+        closure = inspect.getclosurevars(implementation).nonlocals
+        wrapped = closure.get("forward_func")
+        if not callable(wrapped):
+            break
+        implementation = inspect.unwrap(wrapped)
+    raise RuntimeError(
+        "GDN CP could not resolve the Transformers forward "
+        "implementation"
+    )
+
+
+def install_gdn_ulysses_cp(
+    target_module: Any,
+    cp_mesh: Any,
+) -> None:
+    """Install primitive-level Ulysses CP around a GDN forward."""
+    _validate_gdn_cp(target_module, cp_mesh)
+    original_forward = target_module.forward
+    forward_impl = _resolve_gdn_forward_implementation(original_forward)
+    forward_globals = forward_impl.__globals__
+    referenced_names = set(forward_impl.__code__.co_names)
+
+    conv_name = "causal_conv1d_fn"
+    conv_owner = target_module if hasattr(target_module, conv_name) else forward_globals
+    original_conv = (
+        getattr(conv_owner, conv_name)
+        if conv_owner is target_module else conv_owner.get(conv_name)
+    )
+    conv_module = getattr(target_module, "conv1d", None)
+    original_conv_forward = getattr(conv_module, "forward", None)
+    use_fused_conv = conv_name in referenced_names and callable(original_conv)
+    use_module_conv = (
+        not use_fused_conv
+        and "conv1d" in referenced_names
+        and callable(original_conv_forward)
+    )
+    if not use_fused_conv and not use_module_conv:
+        raise RuntimeError(
+            "GDN CP requires a fused or module causal Conv1d path"
+        )
+
+    rule_names = tuple(
+        name for name in (
+            "torch_chunk_gated_delta_rule",
+            "chunk_gated_delta_rule",
+        )
+        if name in referenced_names and (
+            callable(getattr(target_module, name, None))
+            or callable(forward_globals.get(name))
+        )
+    )
+    if not rule_names:
+        raise RuntimeError(
+            "GDN CP could not find a supported chunk Gated Delta "
+            "Rule call in the Transformers forward"
+        )
+    rule_owners = {
+        name: target_module if callable(getattr(target_module, name, None))
+        else forward_globals
+        for name in rule_names
+    }
+    original_rules = {
+        name: getattr(owner, name) if owner is target_module else owner[name]
+        for name, owner in rule_owners.items()
+    }
+
+    def replace_primitive(owner: Any, name: str, value: Callable[..., Any]) -> None:
+        """Replace one module attribute or forward global primitive."""
+        if owner is target_module:
+            setattr(owner, name, value)
+        else:
+            owner[name] = value
+
+    def make_cp_rule(original_rule: Callable[..., Any]) -> Callable[..., Any]:
+        """Build one CP-aware wrapper for a referenced GDN rule primitive."""
+        @functools.wraps(original_rule)
+        def cp_rule(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            if args:
+                raise TypeError(
+                    "GDN CP expects g and beta to be passed by keyword"
+                )
+            decay = kwargs.get("g")
+            beta = kwargs.get("beta")
+            if not isinstance(decay, torch.Tensor) or not isinstance(beta, torch.Tensor):
+                raise TypeError(
+                    "GDN CP requires Tensor keyword arguments g and beta"
+                )
+            if kwargs.get("initial_state") is not None or kwargs.get(
+                    "output_final_state", False):
+                raise NotImplementedError(
+                    "GDN CP does not support recurrent cache state"
+                )
+            query, key, value, decay, beta = _gdn_rule_cp_to_hp(
+                query, key, value, decay, beta, cp_mesh)
+            call_kwargs = dict(kwargs)
+            call_kwargs.update(g=decay, beta=beta)
+            output = original_rule(query, key, value, **call_kwargs)
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise TypeError(
+                    "GDN rule must return (output, recurrent_state)"
+                )
+            core_output, recurrent_state = output
+            if recurrent_state is not None:
+                raise NotImplementedError(
+                    "GDN CP does not support a returned recurrent state"
+                )
+            return _gdn_rule_hp_to_cp(core_output, cp_mesh), recurrent_state
+
+        return cp_rule
+
+    @functools.wraps(original_forward)
+    def cp_forward(*args: Any, **kwargs: Any) -> Any:
+        """Run the original GDN forward with CP-aware primitive interfaces."""
+        cache_params = kwargs.get("cache_params")
+        if cache_params is None and len(args) > 1:
+            cache_params = args[1]
+        if cache_params is not None:
+            raise NotImplementedError(
+                "GDN CP currently supports training with cache_params=None"
+            )
+        if kwargs.get("cu_seq_lens_q") is not None:
+            raise NotImplementedError(
+                "GDN CP does not support packed sequences"
+            )
+
+        fired = {"conv": 0, "rule": 0}
+
+        if use_fused_conv:
+            @functools.wraps(original_conv)
+            def cp_conv(*conv_args: Any, **conv_kwargs: Any) -> Any:
+                fired["conv"] += 1
+                if not conv_args and "x" in conv_kwargs:
+                    conv_kwargs = dict(conv_kwargs)
+                    conv_args = (conv_kwargs.pop("x"),)
+                return _gdn_cp_causal_conv1d(
+                    original_conv, cp_mesh, *conv_args, **conv_kwargs)
+        else:
+            @functools.wraps(original_conv_forward)
+            def cp_conv(hidden_states: torch.Tensor) -> torch.Tensor:
+                fired["conv"] += 1
+                return _gdn_cp_conv1d_module(
+                    original_conv_forward, conv_module, cp_mesh, hidden_states)
+
+        def count_rule(wrapped_rule):
+            @functools.wraps(wrapped_rule)
+            def counted_rule(*rule_args: Any, **rule_kwargs: Any) -> Any:
+                fired["rule"] += 1
+                return wrapped_rule(*rule_args, **rule_kwargs)
+
+            return counted_rule
+
+        wrapped_rules = {
+            name: count_rule(make_cp_rule(original_rule))
+            for name, original_rule in original_rules.items()
+        }
+
+        if use_fused_conv:
+            replace_primitive(conv_owner, conv_name, cp_conv)
+        else:
+            conv_module.forward = cp_conv
+        for name, wrapped_rule in wrapped_rules.items():
+            replace_primitive(rule_owners[name], name, wrapped_rule)
+        try:
+            output = original_forward(*args, **kwargs)
+        finally:
+            if use_fused_conv:
+                replace_primitive(conv_owner, conv_name, original_conv)
+            else:
+                conv_module.forward = original_conv_forward
+            for name, original_rule in original_rules.items():
+                replace_primitive(rule_owners[name], name, original_rule)
+        if fired["conv"] != 1 or fired["rule"] != 1:
+            raise RuntimeError(
+                "GDN CP wrapper expected one causal Conv1d and one "
+                "Gated Delta Rule call, got "
+                f"conv={fired['conv']}, rule={fired['rule']}"
+            )
+        return output
+
+    target_module.forward = cp_forward
