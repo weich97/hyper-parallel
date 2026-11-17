@@ -14,7 +14,9 @@
 # ============================================================================
 """Unit tests for unified multicore payload lookup and OPP diagnostics."""
 
+import ctypes
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -24,7 +26,7 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore import _loader
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
-
+from tests.common.mark_utils import arg_mark
 
 class TestMulticoreNative(unittest.TestCase):
     """Verify component-owned OPP environment and payload lookup."""
@@ -46,8 +48,24 @@ class TestMulticoreNative(unittest.TestCase):
         )
         adapter.parent.mkdir(parents=True)
         adapter.write_bytes(b"adapter")
+        (adapter.parent / "libhyper_parallel_mega_gate_torch.so").write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
+
+    def test_vendor_preload_keeps_dependency_symbols_local(self) -> None:
+        """Load the exact vendor locally and preserve the cause of any load failure."""
+        library = self.vendor_root / "op_api" / "lib" / "libcust_opapi.so"
+        error = OSError("missing dependency")
+        for failure in (None, error):
+            with patch.object(_loader.ctypes, "CDLL", side_effect=failure) as load:
+                if failure is None:
+                    _loader.preload_vendor_library(self.vendor_root)
+                else:
+                    with self.assertRaisesRegex(NativeComponentUnavailableError, "missing dependency") as raised:
+                        _loader.preload_vendor_library(self.vendor_root)
+                    self.assertIs(raised.exception.__cause__, error)
+                    self.assertIn(str(library), str(raised.exception))
+                load.assert_called_once_with(str(library), mode=ctypes.RTLD_LOCAL)
 
     def test_component_paths_accept_sourced_environment_without_modifying_it(self):
         """Lookup accepts the sourced vendor paths without changing the process environment."""
@@ -64,35 +82,49 @@ class TestMulticoreNative(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), patch.object(_loader, "sys", SimpleNamespace(modules={})):
-            vendor_root, adapter = _loader.get_multicore_paths()
+            vendor_root, default_adapter = _loader.get_multicore_paths()
+            _, gate_adapter = _loader.get_multicore_adapter_path(
+                "hyper_parallel_mega_gate_torch"
+            )
             opp_value = os.environ["ASCEND_CUSTOM_OPP_PATH"]
             library_value = os.environ["LD_LIBRARY_PATH"]
 
         self.assertEqual(vendor_root, self.vendor_root.resolve())
-        self.assertEqual(adapter.name, "libhyper_parallel_mega_moe_torch.so")
+        self.assertEqual(default_adapter.name, "libhyper_parallel_mega_moe_torch.so")
+        self.assertEqual(gate_adapter.name, "libhyper_parallel_mega_gate_torch.so")
         self.assertEqual(opp_value, environment["ASCEND_CUSTOM_OPP_PATH"])
         self.assertEqual(library_value, environment["LD_LIBRARY_PATH"])
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_requires_set_env(self):
-        """The loader requires explicit environment activation before a framework is loaded."""
+        """Feature: MegaKernel diagnostics.
+        Description: The loader requires explicit environment activation before a framework is loaded.
+        Expectation: Missing opp environment requires set env.
+        """
         with patch.dict(os.environ, {}, clear=True), patch.object(
             _loader, "sys", SimpleNamespace(modules={})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_after_framework_import_is_too_late(self):
-        """The loader rejects activation after framework initialization."""
+        """Feature: MegaKernel diagnostics.
+        Description: The loader rejects activation after framework initialization.
+        Expectation: Missing opp environment after framework import is too late.
+        """
         with patch.dict(os.environ, {}, clear=True), patch.object(
             _loader, "sys", SimpleNamespace(modules={"torch": object()})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()

@@ -1,0 +1,29 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend@sha256:e62e85cb1bef9625cf568d0e8e2ac8e4b76f946eb6e8d9d459cfcf99565bea5d
+ARG AGENT_IMAGE=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl@sha256:0d1e8af0cbc8eb558497958b827260fa6d9a635fc20e4ec74916587b0348731d
+FROM ${AGENT_IMAGE} AS agent
+FROM ${BASE_IMAGE}
+
+# Reuse the reviewed standalone CLI without changing the official inference stack.
+COPY --from=agent /opt/codex /opt/codex
+ENV PATH=/opt/codex/bin:/opt/codex/codex-path:${PATH}
+RUN printf '%s\n' \
+    '285958769bc41cd70812524ca96631bf679635f4f1c08320ab1f31d958e81b24  /opt/codex/bin/codex' \
+    '8c5723b7c2c642bb07d94166ee8effa11dc3b78166a29209df1b1983d0a5b3e9  /opt/codex/bin/codex-code-mode-host' \
+    | sha256sum --check
+
+RUN test "$(codex --version)" = 'codex-cli 0.152.1'

@@ -35,7 +35,6 @@ Key design decisions for TP optimizer state dict testing:
     ranks. For TP+FSDP, DP ranks within the same TP group shard the model.
 """
 import math
-import os
 import shutil
 
 
@@ -50,11 +49,10 @@ from hyper_parallel import (  # noqa: E402
     ColwiseParallel,
     RowwiseParallel,
     SkipDTensorDispatch,
-    get_optim_state_dict,
     init_device_mesh,
     parallelize_module,
-    set_optim_state_dict,
 )
+from hyper_parallel.core.distributed_checkpoint import get_optim_state_dict, set_optim_state_dict
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy  # noqa: E402
@@ -77,7 +75,14 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(hidden_f, out_f, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: two-layer MLP with ReLU activation."""
+        """Apply the two-layer MLP with ReLU activation.
+
+        Args:
+            x: Input tensor.
+
+        Returns:
+            Output tensor from the second linear layer.
+        """
         return self.w2(F.relu(self.w1(x)))
 
 
@@ -331,7 +336,7 @@ def test_t5_tp_fsdp_optim_state_dict_flatten():
     opts = StateDictOptions(flatten_optimizer_state_dict=True)
     sd = get_optim_state_dict(model, optimizer, options=opts)
 
-    for key in sd.keys():
+    for key in sd:
         assert key.startswith("state.") or key.startswith("param_group."), (
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )

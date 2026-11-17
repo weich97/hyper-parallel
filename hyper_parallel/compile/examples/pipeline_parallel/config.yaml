@@ -1,13 +1,13 @@
-# Pipeline Parallel example configuration.
+# Pipeline Parallel (VPP / Interleaved 1F1B) example configuration.
 #
 # NOTE: fsdp / pp are TOP-LEVEL keys here so the whole file can be fed
-# directly to create_pass_plan_from_yaml(); model / train / logging keys
+# directly to create_plan_from_yaml(); model / train / logging keys
 # are ignored by the plan parser.
 
 model:
   vocab_size: 512
   dim: 64
-  num_layers: 4     # must be >= pp_degree for the even-by-layers split
+  num_layers: 4     # >= pp_degree * pp_chunks (virtual stage count)
   seq_len: 32
 
 train:
@@ -21,22 +21,28 @@ logging:
   log_interval: 5
 
 # ============================================================================
-# Stage split plan (parsed by create_pass_plan_from_yaml)
+# Stage split plan (parsed by create_plan_from_yaml)
 # ============================================================================
-# Pipeline-parallel (v1): pure PP — FSDP must stay disabled, and
-# world_size must equal pp_degree (one stage per rank).
+# Pipeline-parallel: pure PP — FSDP must stay disabled (the PP+FSDP/DDP
+# hybrid is configured through the compiler's 2-D (pp, DP) mesh).
 fsdp:
   enabled: false
 
 pp:
-  # Omit "stages" entirely for the AUTOMATIC even-by-layers split:
-  #   stage 0 -> [tok_embeddings, layers.0, layers.1]
-  #   stage 1 -> [layers.2, layers.3, norm, lm_head]
+  # Omit "stages" entirely for the AUTOMATIC even-by-layers split across the
+  # VIRTUAL stages (pp_degree * pp_chunks == 4 here):
+  #   virtual 0 (rank 0) -> [tok_embeddings, layers.0]
+  #   virtual 1 (rank 1) -> [layers.1]
+  #   virtual 2 (rank 0) -> [layers.2]
+  #   virtual 3 (rank 1) -> [layers.3, norm, lm_head]
   #
-  # Or declare the cut manually (exact module FQNs, no wildcards):
+  # Or declare the cut manually (exact module FQNs, no wildcards; one list per
+  # VIRTUAL stage):
   # stages:
-  #   - [tok_embeddings, layers.0, layers.1]
-  #   - [layers.2, layers.3, norm, lm_head]
+  #   - [tok_embeddings, layers.0]
+  #   - [layers.1]
+  #   - [layers.2]
+  #   - [layers.3, norm, lm_head]
 
 # ============================================================================
 # Parallel Configuration (Core)
@@ -44,5 +50,7 @@ pp:
 parallel:
   enable_overlap: true
   pp_enabled: true        # opt-in; PpPass slices the joint graph per stage
-  pp_degree: 2            # == world_size (one stage per rank, v1)
+  pp_degree: 2            # physical pipeline ranks (pure PP: == world_size)
+  pp_chunks: 2            # 2 virtual stages per rank -> 4 virtual stages
   pp_microbatch_size: 2   # batch_size 8 -> 4 microbatches in flight
+  pp_schedule: vpp        # "interleaved_1f1b" alias; use 1f1b + chunks=1 to disable VPP

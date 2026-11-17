@@ -29,11 +29,13 @@ import torch
 
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_hsdp_interface
 from hyper_parallel.core.fully_shard import hsdp_state as state_mod
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
+from tests.common.mark_utils import arg_mark
 
 
 class _FakeGroup:
@@ -346,16 +348,22 @@ class TestHSDPStateV2(unittest.TestCase):
         self.assertFalse(state.requires_all_reduce)
         self.assertFalse(state.param_group.requires_all_reduce)
 
-    def test_init_mp_dtypes_initializes_each_param_independently(self):
-        """Mixed-precision dtype init should not require state-wide uniform dtypes."""
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_init_mp_dtypes_initializes_each_param_independently(self) -> None:
+        """Feature: Shared precision policy initialization.
+        Description: Initialize two parameters independently from their state's policy.
+        Expectation: Each parameter receives the state policy without state-wide dtype constraints.
+        """
         first = _FakeHSDPParam()
         second = _FakeHSDPParam()
         state = _new_state([first, second])
+        state.mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
         HSDPStateV2._init_mp_dtypes(state)
 
-        first.init_dtype_attrs.assert_called_once_with(None)
-        second.init_dtype_attrs.assert_called_once_with(None)
+        first.init_dtype_attrs.assert_called_once_with(state.mp_policy)
+        second.init_dtype_attrs.assert_called_once_with(state.mp_policy)
         self.assertFalse(hasattr(state, "_orig_dtype"))
         self.assertFalse(hasattr(state, "_reduce_dtype"))
 
@@ -442,6 +450,25 @@ class TestHSDPStateV2(unittest.TestCase):
                 )
                 param.apply_reduced_grad.assert_called_once_with(current_output)
 
+    def test_final_size_one_expert_gradient_with_compact_partial_applies_early(self):
+        """Consume the staged partial before the root finalizes other parameters."""
+        gradient = torch.ones(2)
+        param = _FakeHSDPParam(dp_size=1)
+        param.sharded_param._hp_staged_main_grad = (gradient.bfloat16(), None)
+        param.reduce_scatter_output.return_value = gradient
+        param.reduce_scatter_comm_ctx.reduce_scatter_output = gradient
+        state = _new_state([param])
+        state.scheduler_ctx.pre_reduce_scatter_params.append(param)
+
+        state._wait_prev_reduce_scatter_without_all_reduce()
+        _new_root_scheduler(state).launch_tp_replicate_reduce_and_apply()
+
+        param.all_reduce_source_replicate_grad_inplace.assert_called_once_with(
+            gradient, torch.distributed.ReduceOp.AVG,
+        )
+        param.apply_reduced_grad.assert_called_once_with(gradient)
+        self.assertIsNone(param.reduce_scatter_comm_ctx.reduce_scatter_output)
+
     def test_all_reduce_group_consumes_partial_output_in_reduce_dtype(self):
         """The final HSDP AR buffer should consume partial RS output, not parameter grad."""
         param = _FakeHSDPParam(dp_size=2)
@@ -492,7 +519,9 @@ class TestHSDPStateV2(unittest.TestCase):
     def test_post_backward_no_reduce_accumulates_and_reshards(self):
         """Post-backward without reduction should accumulate grads and reshard."""
         param = _FakeHSDPParam()
-        state = _new_state([param])
+        uninitialized = object.__new__(HSDPParamV2)
+        uninitialized.unsharded_accumulated_grad = torch.ones(2)
+        state = _new_state([param, uninitialized])
         state.reduce_grads = False
         state.shard = MagicMock()
 
@@ -500,20 +529,31 @@ class TestHSDPStateV2(unittest.TestCase):
 
         param.accumulate_unsharded_grad_if_needed.assert_called_once()
         param.to_accumulated_grad_if_needed.assert_called_once()
+        torch.testing.assert_close(uninitialized.unsharded_accumulated_grad, torch.ones(2))
         state.shard.assert_called_once()
 
     def test_post_backward_groups_sharded_and_replicated_params_by_process_group(self):
         """Post-backward should route sharded and replicated params through the unified pipeline."""
+        uninitialized = _FakeHSDPParam()
+        del uninitialized._unsharded_param
+        uninitialized.unsharded_param_buffers = [torch.empty(4)]
+        uninitialized.allgather_comm_ctx.allgather_handle = MagicMock()
         sharded = _FakeHSDPParam(unsharded_grad=torch.ones(2), shard_size=2)
         replicated = _FakeHSDPParam(unsharded_grad=torch.ones(2), shard_size=1)
-        state = _new_state([sharded, replicated])
+        accumulated = _FakeHSDPParam(accumulated_grad=torch.full((2,), 2.0))
+        accumulated.mesh_info.replicate_process_group = sharded.mesh_info.replicate_process_group
+        state = _new_state([uninitialized, sharded, replicated, accumulated])
         state.shard = MagicMock()
 
         HSDPStateV2.post_backward(state)
 
+        uninitialized.accumulate_unsharded_grad_if_needed.assert_called_once()
+        uninitialized.reduce_scatter_grad.assert_not_called()
         sharded.reduce_scatter_grad.assert_called_once()
         replicated.reduce_scatter_grad.assert_called_once()
+        accumulated.reduce_scatter_grad.assert_called_once()
         self.assertEqual(len(state.scheduler_ctx.pre_all_reduce_groups), 2)
+        self.assertIsNotNone(uninitialized.allgather_comm_ctx.allgather_handle)
         state.shard.assert_called_once()
 
     def test_post_backward_for_comm_fusion_drains_context_and_launches_param_group(self):
@@ -719,7 +759,10 @@ class TestHSDPStateV2(unittest.TestCase):
         other_state.param_group.reset_iter_state.assert_not_called()
 
     def test_scheduler_reset_clears_pipeline_and_recompute_state(self):
-        """Scheduler reset should clear hooks and restore prefetch configuration."""
+        """Feature: Scheduler iteration reset.
+        Description: Reset communication, callback, and recompute bookkeeping.
+        Expectation: Pending state is cleared and prefetch configuration is restored.
+        """
         scheduler = object.__new__(HSDPSchedulerV2)
         scheduler.scheduler_state = object()
         scheduler._fsdp_group_post_pending = {object()}
@@ -732,10 +775,12 @@ class TestHSDPStateV2(unittest.TestCase):
         comm_ctx.all_reduce_param_group = object()
         comm_ctx.comm_handle = object()
         scheduler.scheduler_ctx.root_bp_state = True
+        scheduler.scheduler_ctx.post_backward_final_callback_queued = True
 
         scheduler.reset_iter_state()
 
         self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
+        self.assertFalse(scheduler.scheduler_ctx.post_backward_final_callback_queued)
         self.assertIsNone(scheduler.scheduler_state)
         self.assertEqual(scheduler._fsdp_group_post_pending, set())
         self.assertEqual(scheduler.forward_prefetch_cells, ["prefetch"])

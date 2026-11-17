@@ -18,12 +18,14 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../../.." && pwd)
+default_image=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 
 deployment=${1:-}
 [[ "${deployment}" == "colocated" || "${deployment}" == "disjoint" ]] || {
     printf 'Usage: %s {colocated|disjoint}\n' "$0" >&2
     exit 1
 }
+shift
 
 implementation=${HYPER_QWEN3_TP_IMPLEMENTATION:-hyper}
 [[ "${implementation}" == "hyper" || "${implementation}" == "native" ]] || {
@@ -96,7 +98,7 @@ done
 }
 
 workspace_root=$(cd -- "${repo_root}/.." && pwd)
-image=${HYPER_QWEN3_TP_IMAGE:-swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64}
+image=${HYPER_QWEN3_TP_IMAGE:-${default_image}}
 model_root=${HYPER_QWEN3_TP_MODEL_ROOT:-${workspace_root}/models/Qwen3-4B}
 data_root=${HYPER_QWEN3_TP_DATA_ROOT:-${workspace_root}/data/gsm8k}
 result_root=${HYPER_QWEN3_TP_RESULT_ROOT:-${repo_root}/hyper_parallel/rl/output/qwen3-tp-smoke}
@@ -220,7 +222,7 @@ if [[ -n "${requested_devices}" ]]; then
     fi
     resolved_rollout_devices=$(IFS=','; printf '%s' "${rollout_device_list[*]}")
 fi
-config_path=${repo_root}/hyper_parallel/rl/examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml
+config_path=${repo_root}/hyper_parallel/rl/examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml
 mkdir -p "${result_root}"
 result_root=$(cd -- "${result_root}" && pwd)
 
@@ -317,6 +319,8 @@ printf 'Qwen3 TP smoke: deployment=%s implementation=%s trainer_tp=%s rollout_tp
 container_name="hyper-qwen3-${implementation}-trainer-tp${trainer_tp}-rollout-tp${rollout_tp}-$$"
 docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}" --network=host \
     -e "ASCEND_RT_VISIBLE_DEVICES=${all_visible}" \
+    -e "HYPER_RESULT_UID=$(id -u)" \
+    -e "HYPER_RESULT_GID=$(id -g)" \
     -e HYPER_PARALLEL_PLATFORM=torch \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
@@ -357,6 +361,7 @@ docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}"
     -w /workspace/hyper-parallel \
     "${image}" /bin/bash -lc '
         set -euo pipefail
+        trap "chown -R ${HYPER_RESULT_UID}:${HYPER_RESULT_GID} /results" EXIT
         unset VLLM_PLUGINS
         export PYTHONPATH=/workspace/hyper-parallel/hyper_parallel/rl:/workspace/hyper-parallel:${PYTHONPATH:-}
         bash /workspace/hyper-parallel/hyper_parallel/rl/docker/install_runtime.sh
@@ -373,7 +378,6 @@ docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}"
 
         args=(
             /run-config.yaml
-            --consistency.enabled=false
             --data.train_path=/data/gsm8k/train.parquet
             --data.max_train_samples=4
             --data.shuffle=false
@@ -416,6 +420,6 @@ docker run --rm --name "${container_name}" --privileged --shm-size="${shm_size}"
         log_file="/results/${HYPER_RUN_DEPLOYMENT}-${HYPER_RUN_IMPLEMENTATION}-trainer-tp${HYPER_RUN_TRAINER_TP}-rollout-tp${HYPER_RUN_ROLLOUT_TP}-${HYPER_RUN_WEIGHT_SYNC_STRATEGY}.log"
         timeout --signal=TERM --kill-after=60s "${HYPER_RUN_TIMEOUT}s" \
             python -m torch.distributed.run --standalone --nproc_per_node="${HYPER_RUN_TRAINER_COUNT}" \
-            hyper_parallel/rl/train_rl.py "${args[@]}" 2>&1 | tee "${log_file}"
+            hyper_parallel/rl/train_rl.py "${args[@]}" "$@" 2>&1 | tee "${log_file}"
         exit "${PIPESTATUS[0]}"
-    '
+    ' hyper-rl-trainer "$@"

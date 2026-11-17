@@ -16,15 +16,17 @@
 
 import unittest
 
-from hyper_parallel.core.multicore.profiler.profiling import (
+from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import (
     CORE_HEADER,
     CUBE_SLOT_COUNT,
     INVALID_OWNER_ID,
     PROFILE_RECORD,
+    TASK_TYPE_NAMES,
     _CycleTraceConfig,
     _parse_cycle_buffer,
     _profile_buffer_bytes_for_capacities,
 )
+from hyper_parallel.core.multicore.scheduler.config import TaskType
 
 
 _AIC_CAPACITY = 16
@@ -78,7 +80,7 @@ def _profile_buffer(
     return buffer
 
 
-def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
+def _parse(buffer: bytes, *, detailed_task_names: bool = False, aiv_capacity: int = _AIV_CAPACITY) -> dict:
     return _parse_cycle_buffer(
         buffer,
         _CycleTraceConfig(
@@ -93,7 +95,7 @@ def _parse(buffer: bytes, *, detailed_task_names: bool = False) -> dict:
             task_stage_names={9: "GMM1"},
         ),
         aic_record_capacity=_AIC_CAPACITY,
-        aiv_record_capacity=_AIV_CAPACITY,
+        aiv_record_capacity=aiv_capacity,
     )
 
 
@@ -144,12 +146,36 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
                 self.assertEqual(event["args"]["task_stage"], "GMM1")
 
     def test_unknown_task_type_uses_generic_fallback(self):
-        """Keep a record readable when a concrete Kernel has no stage rule."""
+        """Keep a record readable when its task type is not registered."""
+        unknown_task_type = 0xFFFF
+        self.assertNotIn(unknown_task_type, TASK_TYPE_NAMES)
+        trace = _parse(_profile_buffer(desc_id=0x20000 + unknown_task_type))
+        event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
+
+        self.assertEqual(event["name"], f"TaskType_{unknown_task_type}")
+        self.assertEqual(event["args"]["task_type"], unknown_task_type)
+
+    def test_registered_mhc_post_task_type_preserves_its_name(self):
+        """Decode registered MHC task 107 instead of treating it as unknown."""
         trace = _parse(_profile_buffer(desc_id=0x20000 + 107))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 
-        self.assertEqual(event["name"], "TaskType_107")
+        self.assertEqual(event["name"], "TaskType_MhcPost")
         self.assertEqual(event["args"]["task_type"], 107)
+
+    def test_get_task_name_does_not_alias_mega_gate(self):
+        """Decode GET using its dispatch ID without labeling MegaGate as SHMEM."""
+        cases = (
+            (TaskType.TASK_SHMEM_GET_MEM, "TaskType_ShmemGetMem"),
+            (TaskType.TASK_GATE_SOFTPLUS, f"TaskType_{int(TaskType.TASK_GATE_SOFTPLUS)}"),
+        )
+        for task_type, expected_name in cases:
+            with self.subTest(task_type=task_type):
+                trace = _parse(_profile_buffer(desc_id=0x20000 + int(task_type)))
+                event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
+
+                self.assertEqual(event["name"], expected_name)
+                self.assertEqual(event["args"]["task_type"], int(task_type))
 
     def test_dropped_count_is_reported_without_overwriting_records(self):
         """Surface Device overflow in metadata and warnings."""

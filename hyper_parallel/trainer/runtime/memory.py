@@ -1,4 +1,5 @@
 # Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
 
 """Trainer-side host/device memory helpers.
 
@@ -18,7 +20,16 @@ Split out of the former ``auto_models/components/utils/helper.py`` in stage 7
 (05 §10.4); function names and signatures are unchanged.
 """
 
+__all__ = [
+    "empty_cache",
+    "peak_device_memory",
+    "print_cpu_memory_info",
+    "print_device_mem_info",
+    "reset_peak_device_memory",
+]
+
 import gc
+from typing import Dict, Optional
 
 import psutil
 
@@ -65,8 +76,22 @@ def empty_cache() -> None:
         get_torch_device().empty_cache()
 
 
-__all__ = [
-    "empty_cache",
-    "print_cpu_memory_info",
-    "print_device_mem_info",
-]
+
+def reset_peak_device_memory() -> None:
+    """Reset peak allocator counters for one measured training step."""
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+        get_torch_device().reset_peak_memory_stats()
+
+
+def peak_device_memory() -> Dict[str, Optional[int]]:
+    """Return peak allocated/reserved bytes, or nulls for CPU execution."""
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        return {
+            "peak_memory_allocated_bytes": None,
+            "peak_memory_reserved_bytes": None,
+        }
+    device = get_torch_device()
+    return {
+        "peak_memory_allocated_bytes": int(device.max_memory_allocated()),
+        "peak_memory_reserved_bytes": int(device.max_memory_reserved()),
+    }

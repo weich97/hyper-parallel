@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """planner: ShardingPlanner 6-phase derivation pipeline (05 §3.6 canonical).
 
 Phase 1  parameter role classification (ParameterClassifier + the family's
@@ -23,7 +24,7 @@ Phase 2  communication boundary grouping (two passes: first group by owning
 Phase 3  semantic role inference (explicit FQN patterns > structural guards
          > parameter role combinations)
 Phase 4  template lookup to generate spec (_build_spec_from_template)
-Phase 4.5 user plan_overrides merge (_merge_plan_overrides, 05 §3.6.7)
+Phase 4.5 user plan_overrides merge/insert (_merge_plan_overrides, 05 §3.6.7)
 Phase 5  _is_terminal marking only (D-14, 05 §13: compile-time chain
          propagation/validation removed — specs are fully self-declared and
          each module vouches for its own propagation in validate mode)
@@ -37,6 +38,7 @@ Registries:
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)} —
   lives in ``_builder/special_handlers.py``.
 """
+# pylint: disable=forbidden-backend-import
 
 import copy
 import logging
@@ -54,6 +56,7 @@ from hyper_parallel.core.dtensor.placement_types import (
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.distributed.recipe_spec import (
     DP,
+    EP,
     TP,
     ModuleShardingSpec,
 )
@@ -111,6 +114,28 @@ _MLP_PATTERNS = ("mlp", "ffn", "feed_forward")
 _MOE_CONTAINER_PATTERNS = ("mlp", "moe", "moe_block", "moe_layer")
 
 
+def _get_architecture(model) -> str:
+    """Detect the canonical architecture name:
+    config.architectures[0] > config.model_type > class name;
+    lowercased with ForCausalLM-style suffixes stripped."""
+    cfg = getattr(model, "config", None)
+    arch_str = None
+    archs = getattr(cfg, "architectures", None)
+    if archs:
+        arch_str = archs[0]
+    if not arch_str:
+        arch_str = getattr(cfg, "model_type", None)
+    if not arch_str:
+        arch_str = type(model).__name__
+
+    s = arch_str.lower()
+    for suffix in ("forcausallm", "forconditionalgeneration",
+                   "forsequenceclassification", "forimagetexttotext"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
 class ShardingPlanner:
     """Automatically derive a ShardingPlan from any HF-style model (05 §3.6.6).
 
@@ -132,8 +157,11 @@ class ShardingPlanner:
       inserted as-is and must be fully self-declared — an override with
       empty params AND empty contracts fails fast ("no template matched");
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to every
-      matching boundary; a pattern hitting nothing warns loudly. Glob keys
-      never insert new boundaries.
+      matching boundary. A glob with a concrete parameter or I/O contract
+      also expands against the final model tree and inserts unmatched modules
+      with the same validation as exact insert mode. Partial globs carrying
+      only injection/attribute changes remain merge-only and fail if they
+      target a model module for which no boundary was derived.
 
     The YAML transport (``hyper_parallel.trainer.config.PlanOverride``) is
     converted to this dict by ``entries_to_plan_overrides()`` on the trainer
@@ -212,15 +240,14 @@ class ShardingPlanner:
             return
         for boundary_fqn, group in boundary_groups.items():
             boundary_type = self._infer_boundary_type(boundary_fqn, group)
-            template = self._templates.get(boundary_type)
-            if template is None:
+            if self._templates.get(boundary_type) is None:
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
             spec = _build_spec_from_template(
                 self._templates,
                 boundary_fqn,
                 group,
-                template,
+                self._templates.get(boundary_type),
                 sequence_parallel,
                 loss_parallel,
                 mesh_dim_names,
@@ -230,7 +257,7 @@ class ShardingPlanner:
                 continue
             if boundary_type == "moe_mlp":
                 self._mark_hf_native_moe(
-                    spec, group, boundary_fqn, template, mesh_dim_names, arch,
+                    spec, group, boundary_fqn, self._templates.get(boundary_type), mesh_dim_names, arch,
                     ep_extend=ep_extend, mesh=mesh, model=model, param_ndims=param_ndims,
                 )
             plan.modules[boundary_fqn] = spec
@@ -241,11 +268,14 @@ class ShardingPlanner:
         model: Any,
         *,
         tp_size: int,
+        ep_size: int,
+        mesh: DeviceMesh,
         mesh_dim_names: Tuple[str, ...],
     ) -> None:
         """Normalize overrides and finish placement-dependent boundary metadata."""
         _merge_plan_overrides(self._plan_overrides, plan, model, derive=self._derive)
         _normalize_contract_fields(plan)
+        self._mark_virtual_ep_parameters(plan, ep_size, mesh)
         _finalize_tp_local_attr_plans(plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names)
         self._finalize_deferred_biases(plan, model, mesh_dim_names)
         self._finalize_fused_expert_tp_guard(plan, tp_size=tp_size)
@@ -256,10 +286,26 @@ class ShardingPlanner:
         if enabled:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
 
-    def _classify_boundary_groups(self, model: Any, arch: str):
+    @staticmethod
+    def _resolve_isolated_roots(model: Any, arch: str) -> tuple[str, ...]:
+        """Find subtrees whose activation layout is owned by a separate runtime."""
+        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+        adapter = get_model_adapter(arch)
+        if adapter is None or adapter.encoder_parallel is None:
+            return ()
+        spec = adapter.encoder_parallel()
+        names = {name for name, _ in model.named_modules()}
+        return tuple(root for root in spec.isolated_subtrees if root in names)
+
+    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=()):
         """Classify model parameters and group them into candidate boundaries."""
         param_roles = self._classify_all_params(model, arch)
-        return param_roles, self._group_by_boundary(param_roles)
+        regular_roles = {
+            name: role for name, role in param_roles.items()
+            if not any(name.startswith(root + ".") for root in isolated_roots)
+        }
+        return param_roles, self._group_by_boundary(regular_roles)
 
     def plan(
         self,
@@ -321,9 +367,48 @@ class ShardingPlanner:
                 (05 §3.1.1 coordinate-system convention: the plan is always a
                 single dp slice).
         """
-        arch = self._get_architecture(model)
+        arch = _get_architecture(model)
         self._check_overrides_no_dp()   # fail-first: the plan's coordinate system = a single dp slice
         mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
+        plan, param_roles, param_metadata = self._build_plan(
+            model,
+            mesh,
+            mesh_dim_names,
+            arch,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            loss_parallel=loss_parallel,
+        )
+
+        # D-14 invariants, Phase 5/6, F4 lints, DX guard, tied weights
+        plan = self._finalize_plan(
+            plan,
+            model,
+            param_roles,
+            param_metadata,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            ep_size=ep_size,
+        )
+
+        self._log_explanation(plan, explain)
+
+        return plan
+
+    def _build_plan(
+        self,
+        model: Any,
+        mesh: DeviceMesh,
+        mesh_dim_names: Tuple[str, ...],
+        arch: str,
+        *,
+        tp_size: int,
+        ep_size: int,
+        sequence_parallel: bool,
+        loss_parallel: bool,
+    ) -> Tuple[ShardingPlan, Dict[str, ParamRole], Tuple[Dict[str, int], Dict[str, Tuple[int, ...]]]]:
+        """Run Phases 1-4.5: classify, derive, and merge boundary specs."""
         # D-10 TP-extend-EP (05 §6.4.8): ep_size is the extended EP group
         # size (the a2a communication domain, extended from the TP group to
         # neighboring dp/cp ranks; expert weights are sharded only along
@@ -331,16 +416,17 @@ class ShardingPlanner:
         # happens when _mark_hf_native_moe actually matches an HF-native
         # MoE (pre-stacked EP-aware modules use their own dispatcher and
         # are not subject to this constraint)
-        ep_extend = ep_size if ep_size > 1 else 0
-
         # Phase 1: parameter role classification
-        param_roles, boundary_groups = self._classify_boundary_groups(model, arch)
+        isolated_roots = self._resolve_isolated_roots(model, arch) if self._derive else ()
+        param_roles, boundary_groups = self._classify_boundary_groups(model, arch, isolated_roots)
 
         # Phase 3+4: semantic inference + template-fills I/O
-        param_ndims = {name: p.ndim for name, p in model.named_parameters()}
         # F4a/F4b: full shapes + requires_grad for the plan-time lints
         # (meta tensors carry shapes too — the zero-memory path is unaffected)
-        param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
+        param_metadata = (
+            {name: p.ndim for name, p in model.named_parameters()},
+            {name: tuple(p.shape) for name, p in model.named_parameters()},
+        )
         plan = ShardingPlan(
             mesh_dim_names=mesh_dim_names,
             sequence_parallel=sequence_parallel,
@@ -353,18 +439,42 @@ class ShardingPlanner:
             loss_parallel=loss_parallel,
             mesh_dim_names=mesh_dim_names,
             arch=arch,
-            ep_extend=ep_extend,
+            ep_extend=ep_size if ep_size > 1 else 0,
             mesh=mesh,
             model=model,
-            param_ndims=param_ndims,
+            param_ndims=param_metadata[0],
         )
 
-        # Phase 4.5: unified override pass — merge mode (unset fields inherit
-        # the derived spec) / insert mode (fully self-declared only) / glob.
+        for root in isolated_roots:
+            module = model.get_submodule(root)
+            params = {name: {TP: Replicate()} for name, parameter in module.named_parameters()
+                      if parameter.requires_grad}
+            plan.modules[root] = ModuleShardingSpec(params=params, in_src={}, in_dst={}, is_boundary=False)
+
+        # Phase 4.5: merge derived matches and expand fully declared globs
+        # against the final model tree to insert new boundaries.
         self._finalize_boundary_specs(
-            plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
+            plan,
+            model,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            mesh=mesh,
+            mesh_dim_names=mesh_dim_names,
         )
+        return plan, param_roles, param_metadata
 
+    def _finalize_plan(
+        self,
+        plan: ShardingPlan,
+        model: Any,
+        param_roles: Dict[str, ParamRole],
+        param_metadata: Tuple[Dict[str, int], Dict[str, Tuple[int, ...]]],
+        *,
+        tp_size: int,
+        cp_size: int,
+        ep_size: int,
+    ) -> ShardingPlan:
+        """Run the D-14 invariants, Phase 5/6, the F4 lints, and tied pairs."""
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)
         self._check_full_declaration(plan)
@@ -383,7 +493,7 @@ class ShardingPlanner:
         #      shard at apply time becomes a plan-time teaching error;
         # F4b: every trainable parameter must be covered by the plan.
         self._check_shard_divisibility(
-            plan, param_shapes, tp_size=tp_size, cp_size=cp_size,
+            plan, param_metadata[1], tp_size=tp_size, cp_size=cp_size,
             ep_size=ep_size)
         self._check_all_trainable_params_covered(plan, model)
 
@@ -393,34 +503,14 @@ class ShardingPlanner:
 
         # tied-weight detection (embed <-> lm_head sharing storage)
         plan.tied_pairs = self._detect_tied_pairs(model)
-
-        self._log_explanation(plan, explain)
-
         return plan
 
     # ── Architecture detection ──────────────────────────────────────────
 
     @staticmethod
     def _get_architecture(model) -> str:
-        """Detect the canonical architecture name:
-        config.architectures[0] > config.model_type > class name;
-        lowercased with ForCausalLM-style suffixes stripped."""
-        cfg = getattr(model, "config", None)
-        arch_str = None
-        archs = getattr(cfg, "architectures", None)
-        if archs:
-            arch_str = archs[0]
-        if not arch_str:
-            arch_str = getattr(cfg, "model_type", None)
-        if not arch_str:
-            arch_str = type(model).__name__
-
-        s = arch_str.lower()
-        for suffix in ("forcausallm", "forconditionalgeneration",
-                       "forsequenceclassification", "forimagetexttotext"):
-            if s.endswith(suffix):
-                s = s[: -len(suffix)]
-        return s
+        """Compatibility wrapper for the module-level architecture helper."""
+        return _get_architecture(model)
 
     @staticmethod
     def _validate_dtensor_axes(
@@ -625,10 +715,14 @@ class ShardingPlanner:
                     merged[parent].extend(params)
                 else:
                     # Still unknown after backtracking to the root:
-                    # attribute to the parameter's own module (no template
-                    # will match later → skipped)
-                    origin = ".".join(params[0][0].split(".")[:-1]) if params else mfqn
-                    groups.setdefault(origin, params)
+                    # attribute each parameter to its own module (no template
+                    # will match later → skipped). Unrelated unknown
+                    # subtrees may have merged at the root, so anchoring the
+                    # whole group to the first parameter would produce invalid
+                    # relative names for the remaining parameters.
+                    for param_fqn, role in params:
+                        origin = param_fqn.rpartition(".")[0]
+                        groups.setdefault(origin, []).append((param_fqn, role))
         return groups
 
     # ── Phase 3 ─────────────────────────────────────────────────────────
@@ -713,15 +807,11 @@ class ShardingPlanner:
         moe_type = self._moe_boundary_type(fqn, roles)
         return moe_type if moe_type is not None else self._dense_boundary_type(fqn_lower, group)
 
-
     # ── Phase 4 post-processing: MoE EP marking (D-09/D-10, 05 §6.4.7/§6.4.8) ──
 
     @staticmethod
-    def _validate_ep_extend(ep_extend, mesh, model) -> None:
-        """D-10 TP-extend-EP validation (05 §6.4.8): ep_size must not
-        exceed the dense region and must divide it;
-        num_experts % ep_size == 0 (each rank holds num_experts/ep_size
-        complete experts).
+    def _validate_ep_domain(ep_extend, mesh) -> None:
+        """Validate that virtual EP evenly partitions the dense rank domain.
 
         The dense region = all ranks of the non-pp mesh axes
         (dp_replicate × dp_cp × tp).
@@ -732,7 +822,7 @@ class ShardingPlanner:
         for name, size in zip(names, shape):
             if name == "pp" and size > 1:
                 raise NotImplementedError(
-                    "D-10 TP-extend-EP v1 does not support pp>1 "
+                    "virtual EP v1 does not support pp>1 "
                     "(split the mesh by stage before calling)"
                 )
             if name != "pp":
@@ -742,12 +832,53 @@ class ShardingPlanner:
                 f"ep_size ({ep_extend}) must not exceed and must divide "
                 f"the dense region (dp_replicate × dp_cp × tp = {domain})"
             )
+
+    @classmethod
+    def _validate_ep_extend(cls, ep_extend, mesh, model) -> None:
+        """Validate virtual EP plus the routed-expert count constraint."""
+        cls._validate_ep_domain(ep_extend, mesh)
         num_experts = (getattr(getattr(model, "config", None), "num_experts", None)
                        or getattr(getattr(model, "config", None), "n_routed_experts", 0))
         if num_experts and num_experts % ep_extend != 0:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({ep_extend})"
             )
+
+    @classmethod
+    def _mark_virtual_ep_parameters(
+        cls,
+        plan: ShardingPlan,
+        ep_size: int,
+        mesh: DeviceMesh,
+    ) -> None:
+        """Map explicit virtual-EP parameters to the derived expert mesh.
+
+        This deliberately keys off placement semantics rather than parameter
+        names, so routed experts and sparse lookup tables use one mechanism.
+        The boundary still has to inject its matching all-to-all computation.
+        """
+        if ep_size <= 1 or "ep" in tuple(getattr(mesh, "mesh_dim_names", ()) or ()):
+            return
+        marked = []
+        for fqn, spec in plan.modules.items():
+            if getattr(spec, "_ep_size", 0):  # pylint: disable=protected-access
+                continue
+            ep_params = [
+                name
+                for name, named in (spec.params or {}).items()
+                if isinstance((named or {}).get(EP), Shard)
+            ]
+            if ep_params:
+                spec._ep_size = ep_size  # pylint: disable=protected-access
+                marked.append((fqn, ep_params))
+        if not marked:
+            return
+        cls._validate_ep_domain(ep_size, mesh)
+        logger.info(
+            "virtual EP: mapped explicitly EP-sharded parameters to the "
+            "derived expert mesh: %s",
+            marked,
+        )
 
     # per-expert parameter pattern: experts.<idx>.<proj>.weight (legacy HF /
     # in-house MoE layouts).
@@ -837,7 +968,8 @@ class ShardingPlanner:
                 spec.params[stacked] = _multi_dim(
                     tp=None, cp=Replicate(), ep=template.moe_expert_placement
                 )
-                spec._ep_stack[stacked] = sources  # pylint: disable=protected-access  # planner owns the spec DSL internals
+                # The planner owns the spec DSL internals.
+                spec._ep_stack[stacked] = sources  # pylint: disable=protected-access
             spec.region_dispatch = None
             return
         if batched:
@@ -1086,6 +1218,15 @@ class ShardingPlanner:
         )
 
     @staticmethod
+    def _bias_owner_path(param_name: str) -> Optional[str]:
+        """Return a bias owner's module path, or ``None`` for other params."""
+        if param_name == "bias":
+            return ""
+        if param_name.endswith(".bias"):
+            return param_name[: -len(".bias")]
+        return None
+
+    @staticmethod
     def _collect_deferred_biases(module_fqn: str, spec: ModuleShardingSpec, module: nn.Module) -> List[str]:
         """Validate one boundary's biases and collect rowwise deferred names."""
         named_params = dict(module.named_parameters())
@@ -1095,23 +1236,20 @@ class ShardingPlanner:
         ]
         deferred: List[str] = []
         for param_name, param in named_params.items():
-            if param_name == "bias":
-                owner_path = ""
-            elif param_name.endswith(".bias"):
-                owner_path = param_name[: -len(".bias")]
-            else:
+            owner_path = ShardingPlanner._bias_owner_path(param_name)
+            if owner_path is None:
                 continue
             weight_path = f"{owner_path}.weight" if owner_path else "weight"
             weight = named_params.get(weight_path)
-            weight_named = (spec.params or {}).get(weight_path)
-            if weight is None or weight_named is None:
+            tp_placement = (spec.params or {}).get(weight_path)
+            if weight is None or tp_placement is None:
                 continue
-            tp_placement = weight_named.get(TP)
+            tp_placement = tp_placement.get(TP)
             if not isinstance(tp_placement, Shard):
                 continue
             shard_dim = tp_placement.dim if tp_placement.dim >= 0 else tp_placement.dim + weight.ndim
-            bias_named = spec.params.get(param_name)
-            bias_tp = bias_named.get(TP) if bias_named else None
+            bias_tp = spec.params.get(param_name)
+            bias_tp = bias_tp.get(TP) if bias_tp else None
             if shard_dim == weight.ndim - 1:
                 if ShardingPlanner._should_defer_rowwise_bias(
                     module_fqn, module, owner_path, param_name, bias_tp, out_src, partial_outputs
@@ -1119,7 +1257,7 @@ class ShardingPlanner:
                     deferred.append(param_name)
             else:
                 ShardingPlanner._validate_colwise_bias(
-                    module_fqn, weight_path, param_name, param, bias_named, bias_tp, shard_dim
+                    module_fqn, weight_path, param_name, param, spec.params.get(param_name), bias_tp, shard_dim
                 )
         return deferred
 
@@ -1177,7 +1315,8 @@ class ShardingPlanner:
                     "after the TP reduction): %s",
                     module_fqn, list(deferred))
 
-    def _check_param_uniqueness(self, plan: ShardingPlan) -> None:
+    @staticmethod
+    def _check_param_uniqueness(plan: ShardingPlan) -> None:
         """D-14 invariant 1 (05 §13.3): every parameter is sharded by exactly
         one boundary. spec.params keys are resolved to full parameter FQNs
         (relative to the boundary module); any parameter declared by ≥2 specs
@@ -1198,7 +1337,8 @@ class ShardingPlanner:
                     )
                 seen[full] = fqn
 
-    def _check_full_declaration(self, plan: ShardingPlan) -> None:
+    @staticmethod
+    def _check_full_declaration(plan: ShardingPlan) -> None:
         """D-14 (05 §13.2): chain fill is removed — every boundary spec must
         fully declare its I/O contract. A non-empty in_dst with an empty
         in_src fails fast (the previous Scenario-1 fill no longer exists)."""
@@ -1212,8 +1352,58 @@ class ShardingPlanner:
 
     # ── F4 plan-time lints (accuracy_fix_plan.md §2) ─────────────────────
 
+    @staticmethod
+    def _check_param_shard_divisibility(
+        fqn: str,
+        prefix: str,
+        pname: str,
+        placement: Dict[str, Any],
+        param_shapes: Dict[str, Tuple[int, ...]],
+        ep_stack: Dict[str, List[str]],
+        axis_sizes: Dict[str, int],
+    ) -> None:
+        """Check every sharded mesh axis for one declared parameter."""
+        full = prefix + pname
+        shape = param_shapes.get(full)
+        if shape is None and pname in ep_stack:
+            sources = ep_stack[pname]
+            shape = param_shapes.get(prefix + sources[0]) if sources else None
+            if shape is not None:
+                shape = (len(sources), *shape)
+        if shape is None:
+            return  # created later (inner_target factory) — nothing to check
+        for axis, p in (placement or {}).items():
+            if not isinstance(p, Shard):
+                continue
+            size = axis_sizes.get(axis, 1)
+            if size <= 1:
+                continue
+            axis_name = getattr(axis, "value", axis)  # MeshAxisName → "tp"
+            dim = p.dim + len(shape) if p.dim < 0 else p.dim
+            if dim >= len(shape):
+                raise ValueError(
+                    f"plan-time shard check failed: {full!r} has shape "
+                    f"{tuple(shape)} but boundary {fqn!r} declares "
+                    f"{{{axis_name}: Shard({p.dim})}} — dim {p.dim} is out "
+                    f"of range for a {len(shape)}D parameter; fix the "
+                    f"plan_overrides declaration"
+                )
+            if shape[dim] % size != 0:
+                raise ValueError(
+                    f"plan-time shard check failed: {full!r} has shape "
+                    f"{tuple(shape)} but boundary {fqn!r} declares "
+                    f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
+                    f"is not divisible by {axis_name} size {size} (it would "
+                    f"produce empty shards at apply time). This is most "
+                    f"often a parameter-classification error (e.g. a "
+                    f"replicated/gate parameter misclassified into a "
+                    f"sharded role — see accuracy_fix_plan.md §2): fix "
+                    f"the naming rule / family sharding_rules entry, or correct "
+                    f"the plan_overrides declaration"
+                )
+
+    @staticmethod
     def _check_shard_divisibility(
-        self,
         plan: ShardingPlan,
         param_shapes: Dict[str, Tuple[int, ...]],
         *,
@@ -1245,46 +1435,22 @@ class ShardingPlanner:
                 "ep": getattr(spec, "_ep_size", 0) or ep_size,
             }
             for pname, placement in (spec.params or {}).items():
-                full = prefix + pname
-                shape = param_shapes.get(full)
-                if shape is None and pname in ep_stack:
-                    sources = ep_stack[pname]
-                    src_shape = (param_shapes.get(prefix + sources[0])
-                                 if sources else None)
-                    if src_shape is not None:
-                        shape = (len(sources), *src_shape)
-                if shape is None:
-                    continue  # created later (inner_target factory) — nothing to check
-                ndim = len(shape)
-                for axis, p in (placement or {}).items():
-                    if not isinstance(p, Shard):
-                        continue
-                    size = axis_sizes.get(axis, 1)
-                    if size <= 1:
-                        continue
-                    axis_name = getattr(axis, "value", axis)  # MeshAxisName → "tp"
-                    dim = p.dim + ndim if p.dim < 0 else p.dim
-                    if dim >= ndim:
-                        raise ValueError(
-                            f"plan-time shard check failed: {full!r} has shape "
-                            f"{tuple(shape)} but boundary {fqn!r} declares "
-                            f"{{{axis_name}: Shard({p.dim})}} — dim {p.dim} is out "
-                            f"of range for a {ndim}D parameter; fix the "
-                            f"plan_overrides declaration"
-                        )
-                    if shape[dim] % size != 0:
-                        raise ValueError(
-                            f"plan-time shard check failed: {full!r} has shape "
-                            f"{tuple(shape)} but boundary {fqn!r} declares "
-                            f"{{{axis_name}: Shard({p.dim})}} — shape[{dim}]={shape[dim]} "
-                            f"is not divisible by {axis_name} size {size} (it would "
-                            f"produce empty shards at apply time). This is most "
-                            f"often a parameter-classification error (e.g. a "
-                            f"replicated/gate parameter misclassified into a "
-                            f"sharded role — see accuracy_fix_plan.md §2): fix "
-                            f"the naming rule / family sharding_rules entry, or correct "
-                            f"the plan_overrides declaration"
-                        )
+                ShardingPlanner._check_param_shard_divisibility(
+                    fqn, prefix, pname, placement, param_shapes, ep_stack, axis_sizes
+                )
+
+    @staticmethod
+    def _declared_parameter_names(plan: ShardingPlan) -> set[str]:
+        """Collect full names covered by placements and special handlers."""
+        covered = set()
+        for fqn, spec in plan.modules.items():
+            prefix = fqn + "." if fqn else ""
+            for pname in (spec.params or {}):
+                covered.add(prefix + pname)
+            for sources in (getattr(spec, "_ep_stack", None) or {}).values():
+                covered.update(prefix + source for source in sources)
+        covered.update(plan.special_handlers or {})
+        return covered
 
     def _check_all_trainable_params_covered(self, plan: ShardingPlan, model) -> None:
         """F4b: every ``requires_grad=True`` parameter must appear in some
@@ -1309,14 +1475,7 @@ class ShardingPlanner:
         """
         if not self._derive:
             return
-        covered = set()
-        for fqn, spec in plan.modules.items():
-            prefix = fqn + "." if fqn else ""
-            for pname in (spec.params or {}):
-                covered.add(prefix + pname)
-            for sources in (getattr(spec, "_ep_stack", None) or {}).values():
-                covered.update(prefix + s for s in sources)
-        covered.update(plan.special_handlers or {})
+        covered = self._declared_parameter_names(plan)
         uncovered = [
             name for name, p in model.named_parameters()
             if p.requires_grad and name not in covered
@@ -1353,15 +1512,16 @@ class ShardingPlanner:
         removed; only ``_is_terminal`` marking is kept — the last boundary
         in forward order (each module vouches for its own propagation in
         validate mode; adjacent-contract checks no longer exist)."""
-        sorted_fqns = self._topological_sort_by_forward_order(
-            list(plan.modules.keys()), model
-        )
+        boundaries = [fqn for fqn, spec in plan.modules.items() if spec.is_boundary]
+        sorted_fqns = self._topological_sort_by_forward_order(boundaries, model)
         terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():
-            spec._is_terminal = fqn == terminal  # pylint: disable=protected-access  # planner owns the spec DSL internals
+            # The planner owns the spec DSL internals.
+            spec._is_terminal = fqn == terminal  # pylint: disable=protected-access
         return plan
 
-    def _topological_sort_by_forward_order(self, fqns: List[str], model) -> List[str]:
+    @staticmethod
+    def _topological_sort_by_forward_order(fqns: List[str], model) -> List[str]:
         """Sort by named_modules registration order; unmatched FQNs are
         appended at the end with a warning."""
         fqn_set = set(fqns)
@@ -1380,7 +1540,6 @@ class ShardingPlanner:
             )
             ordered.extend(sorted(missing))
         return ordered
-
 
     # ── tied weights ────────────────────────────────────────────────────
 
@@ -1408,33 +1567,56 @@ class ShardingPlanner:
         return []
 
 
+def _validate_tp_model_compatibility(config: Any, tp_size: int, ep_size: int) -> None:
+    """Check model head and expert width divisibility on the TP axis."""
+    heads = getattr(config, "num_attention_heads", None)
+    if heads is not None and heads % tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads ({heads}) must be divisible by TP ({tp_size})"
+        )
+    kv_heads = getattr(config, "num_key_value_heads", None)
+    if kv_heads is not None and kv_heads % tp_size != 0:
+        raise ValueError(
+            f"num_key_value_heads ({kv_heads}) must be divisible by TP ({tp_size})"
+        )
+    moe_inter = getattr(config, "moe_intermediate_size", None)
+    if ep_size > 1 and moe_inter is not None and moe_inter % tp_size != 0:
+        raise ValueError(
+            f"moe_intermediate_size ({moe_inter}) must be divisible by TP ({tp_size})"
+        )
+
+
+def _validate_ep_model_compatibility(config: Any, ep_size: int) -> None:
+    """Check that the model has a divisible routed-expert count."""
+    num_experts = (getattr(config, "num_experts", None)
+                   or getattr(config, "n_routed_experts", None) or 0)
+    if num_experts <= 0:
+        raise ValueError("EP>1 requires MoE model (num_experts > 0)")
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by EP ({ep_size})"
+        )
+
+
 def validate_model_compatibility(
     model: Any, *, tp_size: int = 1, cp_size: int = 1, ep_size: int = 1,
     seq_len: Optional[int] = None,
 ) -> None:
-    """Model-side compatibility validation (05 §6.5; division of labor
-    with 06's topology validation — this only inspects the model
-    config)."""
+    """Validate model config against requested TP, CP, and EP degrees.
+
+    Args:
+        model: Model whose configuration declares attention and expert sizes.
+        tp_size: Requested decoder tensor-parallel degree.
+        cp_size: Requested decoder context-parallel degree.
+        ep_size: Requested expert-parallel degree.
+        seq_len: Optional global decoder token length.
+    """
     config = getattr(model, "config", None)
     if config is None:
         return
 
     if tp_size > 1:
-        heads = getattr(config, "num_attention_heads", None)
-        if heads is not None and heads % tp_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({heads}) must be divisible by TP ({tp_size})"
-            )
-        kv_heads = getattr(config, "num_key_value_heads", None)
-        if kv_heads is not None and kv_heads % tp_size != 0:
-            raise ValueError(
-                f"num_key_value_heads ({kv_heads}) must be divisible by TP ({tp_size})"
-            )
-        moe_inter = getattr(config, "moe_intermediate_size", None)
-        if ep_size > 1 and moe_inter is not None and moe_inter % tp_size != 0:
-            raise ValueError(
-                f"moe_intermediate_size ({moe_inter}) must be divisible by TP ({tp_size})"
-            )
+        _validate_tp_model_compatibility(config, tp_size, ep_size)
 
     if cp_size > 1 and seq_len is not None and seq_len % (cp_size * 2) != 0:
         raise ValueError(
@@ -1442,11 +1624,4 @@ def validate_model_compatibility(
         )
 
     if ep_size > 1:
-        num_experts = (getattr(config, "num_experts", None)
-                       or getattr(config, "n_routed_experts", None) or 0)
-        if num_experts <= 0:
-            raise ValueError("EP>1 requires MoE model (num_experts > 0)")
-        if num_experts % ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by EP ({ep_size})"
-            )
+        _validate_ep_model_compatibility(config, ep_size)

@@ -19,28 +19,57 @@ unrelated optional Omni custom operators. Accessing an Omni-backed module still
 loads and validates that dependency normally.
 """
 
-import importlib
-from typing import Any
+__all__: list[str] = []
 
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.modules.mtp import (
+        MTPLayer, MultiTokenPrediction, MTPOutput, build_mtp,
+    )
+    from hyper_parallel.components.modules.dsa_attention import DSAAttention, DeepseekV32DSAAttention
+    from hyper_parallel.components.modules.gqa_attention import GatedGQAAttention, GQAAttention
+    from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+    from hyper_parallel.components.modules.linear import Linear
+    from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
+    from hyper_parallel.components.modules.mla_attention import MLAAttention
+    from hyper_parallel.components.modules.rms_norm import OffsetRMSNorm, RMSNorm
+    from hyper_parallel.components.modules.shared_expert import SharedExpert
+    from hyper_parallel.components.modules.swiglu_mlp import SwiGLUMLP
 
 _EXPORT_TO_MODULE = {
+    "TritonGDN": "gdn_triton",
+    "build_mtp": "mtp",
+    "MTPLayer": "mtp",
+    "MultiTokenPrediction": "mtp",
+    "MTPOutput": "mtp",
     "DeepseekV32DSAAttention": "dsa_attention",
     "DSAAttention": "dsa_attention",
     "GQAAttention": "gqa_attention",
     "GatedGQAAttention": "gqa_attention",
+    "EngramModule": "engram",
     "GroupedExperts": "grouped_experts",
+    "Linear": "linear",
     "KimiDeltaAttention": "kimi_delta_attention",
     "KimiRMSNormGated": "kimi_delta_attention",
     "MhcPostModule": "mhc",
     "MhcPreModule": "mhc",
+    "NgramHashMapping": "engram",
+    "PipelinedMhcModule": "mhc",
     "MLAAttention": "mla_attention",
     "OffsetRMSNorm": "rms_norm",
     "RMSNorm": "rms_norm",
     "SharedExpert": "shared_expert",
+    "SharedCompressedAttentionCPContext": "shared_compressed_dsa_attention",
+    "SharedCompressedAttentionState": "shared_compressed_dsa_attention",
+    "SharedCompressedPackedSequence": "shared_compressed_dsa_attention",
+    "SharedCompressedAttentionTPContext": "shared_compressed_dsa_attention",
+    "SharedCompressedDSAAttention": "shared_compressed_dsa_attention",
+    "SharedCompressedDSAIndexer": "shared_compressed_dsa_attention",
     "SwiGLUMLP": "swiglu_mlp",
 }
-
-__all__ = list(_EXPORT_TO_MODULE)
+__all__.extend(_EXPORT_TO_MODULE)
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
@@ -52,3 +81,8 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
     value = getattr(module, name)
     globals()[name] = value
     return value
+
+
+def __dir__() -> list[str]:
+    """Include lazy public exports in ``dir()``."""
+    return sorted(set(globals()) | set(__all__))

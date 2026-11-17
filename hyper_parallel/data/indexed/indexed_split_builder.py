@@ -28,6 +28,7 @@ from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.indexed.indexed_blended_dataset import BlendedDataset
 from hyper_parallel.data.indexed.indexed_data_config import GPTDatasetConfig
 from hyper_parallel.data.indexed.indexed_lazy_dataset import LazyDatasetProxy
+from hyper_parallel.data.indexed.indexed_pretrain_dataset import GPTDataset, MockGPTDataset
 from hyper_parallel.data.indexed.indexed_simple_blended_dataset import SimpleBlendedDataset
 from hyper_parallel.data.parallel import (
     DataLoaderParallelContext,
@@ -149,8 +150,10 @@ class IndexedDatasetSplitBuilder:
             raise ValueError("train_valid_test_num_samples must be non-negative")
         if blend_mode not in {"no", "inter", "intra"}:
             raise ValueError(f"Unsupported blend mode: {blend_mode!r}")
-        if blend_mode != "no" and not config.is_dataset_from_mr:
-            raise ValueError("inter/intra blending requires is_dataset_from_mr=True")
+        if config.mock != (dataset_type is MockGPTDataset):
+            raise ValueError("mock_data must match the selected MockGPTDataset class")
+        if not config.mock and (blend_mode == "no") != (dataset_type is GPTDataset):
+            raise ValueError("simple_blend='no' is only for GPTDataset; other Datasets require inter/intra")
 
         logger.debug(
             "Building indexed splits: dataset=%s, num_samples=%s, mock=%s, blend_mode=%s, lazy=%s",
@@ -279,10 +282,10 @@ class IndexedDatasetSplitBuilder:
               books.idx: sequence_lengths[1] = 2049, sequence_pointers[1] = 4098
               books_reader[1] -> books.bin[offset=4098, count=2049] -> text token IDs
 
-            Mid-level, organize tokens into training records (tokens, labels, and masks),
+            Mid-level, organize tokens into training records (input_ids, labels, and masks),
             with one GPTDataset/GPTFromMRDataset per source and split:
               books_train[0] -> split indices[0] = 1 -> books_reader[1]
-                             -> tokens = text[:-1], labels = text[1:]
+                             -> input_ids = text[:-1], labels = text[1:]
               datasets_per_source = [
                   (books_train[80], books_valid[10], None),
                   (code_train[20],  code_valid[5],   None),
@@ -356,7 +359,10 @@ class IndexedDatasetSplitBuilder:
         if (
             config.data_lazy_load
             and self.dataloader_context.distributed_enabled
-            and not (self.dataloader_context.data_index_cache or self.dataloader_context.build_on_rank())
+            and not (
+                self.dataloader_context.data_index_cache
+                or self.dataloader_context.build_on_rank()
+            )
         ):
             return cast(DatasetSplits, (None, None, None))
 
@@ -382,7 +388,7 @@ class IndexedDatasetSplitBuilder:
             else:
                 dataset_factory = partial(dataset_type, low_level_dataset, dataset_path, indices, size, split, config)
                 mid_level_dataset = self._build_dataset_for_dataloader(
-                    dataset_factory, barrier_needed=not config.is_dataset_from_mr
+                    dataset_factory, barrier_needed=dataset_type is GPTDataset
                 )
             datasets.append(mid_level_dataset)
         return cast(DatasetSplits, tuple(datasets))

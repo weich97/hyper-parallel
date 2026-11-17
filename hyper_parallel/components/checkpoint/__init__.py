@@ -30,6 +30,21 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
     DistributedCheckpointer,
     initialize_optimizer_state,
 )
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
+    HuggingFaceCheckpointer,
+    resolve_hf_loader,
+)
+from hyper_parallel.components.checkpoint.huggingface_load_planner import (
+    HFLoadPlanner,
+    load_hf_checkpoint,
+)
+from hyper_parallel.components.checkpoint.hf_storage import (
+    HuggingFaceStorageReader,
+    TorchShardedSafetensorsReader,
+)
+from hyper_parallel.components.checkpoint.quantized_hf_storage import QuantizedHuggingFaceStorageReader
+from hyper_parallel.components.checkpoint.remap_planner import DeferredRead, RemapBlock, RemapLoadPlanner
+from hyper_parallel.components.checkpoint.load_groups import LoadReport
 from hyper_parallel.components.checkpoint.registry import (
     CHECKPOINTER_REGISTRY,
     build_checkpointer,
@@ -44,10 +59,21 @@ __all__ = [
     "DeinterleaveGateQKV",
     "DeinterleaveQKV",
     "DistributedCheckpointer",
+    "DeferredRead",
+    "HFLoadPlanner",
+    "HuggingFaceCheckpointer",
+    "HuggingFaceStorageReader",
     "InterleaveGateQKV",
     "InterleaveQKV",
+    "LoadReport",
+    "QuantizedHuggingFaceStorageReader",
+    "RemapBlock",
+    "RemapLoadPlanner",
     "STEP_PREFIX",
     "Split",
+    "TorchShardedSafetensorsReader",
     "build_checkpointer",
     "initialize_optimizer_state",
+    "load_hf_checkpoint",
+    "resolve_hf_loader",
 ]

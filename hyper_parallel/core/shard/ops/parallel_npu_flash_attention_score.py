@@ -24,11 +24,11 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 import torch
+import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from hyper_parallel.core.shard.utils import get_rank
 
 Tensor = torch.Tensor
 
@@ -431,8 +431,6 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         For dynamic shapes, uses torch.where to preserve the symbolic computation graph.
         For static shapes, uses direct conditional assignment.
         """
-
-        import torch  # pylint: disable=import-outside-toplevel
 
         if device is None:
             device = torch.device("cpu")
@@ -1294,7 +1292,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             return 0
 
         if isinstance(dim_map, str):
-            rank = get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(dim_map)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -1312,7 +1310,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
                     f"Using the last axis for split_id calculation."
                 )
             axis_name = non_none_axes[-1]
-            rank = get_rank()
+            rank = dist.get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(axis_name)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -1339,7 +1337,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
                 f"TND layout with context parallelism (s1_split_num={s1_split_num} > 1) "
                 f"requires sparse_mode={SPARSE_RIGHT_DOWN_CAUSAL} (rightDownCausal), "
                 f"but got sparse_mode={sparse_mode}.\n"
-                f"This is required by MindSpore for correct attention mask partitioning."
+                f"This is required for correct attention mask partitioning."
             )
 
         if query_global_shape[0] != key_global_shape[0]:

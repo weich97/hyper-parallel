@@ -14,28 +14,30 @@
 # limitations under the License.
 # ============================================================================
 """
-Pipeline Parallel Training - HyperParallel Graph Mode Example
+VPP (Interleaved 1F1B) Training - HyperParallel Graph Mode Example
 
-Demonstrates graph-pass pipeline parallelism: the joint fwd+bwd graph is
-sliced into per-rank stages by ``PpPass`` (no model deepcopy), boundary
-activations cross stages via P2P, and a self-contained GPipe schedule drives
-microbatched training. ``GraphTrainer`` itself stays PP-unaware.
+Demonstrates graph-pass VPP: the joint fwd+bwd graph is sliced into
+``pp_degree * pp_chunks`` virtual stages by ``PpPass`` (no model deepcopy),
+boundary activations cross virtual stages via P2P, and the self-contained
+``ScheduleInterleaved1F1B`` schedule drives microbatched training.
+``GraphTrainer`` itself stays PP-unaware.
 
-Launch with world_size == pp_degree (v1 pure-PP contract), e.g. 2 stages:
+Launch with world_size == pp_degree (pure-PP contract), e.g. 2 physical
+ranks x 2 virtual chunks == 4 virtual stages:
 
     torchrun --nproc_per_node=2 train.py --config config.yaml
 
-Stage split comes from ``sharding.pp.stages`` in the YAML when declared, or
-falls back to the automatic even-by-layers split (the ``layers`` ModuleList
-is distributed evenly; modules before it go to stage 0, modules after it to
-the last stage).
+Stage split comes from ``pp.stages`` in the YAML when declared, or falls back
+to the automatic even-by-layers split (the ``layers`` ModuleList is
+distributed evenly across the virtual stages; modules before it go to
+virtual stage 0, modules after it to the last virtual stage).
 """
 
 import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Dict, Iterator
 
 import torch
 import torch.distributed as dist
@@ -48,10 +50,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
-    create_pass_plan_from_yaml,
+    create_plan_from_yaml,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -95,11 +97,11 @@ def load_config(config_path: str) -> dict:
 class PPDemoModel(nn.Module):
     """Tiny LLM-shaped model: embedding -> layer container -> norm -> head.
 
-    The ``layers`` ModuleList is what the automatic PP split distributes:
-    modules registered before it go to stage 0 and modules after it to the
-    last stage. Each block keeps a residual stream, so exactly ONE tensor
-    (the hidden state) crosses every stage boundary — the single-tensor cut
-    contract of the graph-pass PP split.
+    The ``layers`` ModuleList is what the automatic VPP split distributes
+    across the virtual stages: modules registered before it go to virtual
+    stage 0 and modules after it to the last virtual stage. Each block keeps
+    a residual stream, so exactly ONE tensor (the hidden state) crosses every
+    stage boundary — the single-tensor cut contract of the graph-pass split.
     """
 
     def __init__(self, vocab_size: int, dim: int, num_layers: int) -> None:
@@ -121,7 +123,7 @@ class PPDemoModel(nn.Module):
 
 
 def train_fn(
-    model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
+    model: nn.Module, *, input_ids: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
     """Next-token loss; computed at the root, so it lands on the LAST stage."""
     logits = model(input_ids)
@@ -135,24 +137,26 @@ def train_fn(
 
 
 def build_pass_config(config: dict) -> PassConfig:
-    """Build the pass config; PP is opt-in and pure (FSDP off) in v1."""
+    """Build the pass config; PP is opt-in and pure (FSDP off) in this demo."""
     parallel = config.get("parallel", {})
     return PassConfig(
         enable_overlap=parallel.get("enable_overlap", True),
         fsdp_enabled=False,
         pp_enabled=parallel.get("pp_enabled", True),
         pp_degree=parallel.get("pp_degree"),
+        pp_chunks=parallel.get("pp_chunks", 2),
         pp_microbatch_size=parallel.get("pp_microbatch_size", 1),
+        pp_schedule=parallel.get("pp_schedule", "vpp"),
     )
 
 
-def build_pass_plan(config_path: str) -> PassPlan:
+def build_parallel_plan(config_path: str) -> GraphParallelPlan:
     """Parse the YAML plan (fsdp + pp sections; extra keys are ignored).
 
     With ``pp.stages`` declared the plan is manual; without it ``PpPass``
     falls back to the automatic even-by-layers split.
     """
-    return create_pass_plan_from_yaml(config_path=config_path)
+    return create_plan_from_yaml(config_path=config_path)
 
 
 def main() -> None:  # pylint: disable=too-many-locals
@@ -174,14 +178,17 @@ def main() -> None:  # pylint: disable=too-many-locals
     ).to(device)
 
     pass_config = build_pass_config(config)
-    pass_plan = build_pass_plan(args.config)
+    parallel_plan = build_parallel_plan(args.config)
 
     if rank == 0:
-        stages = pass_plan.pp_module_fqns_per_stage or "auto (even by layers)"
+        stages = parallel_plan.pp_module_fqns_per_stage or "auto (even by layers)"
         _LOG.info("=" * 72)
         _LOG.info(
-            "PP demo: world_size=%s (stages), microbatch=%s",
+            "VPP demo: world_size=%s (ranks), virtual_stages=%s, schedule=%s, "
+            "microbatch=%s",
             world_size,
+            world_size * pass_config.pp_chunks,
+            pass_config.pp_schedule,
             pass_config.pp_microbatch_size,
         )
         _LOG.info("Stage plan: %s", stages)
@@ -191,7 +198,7 @@ def main() -> None:  # pylint: disable=too-many-locals
         model=model,
         train_fn=train_fn,
         pass_config=pass_config,
-        pass_plan=pass_plan,
+        parallel_plan=parallel_plan,
         optimizer_config={
             "lr": config["train"]["optimizer"]["lr"],
             "grad_clip": config["train"].get("grad_clip"),
@@ -210,24 +217,24 @@ def main() -> None:  # pylint: disable=too-many-locals
     labels = torch.roll(batch, shifts=-1, dims=1)
 
     # Compile ONCE with a MICROBATCH-shaped sample: the traced graph bakes
-    # view sizes for one microbatch, and the GPipe schedule then slices
+    # view sizes for one microbatch, and the interleaved schedule then slices
     # every full batch it receives into matching microbatches at runtime.
     # ``compile`` does NOT move its sample tensors, so place them on the
     # trainer's device here (``train_step`` does the same per batch).
-    input_batch, label_batch = trainer._place_on_device(  # pylint: disable=protected-access
-        (batch[:microbatch], labels[:microbatch])
+    inputs = trainer._place_on_device(  # pylint: disable=protected-access
+        {"input_ids": batch[:microbatch], "labels": labels[:microbatch]}
     )
-    trainer.compile(input_batch, label_batch)
+    trainer.compile(**inputs)
 
-    def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def data_iter() -> Iterator[Dict[str, torch.Tensor]]:
         """Yield the same synthetic batch each step (demo workload)."""
         for _ in range(steps):
-            yield batch, labels
+            yield {"input_ids": batch, "labels": labels}
 
     losses = trainer.train(
         data_iter(), max_steps=steps, log_interval=config["logging"]["log_interval"]
     )
-    # The real loss lives on the LAST stage (other stages return a zero
+    # The real loss lives on the LAST virtual stage (other stages return a zero
     # placeholder); report convergence from there.
     if rank == world_size - 1 and losses:
         _LOG.info(

@@ -219,6 +219,32 @@ class TestTorchDispatchModes(unittest.TestCase):
 
         fake_manager.add_storage.assert_called_once()
 
+    def test_must_swap_without_group_keeps_activations_on_device(self):
+        """MUST_SWAP outside a swap group must save on device instead of raising."""
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = ""
+        left = torch.tensor([1.0])
+        right = torch.tensor([2.0])
+
+        with patch.object(sac, "SwapManager", return_value=fake_manager):
+            caching, _ = create_selective_checkpoint_contexts(
+                lambda ctx, op, *args, **kwargs: CheckpointPolicy.MUST_SWAP,
+                group_swap=True,
+            )
+            with caching:
+                torch.add(left, right)
+
+        # Nothing may be registered against the empty-named global group, which
+        # is neither offloaded nor released.
+        fake_manager.add_storage.assert_not_called()
+        self.assertEqual(len(caching.swap_storage._data), 0)
+        fake_manager.warn_missing_group_once.assert_called_once()
+
+        # The activation is cached like MUST_SAVE, so backward still restores it.
+        saved = caching.storage[torch.ops.aten.add.Tensor]
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(torch.equal(saved[0].get_val(False), torch.tensor([3.0])))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,37 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Regression coverage for the direct vLLM plugin entry point."""
-
+"""Native vLLM plugin entrypoint and version contracts."""
+import unittest
 from importlib.metadata import EntryPoint
-import sys
-from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-import pytest
-
-import rl.roles.rollout.vllm_plugin as plugin_module
+from rl.rollout import vllm_plugin as plugin
 
 
-def test_external_plugin_entry_point_registers_qwen3(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The public entry point must import and register the supported dense model."""
-    entry_point = EntryPoint(
-        name="hyper_parallel",
-        value="rl.roles.rollout.vllm_plugin:register_hyper_models",
-        group="vllm.general_plugins",
-    )
-    register_models = entry_point.load()
-    assert register_models is plugin_module.register_hyper_models
-    registry = SimpleNamespace(get_supported_archs=lambda: (), register_model=Mock())
-    versions = {"vllm": "0.22.1", "vllm-ascend": "0.22.1rc1"}
-    monkeypatch.setattr(plugin_module, "package_version", versions.__getitem__)
-    monkeypatch.setattr(plugin_module, "install_vllm_weight_sync_hooks", Mock())
-    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(ModelRegistry=registry))
-    monkeypatch.delenv("HYPER_RL_CONSISTENCY_PROFILE", raising=False)
-    monkeypatch.delenv("HYPER_RL_TEST_QWEN3_RMS_NORM", raising=False)
+class TestNativePlugin(unittest.TestCase):
+    """Keep weight RPC, Agent evidence and sampler hooks available."""
 
-    register_models()
+    def test_entrypoint_installs_native_hooks(self):
+        entry = EntryPoint(name="hyper_parallel", value="rl.rollout.vllm_plugin:install_runtime_hooks",
+                           group="vllm.general_plugins")
+        self.assertIs(entry.load(), plugin.install_runtime_hooks)
+        versions = {"vllm": "0.23.0+empty", "vllm-ascend": "0.23.0.post1"}
+        with patch.dict(plugin.os.environ, {}, clear=True), \
+             patch.object(plugin, "package_version", side_effect=versions.__getitem__), \
+             patch.object(plugin, "install_vllm_weight_sync_hooks") as hooks, \
+             patch.object(plugin, "install_tool_evidence") as evidence, \
+             patch.object(plugin, "install_partial_prefill_rng_fix") as sampler:
+            plugin.install_runtime_hooks()
+        self.assertEqual([call.kwargs for call in hooks.call_args_list],
+                         [{"private_lifecycle": False}, {"private_lifecycle": True}])
+        evidence.assert_called_once_with()
+        sampler.assert_called_once_with()
 
-    registry.register_model.assert_called_once_with(
-        "HyperQwen3ForCausalLM", "rl.roles.rollout.consistency_models.qwen3.model:HyperQwen3ForCausalLM",
-    )
+    def test_unknown_pair_is_rejected_before_private_hooks(self):
+        with patch.dict(plugin.os.environ, {}, clear=True), \
+             patch.object(plugin, "package_version", side_effect=["0.24.0", "0.23.0.post1"]), \
+             patch.object(plugin, "install_vllm_weight_sync_hooks") as hooks:
+            with self.assertRaisesRegex(ValueError, "Unsupported native"):
+                plugin.install_runtime_hooks()
+        hooks.assert_called_once_with(private_lifecycle=False)
+
+    def test_removed_profile_is_rejected(self):
+        with patch.dict(plugin.os.environ, {"HYPER_RL_CONSISTENCY_PROFILE": "off"}):
+            with self.assertRaisesRegex(ValueError, "removed"):
+                plugin.install_runtime_hooks()

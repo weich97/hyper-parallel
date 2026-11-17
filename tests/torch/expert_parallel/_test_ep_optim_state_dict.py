@@ -34,7 +34,6 @@ Key design decisions for EP optimizer state dict testing:
     where the same FQNs are present.
 """
 import math
-import os
 import shutil
 
 
@@ -43,9 +42,9 @@ import torch.distributed as dist  # noqa: E402
 import torch_npu  # noqa: F401,E402  # pylint: disable=unused-import
 from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E402
 
-from hyper_parallel import (  # noqa: E402
+from hyper_parallel import init_device_mesh  # noqa: E402
+from hyper_parallel.core.distributed_checkpoint import (  # noqa: E402
     get_optim_state_dict,
-    init_device_mesh,
     set_optim_state_dict,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
@@ -318,7 +317,7 @@ def test_e5_fsdp_ep_optim_state_dict_flatten():
     opts = StateDictOptions(flatten_optimizer_state_dict=True)
     sd = get_optim_state_dict(moe, optimizer, options=opts)
 
-    for key in sd.keys():
+    for key in sd:
         assert key.startswith("state.") or key.startswith("param_group."), (
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )

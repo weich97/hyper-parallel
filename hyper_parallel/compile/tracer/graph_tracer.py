@@ -44,6 +44,8 @@ contains the explicit backward ops, and a redundant autograd graph on top
 would keep every forward intermediate alive via ``grad_fn`` references.
 """
 
+from __future__ import annotations
+
 __all__ = [
     "JointGraph",
     "trace_model_graph",
@@ -63,11 +65,16 @@ from typing import Any, Dict, List
 
 import torch
 from torch import nn
+from torch._decomp import get_decompositions
 from torch._guards import tracing, TracingContext
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
+
+from .dynamic_shapes import InputGuards, build_symbolic_inputs
 
 # Older torch's make_fx predates record_stack_traces / record_module_stack
 # and rejects unknown kwargs; forward only the kwargs this torch supports.
@@ -172,13 +179,23 @@ class JointGraph:
     # runtime parameter state into the graph.
     state_fqns: List[str]
     example_inputs: tuple
+    input_guards: InputGuards | None = None
 
 
 def extract_module_state(mod: nn.Module) -> Dict[str, torch.Tensor]:
-    """Return a merged dict of the module's named parameters and buffers."""
+    """Return a merged dict of the module's named parameters and buffers.
+
+    Tied tensors (e.g. an ``lm_head.weight`` sharing storage with
+    ``embed_tokens.weight``) are DEDUPLICATED to a single entry: the graph
+    threads each unique tensor as one static input, so emitting one entry per
+    alias would double the placeholder count, duplicate every FSDP collective,
+    and make ``torch.autograd.grad`` return (and the compiler add) the same
+    gradient once per alias. The missing aliases are re-materialized only for
+    tracing, via ``_reparametrize_train_state``'s ``tie_weights=True``.
+    """
     return {
-        **dict(mod.named_parameters(remove_duplicate=False)),
-        **dict(mod.named_buffers(remove_duplicate=False)),
+        **dict(mod.named_parameters(remove_duplicate=True)),
+        **dict(mod.named_buffers(remove_duplicate=True)),
     }
 
 
@@ -191,9 +208,17 @@ def _reparametrize_train_state(
 
     Inside the traced function this swaps in the fake/static tensors so every
     parameter access in the model goes through the graph's static inputs.
+
+    ``tie_weights=True`` re-adds, for the duration of the trace, the alias
+    keys that ``extract_module_state`` deduplicated — mapping each alias to
+    the SAME static tensor. Both tied uses then reference one ``fx.Node``, so
+    the traced graph keeps a single placeholder (and a single gradient) for
+    the shared tensor instead of a baked-in ``get_attr`` constant.
     """
     with contextlib.ExitStack() as stack:
-        stack.enter_context(stateless._reparametrize_module(module, model_state))
+        stack.enter_context(
+            stateless._reparametrize_module(module, model_state, tie_weights=True)
+        )
         yield
 
 
@@ -373,7 +398,7 @@ def _fakeify_input(fake_mode: FakeTensorMode, x: Any) -> Any:
     """Convert a real tensor input into its fake counterpart."""
     if not isinstance(x, torch.Tensor):
         return x
-    return fake_mode.from_tensor(x, static_shapes=False)
+    return fake_mode.from_tensor(x, static_shapes=True)
 
 
 def _input_meta(x: Any) -> Any:
@@ -395,51 +420,9 @@ def _input_meta(x: Any) -> Any:
     return x
 
 
-def trace_model_graph(  # pylint: disable=too-many-locals
-    model: torch.nn.Module,
-    train_fn: Callable,
-    input_batch: torch.Tensor,
-    label_batch: torch.Tensor,
-) -> JointGraph:
-    """
-    Trace model to generate complete forward + backward graph
-
-    Args:
-        model: Model (no parallel wrapping)
-        train_fn: Training function signature: train_fn(model, input, label) -> loss
-        input_batch: Input batch used to trace the joint graph
-        label_batch: Label batch used to trace the joint graph
-
-    Returns:
-        JointGraph: Joint forward-backward computation graph
-
-    Note:
-        Tracing is STATIC-SHAPE: no ``ShapeEnv`` is installed, so the graph
-        bakes the sample tensors' concrete shapes (symbolic ``sym_size``
-        nodes would make per-stage placement ambiguous in ``PpPass``).
-        This contract is shared by ALL graph-mode users, FSDP included — a
-        batch whose shape differs from the compile sample must be
-        re-compiled.
-    """
-    # Extract module state (parameters/buffers) into flat tensors threaded
-    # through the graph as static inputs (leading placeholders).
-    model_state = extract_module_state(model)
-    state_fqns = list(model_state.keys())
-    # Which leading state inputs are parameters (vs buffers). FSDP shards
-    # parameters only: buffers -- e.g. the non-persistent RoPE ``cache`` --
-    # are full-rank by nature and must flow through as plain inputs, never
-    # all-gathered. ``state_is_param`` is indexed by state position, aligned
-    # with ``state_fqns``.
-    param_fqns = set(dict(model.named_parameters(remove_duplicate=False)).keys())
-    state_is_param = [fqn in param_fqns for fqn in state_fqns]
-    state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
-
-    # user_inputs is a plain tuple (input_batch, label_batch) so the traced
-    # closure unpacks it back into the two positional args of train_fn.
-    user_inputs = (input_batch, label_batch)
-    user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
-
-    for leaf in [*state_flat, *user_inputs_flat]:
+def _validate_trace_leaves(leaves: list[Any]) -> None:
+    """Reject state or input objects that cannot become explicit FX inputs."""
+    for leaf in leaves:
         if isinstance(leaf, nn.Module):
             raise ValueError(
                 "trace_model_graph requires explicit tensor state, not "
@@ -452,18 +435,21 @@ def trace_model_graph(  # pylint: disable=too-many-locals
                 f"got {type(leaf).__name__}."
             )
 
-    full_args = list(state_flat) + list(user_inputs_flat)
 
-    # Static shapes: no ShapeEnv -> no symbolic sizes -> the traced graph
-    # carries no aten.sym_size scalar nodes (their CSE-across-phases aliasing
-    # makes per-stage placement ambiguous). The trainer compiles per fixed
-    # batch shape, so static tracing loses nothing here.
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-    fake_args = tuple(
-        _fakeify_input(fake_mode, a) if isinstance(a, torch.Tensor) else a
-        for a in full_args
-    )
-    num_state_inputs = len(state_flat)
+def _make_fwd_bwd_fn(
+    model: nn.Module,
+    train_fn: Callable,
+    state_fqns: list[str],
+    state_is_param: list[bool],
+    state_spec: Any,
+    user_inputs_spec: Any,
+) -> tuple[Callable, list[str]]:
+    """Build the joint callable and its named-loss output metadata."""
+    num_state_inputs = len(state_fqns)
+    # ``_fwd_bwd_fn`` communicates the traced ``loss_dict`` key order to the
+    # enclosing scope through this box (plain closure writes cannot escape
+    # the nested ``def``); the keys are attached to the GraphModule below.
+    loss_dict_keys_box: list[str] = []
 
     def _fwd_bwd_fn(*plain_args):
         state_wrapped = plain_args[:num_state_inputs]
@@ -477,7 +463,25 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             _reparametrize_train_state(model, state_t["model"]),
             _patch_engine_backward(),
         ):
-            loss = train_fn(model, *user_args)
+            out = train_fn(model, **user_args)
+
+            # ``train_fn`` may return either a bare loss tensor or the
+            # ``(loss, loss_dict)`` pair produced by the trainer's
+            # ``postforward``. The named loss_dict values are emitted as
+            # graph outputs AFTER the gradients so passes that assume
+            # ``output[0] == loss`` and ``output[1:] == grads`` keep working
+            # once they trim the trailing loss_dict outputs.
+            if (
+                isinstance(out, tuple)
+                and len(out) == 2
+                and isinstance(out[1], dict)
+            ):
+                loss, loss_dict = out
+                loss_dict_keys = list(loss_dict.keys())
+                loss_dict_keys_box.extend(loss_dict_keys)
+                loss_dict_values = [loss_dict[key] for key in loss_dict_keys]
+            else:
+                loss, loss_dict_keys, loss_dict_values = out, [], []
 
             # Read params from state_t["model"] so the exact trace-time
             # tensors (not the live module's) drive autograd.grad.
@@ -498,7 +502,74 @@ def trace_model_graph(  # pylint: disable=too-many-locals
             else:
                 processed_grads.append(grad)
 
-        return [loss] + processed_grads
+        return [loss] + processed_grads + loss_dict_values
+
+    return _fwd_bwd_fn, loss_dict_keys_box
+
+
+def trace_model_graph(  # pylint: disable=too-many-locals
+    model: torch.nn.Module,
+    train_fn: Callable,
+    inputs: Dict[str, Any],
+    *,
+    dynamic: bool = False,
+    dynamic_arg_dims: dict[str, int | list[int]] | None = None,
+) -> JointGraph:
+    """
+    Trace model to generate complete forward + backward graph
+
+    Args:
+        model: Model (no parallel wrapping)
+        train_fn: Training function signature:
+            ``train_fn(model, **inputs) -> loss``
+        inputs: Model inputs, forwarded to ``train_fn`` as keyword arguments
+        dynamic: Symbolize all user tensor dimensions when no explicit mapping is supplied.
+        dynamic_arg_dims: Dotted input paths to dynamic dimensions (supports negative indices).
+            Providing a mapping enables selective symbolic tracing, even when dynamic is False.
+            Parameters and buffers always remain static.
+
+    Returns:
+        JointGraph: Joint forward-backward computation graph
+
+    Note:
+        Static tracing remains the default. Dynamic traces retain shape guards;
+        incompatible shapes or shape-dependent branches raise before execution.
+    """
+    # Extract module state (parameters/buffers) into flat tensors threaded
+    # through the graph as static inputs (leading placeholders).
+    model_state = extract_module_state(model)
+    state_fqns = list(model_state.keys())
+    # Which leading state inputs are parameters (vs buffers). FSDP shards
+    # parameters only: buffers -- e.g. the non-persistent RoPE ``cache`` --
+    # are full-rank by nature and must flow through as plain inputs, never
+    # all-gathered. ``state_is_param`` is indexed by state position, aligned
+    # with ``state_fqns``.
+    param_fqns = set(dict(model.named_parameters(remove_duplicate=False)).keys())
+    state_is_param = [fqn in param_fqns for fqn in state_fqns]
+    state_flat, state_spec = torch.utils._pytree.tree_flatten({"model": model_state})
+
+    # user_inputs is a plain dict so the traced closure unpacks it back into
+    # train_fn's keyword arguments.
+    user_inputs = inputs
+    user_inputs_flat, user_inputs_spec = torch.utils._pytree.tree_flatten(user_inputs)
+
+    _validate_trace_leaves([*state_flat, *user_inputs_flat])
+
+    full_args = list(state_flat) + list(user_inputs_flat)
+
+    if not isinstance(dynamic, bool):
+        raise ValueError("dynamic must be a bool")
+    symbolic = dynamic or dynamic_arg_dims is not None
+    if symbolic:
+        fake_mode, fake_args = build_symbolic_inputs(state_flat, inputs, dynamic_arg_dims)
+    else:
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv(), static_shapes=True)
+        fake_args = tuple(_fakeify_input(fake_mode, value) for value in full_args)
+    num_state_inputs = len(state_flat)
+
+    _fwd_bwd_fn, loss_dict_keys_box = _make_fwd_bwd_fn(  # pylint: disable=C0103
+        model, train_fn, state_fqns, state_is_param, state_spec, user_inputs_spec
+    )
 
     # make_fx only records ``nn_module_stack`` when the traced callable
     # carries ``_orig_mod``: its ``_init_modes_from_inputs`` then installs a
@@ -509,10 +580,6 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     # ``_annotate_autograd_backward``), after tracing.
     _fwd_bwd_fn._orig_mod = model  # type: ignore[attr-defined]
 
-    # The pytree spec of the combined state tree is captured here so the
-    # traced closure can unflatten the leading state placeholders.
-    _, state_spec = torch.utils._pytree.tree_flatten({"model": model_state})
-
     ctx = TracingContext(fake_mode)
     with (
         fake_mode,
@@ -522,7 +589,16 @@ def trace_model_graph(  # pylint: disable=too-many-locals
         torch.autograd.set_multithreading_enabled(False),
         _non_strict_tracing_context(),
     ):
-        traced_graph = make_fx(_fwd_bwd_fn, **_MAKE_FX_KWARGS)(*fake_args)
+        # Native constant padding can specialize SymInt sizes (notably on
+        # NPU). Its upstream decomposition preserves causal-LM label lengths.
+        decompositions = get_decompositions([torch.ops.aten.constant_pad_nd.default]) if symbolic else None
+        traced_graph = make_fx(
+            _fwd_bwd_fn, decomposition_table=decompositions, **_MAKE_FX_KWARGS
+        )(*fake_args)
+
+    # EP receive lengths depend on routing values even when input shapes are fixed.
+    insert_deferred_runtime_asserts(traced_graph, fake_mode.shape_env, "joint_graph")
+    traced_graph.recompile()
 
     # Stock torch's make_fx does not tag backward nodes (no torchtitan
     # ``_patch_engine_backward`` hook), so the joint graph splits into
@@ -544,6 +620,14 @@ def trace_model_graph(  # pylint: disable=too-many-locals
     traced_graph.state_fqns = state_fqns
     traced_graph.state_is_param = state_is_param
     traced_graph.num_state_inputs = num_state_inputs
+    # Kept for ``run_traced_graph`` to validate the runtime inputs' pytree
+    # structure against the traced one.
+    traced_graph.user_inputs_spec = user_inputs_spec
+    # Key order of the traced ``loss_dict``: its values are emitted as
+    # graph outputs AFTER the gradients, so ``run_traced_graph`` can split
+    # (loss, grads, loss_dict) and passes can trim the trailing loss_dict
+    # outputs off the gradient range.
+    traced_graph.loss_dict_keys = list(loss_dict_keys_box)
 
     param_names = [name for name, _ in model.named_parameters() if _.requires_grad]
     param_shapes = {
@@ -556,28 +640,33 @@ def trace_model_graph(  # pylint: disable=too-many-locals
 
     return JointGraph(
         graph_module=traced_graph,
-        inputs=[_input_meta(input_batch), _input_meta(label_batch)],
+        inputs=[_input_meta(v) for v in inputs.values()],
         outputs=[],
         param_names=param_names,
         param_shapes=param_shapes,
         num_layers=num_layers,
         state_fqns=state_fqns,
         example_inputs=fake_args,
+        input_guards=(
+            InputGuards(user_inputs_flat, fake_args[num_state_inputs:], fake_mode.shape_env)
+            if symbolic else None
+        ),
     )
 
 
 def run_traced_graph(
     joint_graph: JointGraph,
     model: torch.nn.Module,
-    input_batch: Any,
-    label_batch: Any,
+    inputs: Dict[str, Any],
 ) -> tuple:
     """
     Execute a traced joint graph against the live model state.
 
     Parameters/buffers are sampled from ``model`` at call time and fed to the
-    graph as static inputs (in ``joint_graph.state_fqns`` order). Runs
-    under ``torch.no_grad()`` because the graph already contains the explicit
+    graph as static inputs (in ``joint_graph.state_fqns`` order). ``inputs``
+    is flattened with the same pytree structure used at trace time (checked
+    against the stored spec) and appended after the state. Runs under
+    ``torch.no_grad()`` because the graph already contains the explicit
     backward ops traced by ``torch.autograd.grad``.
 
     FSDP is invisible here: FSDPPass shards ``model``'s parameters in place,
@@ -585,8 +674,10 @@ def run_traced_graph(
     leading static inputs (the graph re-gathers them via AllGather each step).
 
     Returns:
-        tuple: (loss, grads) where ``grads`` aligns with the model's
-        trainable parameter list.
+        tuple: (loss, grads, loss_dict) where ``grads`` aligns with the
+        model's trainable parameter list and ``loss_dict`` maps the traced
+        loss names to their graph outputs (empty when ``train_fn`` returned
+        a bare loss tensor).
     """
     model_state = extract_module_state(model)
     if list(model_state.keys()) != joint_graph.state_fqns:
@@ -596,15 +687,40 @@ def run_traced_graph(
             f"  Got:    {list(model_state.keys())}"
         )
 
+    user_flat, user_spec = torch.utils._pytree.tree_flatten(inputs)
+    traced_spec = getattr(joint_graph.graph_module, "user_inputs_spec", None)
+    if traced_spec is not None and user_spec != traced_spec:
+        raise ValueError(
+            "model inputs have a different pytree structure than during "
+            "tracing (keys, nesting, or leaf types changed).\n"
+            f"  Traced spec: {traced_spec}\n"
+            f"  Got spec:    {user_spec}"
+        )
+
     state_flat, _ = torch.utils._pytree.tree_flatten({"model": model_state})
 
-    flat_inputs = list(state_flat) + [input_batch, label_batch]
+    if joint_graph.input_guards is not None:
+        joint_graph.input_guards.validate(user_flat)
+
+    flat_inputs = list(state_flat) + list(user_flat)
 
     with torch.no_grad():
         outputs = joint_graph.graph_module(*flat_inputs)
 
+    loss_dict_keys = getattr(joint_graph.graph_module, "loss_dict_keys", [])
+    num_loss_outputs = len(loss_dict_keys)
     if isinstance(outputs, (list, tuple)):
-        loss, grads = outputs[0], list(outputs[1:])
+        loss = outputs[0]
+        loss_dict = (
+            dict(zip(loss_dict_keys, outputs[len(outputs) - num_loss_outputs:]))
+            if num_loss_outputs
+            else {}
+        )
+        grads = (
+            list(outputs[1:len(outputs) - num_loss_outputs])
+            if num_loss_outputs
+            else list(outputs[1:])
+        )
     else:
-        loss, grads = outputs, []
-    return loss, grads
+        loss, grads, loss_dict = outputs, [], {}
+    return loss, grads, loss_dict

@@ -1,0 +1,52 @@
+name: Label Gate Check
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: label-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      # Label cleanup uses GITHUB_TOKEN, so it does not trigger an unlabeled run.
+      # The synchronize run must block without accepting the previous CI labels.
+      - name: Require a fresh CI result after a push
+        if: github.event.action == 'synchronize'
+        run: |
+          echo "::error::New commits were pushed. Waiting for CI to add a fresh pipeline-passed label."
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check for an unexpired CI pass label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Jenkins removes and adds labels in separate requests; let updates settle.
+          sleep 5
+          for ((attempt = 1; attempt <= 10; attempt++)); do
+            if node .github/scripts/ci-label-expiry.mjs --check --pr "$PR_NUMBER"; then
+              exit 0
+            fi
+            if ((attempt < 10)); then
+              sleep 3
+            fi
+          done
+          echo "::error::Unable to verify a CI pass label less than 24 hours old."
+          exit 1

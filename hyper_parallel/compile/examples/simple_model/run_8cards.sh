@@ -26,11 +26,17 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+HYPER_PARALLEL_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${HYPER_PARALLEL_ROOT}/.." && pwd)"
+
+CONFIG="${SCRIPT_DIR}/config.yaml"
+TRAIN_ENTRY="${REPO_ROOT}/scripts/train_lm.py"
 
 echo "=========================================="
 echo "Starting 8-card distributed training"
 echo "Configuration: FSDP=8"
+echo "Entry: ${TRAIN_ENTRY}"
+echo "Config: ${CONFIG}"
 echo "=========================================="
 
 torchrun \
@@ -39,8 +45,8 @@ torchrun \
     --node_rank=0 \
     --master_addr="127.0.0.1" \
     --master_port=29500 \
-    train.py \
-    --config config.yaml
+    "${TRAIN_ENTRY}" \
+    "${CONFIG}"
 
 echo "=========================================="
 echo "Training completed!"

@@ -17,9 +17,10 @@
 
 import copy
 import logging
-import os
 import tempfile
 import unittest
+import weakref
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -42,9 +43,10 @@ _LOGGER_ATTR_SNAPSHOT = {
 import torch  # pylint: disable=wrong-import-position
 from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel import DeviceMesh, DTensor, Replicate
+from hyper_parallel import DeviceMesh, DTensor, Replicate, Shard, SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     Float16OptimizerWithFloat16Params,
+    _gradient_for_param,
 )
 from hyper_parallel.components.optim.builders import Muon
 from hyper_parallel.components.checkpoint.dcp_checkpointer import (
@@ -54,6 +56,9 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.core.optimizer.adamw import AdamW as CoreAdamW
 from hyper_parallel.core.optimizer.muon import Muon as CoreMuon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
+from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.runtime.model_integration import DisabledModelIntegrationSession
 from hyper_parallel.core.distributed_checkpoint import (
     save as dcp_save,
 )
@@ -162,6 +167,70 @@ def _muon_step_parameters(muon_optimizer: Any) -> list[nn.Parameter]:
     ]
 
 
+def _assert_serialized_adamw_muon_state(
+        test_case: unittest.TestCase,
+        state_dict: dict,
+        expected_adam_config: dict,
+        expected_muon_config: dict,
+) -> None:
+    """Check serialized optimizer keys and per-optimizer configuration."""
+    test_case.assertIn("state.adam_weight.exp_avg", state_dict)
+    test_case.assertIn("state.adam_weight.exp_avg_sq", state_dict)
+    test_case.assertIn("state.muon_weight.momentum_buffer", state_dict)
+    for parameter_name, expected_config in (
+            ("adam_weight", expected_adam_config),
+            ("muon_weight", expected_muon_config),
+    ):
+        for config_name, expected_value in expected_config.items():
+            with test_case.subTest(parameter=parameter_name, config_name=config_name):
+                test_case.assertEqual(
+                    state_dict[f"param_groups.{parameter_name}.{config_name}"],
+                    expected_value,
+                )
+    test_case.assertNotIn("param_groups.adam_weight.momentum", state_dict)
+    test_case.assertNotIn("param_groups.muon_weight.betas", state_dict)
+
+
+def _assert_restored_adamw_muon_state(
+        test_case: unittest.TestCase,
+        model: nn.Module,
+        adam: CoreAdamW,
+        muon: CoreMuon,
+        state_dict: dict,
+        expected_adam_config: dict,
+        expected_muon_config: dict,
+        expected_main_params: dict,
+) -> None:
+    """Check restored moments, optimizer configs, and fp32 main parameters."""
+    test_case.assertTrue(
+        torch.equal(
+            adam.state[model.adam_weight.main_param]["exp_avg"],
+            state_dict["state.adam_weight.exp_avg"],
+        )
+    )
+    test_case.assertTrue(
+        torch.equal(
+            muon.state[model.muon_weight.main_param]["momentum_buffer"],
+            state_dict["state.muon_weight.momentum_buffer"],
+        )
+    )
+    for leaf_optimizer, expected_config in (
+            (adam, expected_adam_config),
+            (muon, expected_muon_config),
+    ):
+        for config_name, expected_value in expected_config.items():
+            with test_case.subTest(loaded_optimizer=type(leaf_optimizer).__name__, config_name=config_name):
+                test_case.assertEqual(leaf_optimizer.param_groups[0][config_name], expected_value)
+    model_parameters = dict(model.named_parameters())
+    for parameter_fqn, expected_main_param in expected_main_params.items():
+        test_case.assertTrue(
+            torch.equal(
+                model_parameters[parameter_fqn].main_param,
+                expected_main_param,
+            )
+        )
+
+
 class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
     """Cover group routing, gradient movement, copy-back, reset, and DCP state."""
 
@@ -174,13 +243,15 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         Expectation: Required zero state exists without calling either optimizer step.
         """
         model = nn.Module()
-        model.adamw_param = nn.Parameter(torch.tensor([1.0, 2.0]))
-        model.muon_param = nn.Parameter(torch.arange(4.0).reshape(2, 2))
-        adamw = CoreAdamW([model.adamw_param], lr=0.1)
-        muon = CoreMuon([model.muon_param], lr=0.1)
+        adamw_param = nn.Parameter(torch.tensor([1.0, 2.0]))
+        muon_param = nn.Parameter(torch.arange(4.0).reshape(2, 2))
+        model.register_parameter("adamw_param", adamw_param)
+        model.register_parameter("muon_param", muon_param)
+        adamw = CoreAdamW([adamw_param], lr=0.1)
+        muon = CoreMuon([muon_param], lr=0.1)
         optimizer = ChainedOptimizer(model, {"adamw": adamw, "muon": muon})
-        expected_adamw = model.adamw_param.detach().clone()
-        expected_muon = model.muon_param.detach().clone()
+        expected_adamw = torch.clone(adamw_param)
+        expected_muon = torch.clone(muon_param)
 
         with patch.object(adamw, "step", side_effect=AssertionError("AdamW step called")), \
                 patch.object(muon, "step", side_effect=AssertionError("Muon step called")):
@@ -188,12 +259,193 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
 
         self.assertEqual(adamw.param_groups[0]["step"], 0)
         self.assertEqual(muon.param_groups[0]["step"], 0)
-        self.assertEqual(set(adamw.state[model.adamw_param]), {"exp_avg", "exp_avg_sq"})
-        self.assertEqual(set(muon.state[model.muon_param]), {"momentum_buffer"})
-        self.assertTrue(torch.equal(adamw.state[model.adamw_param]["exp_avg"], torch.zeros(2)))
-        self.assertTrue(torch.equal(muon.state[model.muon_param]["momentum_buffer"], torch.zeros(2, 2)))
-        self.assertTrue(torch.equal(model.adamw_param, expected_adamw))
-        self.assertTrue(torch.equal(model.muon_param, expected_muon))
+        self.assertEqual(set(adamw.state[adamw_param]), {"exp_avg", "exp_avg_sq"})
+        self.assertEqual(set(muon.state[muon_param]), {"momentum_buffer"})
+        self.assertTrue(torch.equal(adamw.state[adamw_param]["exp_avg"], torch.zeros(2)))
+        self.assertTrue(torch.equal(muon.state[muon_param]["momentum_buffer"], torch.zeros(2, 2)))
+        self.assertTrue(torch.equal(adamw_param, expected_adamw))
+        self.assertTrue(torch.equal(muon_param, expected_muon))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_initialize_hyper_optimizer_state_preserves_dtensor_layout(
+            self,
+            mock_get_rank,
+    ):
+        """Materialize optimizer moments with the parameter's DTensor layout.
+
+        Feature: DTensor optimizer-state materialization.
+        Description: Initialize AdamW and Muon state for sharded parameters.
+        Expectation: Moments and exported state retain global and local layout.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(torch.ones(2), mesh, (Shard(0),))
+        )
+        model.register_parameter("weight", parameter)
+        muon_parameter = nn.Parameter(
+            DTensor.from_local(torch.ones(2, 2), mesh, (Shard(0),))
+        )
+        model.register_parameter("muon_weight", muon_parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        with patch.object(CoreMuon, "reset_optimizer_parameters"):
+            muon = CoreMuon([muon_parameter], lr=0.1)
+        optimizer = ChainedOptimizer(
+            model,
+            {"adamw": adamw, "muon": muon},
+            flatten=True,
+        )
+
+        self.assertEqual(tuple(parameter.shape), (4,))
+        self.assertTrue(initialize_optimizer_state(optimizer))
+
+        exp_avg = adamw.state[parameter]["exp_avg"]
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (4,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (2,))
+        self.assertEqual(exp_avg.device_mesh.rank_list, mesh.rank_list)
+        self.assertEqual(exp_avg.device_mesh.mesh_dim_names, mesh.mesh_dim_names)
+        self.assertEqual(tuple(exp_avg.placements), (Shard(0),))
+        momentum = muon.state[muon_parameter]["momentum_buffer"]
+        self.assertIsInstance(momentum, DTensor)
+        self.assertEqual(tuple(momentum.shape), (4, 2))
+        self.assertEqual(tuple(momentum.to_local().shape), (2, 2))
+        self.assertEqual(tuple(momentum.placements), (Shard(0),))
+
+        state_dict = optimizer.state_dict()
+        checkpoint_exp_avg = state_dict["state.weight.exp_avg"]
+        self.assertIsInstance(checkpoint_exp_avg, DTensor)
+        self.assertEqual(tuple(checkpoint_exp_avg.shape), (4,))
+        self.assertEqual(tuple(checkpoint_exp_avg.to_local().shape), (2,))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_main_grad_and_adam_state_preserve_dtensor_layout(
+            self,
+            mock_get_rank,
+    ):
+        """Keep main gradients and Adam moments distributed through optimizer step.
+
+        Feature: Mixed-precision DTensor optimizer step.
+        Description: Bridge an FSDP main_grad to a sharded FP32 main parameter.
+        Expectation: The optimizer gradient and Adam moment remain DTensors.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.ones(2, dtype=torch.bfloat16),
+                mesh,
+                (Shard(0),),
+            )
+        )
+        parameter.model_name = "weight"
+        model.register_parameter("weight", parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": adamw}),
+            model,
+        )
+        main_param = parameter.main_param
+        gradient_mesh = DeviceMesh(
+            "cpu",
+            [0, 1],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        self.assertIsNot(gradient_mesh, main_param.device_mesh)
+        self.assertEqual(gradient_mesh.to_hash(), main_param.device_mesh.to_hash())
+        parameter.main_grad = DTensor.from_local(
+            torch.full((2,), 0.25, dtype=torch.float32),
+            gradient_mesh,
+            (Shard(0),),
+        )
+
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.step()
+
+        exp_avg = adamw.state[main_param]["exp_avg"]
+        self.assertIsInstance(main_param.grad, DTensor)
+        self.assertEqual(tuple(main_param.grad.shape), (4,))
+        self.assertEqual(tuple(main_param.grad.to_local().shape), (2,))
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (4,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (2,))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=15)
+    def test_empty_uneven_main_grad_preserves_optimizer_state_global_shape(
+            self,
+            mock_get_rank,
+    ):
+        """Keep logical optimizer-state shape on an empty uneven FSDP shard.
+
+        Feature: Mixed-precision optimizer state for uneven DTensor shards.
+        Description: Bind an empty local main_grad whose logical shape is non-empty.
+        Expectation: Adam moments inherit the main_grad's global layout unchanged.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            list(range(16)),
+            mesh_dim_names=("fsdp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.empty(0, dtype=torch.bfloat16),
+                mesh,
+                (Shard(0, uneven_shard=True),),
+                shape=(16,),
+                stride=(1,),
+            )
+        )
+        parameter.model_name = "sinks"
+        model.register_parameter("sinks", parameter)
+        adamw = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": adamw}),
+            model,
+        )
+        main_param = parameter.main_param
+        gradient_mesh = DeviceMesh(
+            "cpu",
+            list(range(16)),
+            mesh_dim_names=("fsdp",),
+            _init_backend=False,
+        )
+        main_gradient = DTensor.from_local(
+            torch.empty(0, dtype=torch.float32),
+            gradient_mesh,
+            (Shard(0, uneven_shard=True),),
+            shape=(16,),
+            stride=(1,),
+        )
+        parameter.main_grad = main_gradient
+
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.step()
+
+        exp_avg = adamw.state[main_param]["exp_avg"]
+        self.assertIs(main_param.grad, main_gradient)
+        self.assertIsInstance(exp_avg, DTensor)
+        self.assertEqual(tuple(exp_avg.shape), (16,))
+        self.assertEqual(tuple(exp_avg.to_local().shape), (0,))
+        self.assertEqual(tuple(exp_avg.placements), (Shard(0, uneven_shard=True),))
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_groups_separate_low_precision_and_native_fp32_params(self):
@@ -258,6 +510,195 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         self.assertEqual(main_param.model_name, "weight")
         self.assertFalse(hasattr(main_param, "is_muon"))
         self.assertIs(optimizer.param_groups[0]["params"][0], main_param)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0)
+    def test_adamw_step_preserves_dtensor_grad_and_state(
+            self,
+            mock_get_rank: Any,
+    ) -> None:
+        """Keep DTensor gradients and AdamW state through the fp32 main-param step.
+
+        Feature: DTensor state for mixed-precision AdamW.
+        Description: Prepare an FSDP-style main gradient and step AdamW through
+            the shared trainer method used by BaseTrainer and VLMTrainer.
+        Expectation: Gradients retain their layout before the step, AdamW moments
+            remain DTensors, and the trainer clears consumed gradients afterward.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh(
+            "cpu",
+            [0],
+            mesh_dim_names=("dp",),
+            _init_backend=False,
+        )
+        model = nn.Module()
+        parameter = nn.Parameter(
+            DTensor.from_local(
+                torch.ones(2, dtype=torch.bfloat16),
+                mesh,
+                (Replicate(),),
+            )
+        )
+        parameter.model_name = "weight"
+        model.register_parameter("weight", parameter)
+        leaf_optimizer = CoreAdamW([parameter], lr=0.1)
+        optimizer = Float16OptimizerWithFloat16Params(
+            ChainedOptimizer(model, {"adamw": leaf_optimizer}),
+            model,
+        )
+        parameter.main_grad = DTensor.from_local(
+            torch.tensor([0.5, -0.25], dtype=torch.float32),
+            mesh,
+            (Replicate(),),
+        )
+
+        optimizer.prepare_grads()
+        main_param = optimizer.fp32_from_float16_groups[0][0]
+        self.assertIs(main_param.grad, parameter.main_grad)
+        self.assertIsInstance(main_param.grad, DTensor)
+        self.assertIs(main_param.grad.device_mesh, mesh)
+        self.assertEqual(tuple(main_param.grad.placements), (Replicate(),))
+        torch.testing.assert_close(
+            main_param.grad.to_local(),
+            torch.tensor([0.5, -0.25], dtype=torch.float32),
+        )
+        trainer = SimpleNamespace(
+            optimizer=optimizer,
+            lr_scheduler=None,
+            model_integration=DisabledModelIntegrationSession(),
+        )
+        BaseTrainer.step_optimizers_and_schedulers(trainer)
+        self.assertIsNone(main_param.grad)
+        for state_name in ("exp_avg", "exp_avg_sq"):
+            with self.subTest(state_name=state_name):
+                state_tensor = leaf_optimizer.state[main_param][state_name]
+                self.assertIsInstance(state_tensor, DTensor)
+                self.assertEqual(
+                    state_tensor.device_mesh.to_hash(),
+                    mesh.to_hash(),
+                )
+                self.assertEqual(tuple(state_tensor.placements), (Replicate(),))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_cast_gradients_releases_source_buffers(self):
+        """Release each converted source before preparing the next parameter.
+
+        Feature: Dtype-only gradient transfer and buffer lifetime.
+        Description: Supply low-precision gradients through both grad owners.
+        Expectation: Old tensors die before the next cast and FP32 values agree.
+        """
+        for gradient_dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=gradient_dtype):
+                model, optimizer = _build_optimizer()
+                model.low.main_grad = torch.tensor([0.5, -0.25], dtype=gradient_dtype)
+                if gradient_dtype == model.low.dtype:
+                    model.low.grad = model.low.main_grad
+                model.fp32.main_grad = torch.ones(1, dtype=gradient_dtype)
+                source_refs = [weakref.ref(model.low.main_grad), weakref.ref(model.fp32.main_grad)]
+
+                def prepare_gradient(
+                        parameter: nn.Parameter,
+                        gradient: torch.Tensor,
+                        next_parameter: nn.Parameter = model.fp32,
+                        source_ref: weakref.ReferenceType = source_refs[0],
+                ) -> torch.Tensor:
+                    """Observe source lifetime without a mock retaining call arguments."""
+                    if parameter is next_parameter:
+                        self.assertIsNone(source_ref())
+                    return _gradient_for_param(parameter, gradient)
+
+                with patch(
+                        "hyper_parallel.components.optim.mixed_precision_optimizer._gradient_for_param",
+                        new=prepare_gradient,
+                ):
+                    optimizer.prepare_grads()
+
+                self.assertTrue(all(source_ref() is None for source_ref in source_refs))
+                self.assertIsNone(model.low.grad)
+                self.assertIs(model.low.main_grad, model.low.main_param.grad)
+                self.assertIs(model.fp32.main_grad, model.fp32.grad)
+                torch.testing.assert_close(model.low.main_param.grad, torch.tensor([0.5, -0.25]))
+                torch.testing.assert_close(model.fp32.grad, torch.ones(1))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_grad_fallback_casts_and_releases_source(self):
+        """Cast ordinary backward gradients without keeping low-precision owners.
+
+        Feature: Non-FSDP mixed-precision gradient preparation.
+        Description: Backpropagate into a BF16 parameter without main_grad.
+        Expectation: The FP32 gradient has the same values and its source dies.
+        """
+        model, optimizer = _build_optimizer()
+        model.low.sum().backward()
+        source_ref = weakref.ref(model.low.grad)
+
+        optimizer.prepare_grads()
+
+        self.assertIsNone(source_ref())
+        self.assertIsNone(model.low.grad)
+        torch.testing.assert_close(model.low.main_param.grad, torch.ones(2))
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_gradient_device_mismatch_leaves_source_untouched(self):
+        """Reject a device mismatch before casting or consuming gradients.
+
+        Feature: Gradient device ownership remains with the producer.
+        Description: Provide a meta-device gradient to CPU optimizer params.
+        Expectation: Preparation fails without moving or dropping the source.
+        """
+        for gradient_dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=gradient_dtype):
+                model, optimizer = _build_optimizer()
+                source_gradient = torch.ones(2, device="meta", dtype=gradient_dtype)
+                model.low.main_grad = source_gradient
+
+                with self.assertRaisesRegex(ValueError, "must already be on its parameter's device"):
+                    optimizer.prepare_grads()
+
+                self.assertIs(model.low.main_grad, source_gradient)
+                self.assertIsNone(model.low.main_param.grad)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    @patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=1)
+    def test_dtensor_cast_preserves_uneven_layout_and_releases_source(self, mock_get_rank):
+        """Preserve logical shape when casting uneven, including empty, shards.
+
+        Feature: DTensor gradient dtype conversion.
+        Description: Prepare BF16 main_grad with an explicitly uneven layout.
+        Expectation: Global metadata survives and the old local shard is freed.
+        """
+        del mock_get_rank
+        mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("dp",), _init_backend=False)
+        for local_size in (0, 1):
+            with self.subTest(local_size=local_size):
+                model = nn.Module()
+                model.weight = nn.Parameter(DTensor.from_local(
+                    torch.ones(local_size, dtype=torch.bfloat16), mesh,
+                    (Shard(0, uneven_shard=True),), shape=(3,), stride=(1,),
+                ))
+                optimizer = Float16OptimizerWithFloat16Params(
+                    ChainedOptimizer(model, {"adamw": CoreAdamW(model.parameters(), lr=0.1)}), model,
+                )
+                model.weight.main_grad = DTensor.from_local(
+                    torch.full((local_size,), 0.5, dtype=torch.bfloat16), mesh,
+                    (Shard(0, uneven_shard=True),), shape=(3,), stride=(1,),
+                )
+                gradient_ref = weakref.ref(model.weight.main_grad)
+                local_ref = weakref.ref(model.weight.main_grad.to_local())
+
+                with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+                    optimizer.prepare_grads()
+
+                self.assertIsNone(gradient_ref())
+                self.assertIsNone(local_ref())
+                self.assertIsInstance(model.weight.main_param.grad, DTensor)
+                self.assertEqual(tuple(model.weight.main_param.grad.shape), (3,))
+                self.assertEqual(model.weight.main_param.grad.placements, (Shard(0, uneven_shard=True),))
+                self.assertIs(model.weight.main_param.grad.device_mesh, mesh)
+                torch.testing.assert_close(
+                    model.weight.main_param.grad.to_local(), torch.full((local_size,), 0.5),
+                )
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_prepare_step_copy_back_and_zero_grad(self):
@@ -660,28 +1101,14 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
         optimizer.step()
         optimizer.zero_grad()
         state_dict = copy.deepcopy(optimizer.state_dict())
-
-        self.assertIn("state.adam_weight.exp_avg", state_dict)
-        self.assertIn("state.adam_weight.exp_avg_sq", state_dict)
-        self.assertIn("state.muon_weight.momentum_buffer", state_dict)
-        for config_name, expected_value in expected_adam_config.items():
-            with self.subTest(optimizer="adamw", config_name=config_name):
-                self.assertEqual(
-                    state_dict[f"param_groups.adam_weight.{config_name}"],
-                    expected_value,
-                )
-        for config_name, expected_value in expected_muon_config.items():
-            with self.subTest(optimizer="muon", config_name=config_name):
-                self.assertEqual(
-                    state_dict[f"param_groups.muon_weight.{config_name}"],
-                    expected_value,
-                )
-        self.assertNotIn("param_groups.adam_weight.momentum", state_dict)
-        self.assertNotIn("param_groups.muon_weight.betas", state_dict)
+        _assert_serialized_adamw_muon_state(
+            self,
+            state_dict,
+            expected_adam_config,
+            expected_muon_config,
+        )
         expected_main_params = copy.deepcopy(
-            state_dict["_mixed_precision_optimizer"][
-                "fp32_from_fp16_params"
-            ]
+            state_dict["_mixed_precision_optimizer"]["fp32_from_fp16_params"]
         )
         for leaf_optimizer in (adam, muon_state_owner):
             for parameter_state in leaf_optimizer.state.values():
@@ -715,38 +1142,68 @@ class TestFloat16OptimizerWithFloat16Params(unittest.TestCase):
             DistributedCheckpointer().load(checkpoint_path, load_state)
 
         optimizer.load_state_dict(load_state["optimizer"])
+        _assert_restored_adamw_muon_state(
+            self,
+            model,
+            adam,
+            muon_state_owner,
+            state_dict,
+            expected_adam_config,
+            expected_muon_config,
+            expected_main_params,
+        )
 
-        self.assertTrue(
-            torch.equal(
-                adam.state[model.adam_weight.main_param]["exp_avg"],
-                state_dict["state.adam_weight.exp_avg"],
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                muon_state_owner.state[model.muon_weight.main_param][
-                    "momentum_buffer"
-                ],
-                state_dict["state.muon_weight.momentum_buffer"],
-            )
-        )
-        for config_name, expected_value in expected_adam_config.items():
-            with self.subTest(loaded_optimizer="adamw", config_name=config_name):
-                self.assertEqual(
-                    adam.param_groups[0][config_name],
-                    expected_value,
-                )
-        for config_name, expected_value in expected_muon_config.items():
-            with self.subTest(loaded_optimizer="muon", config_name=config_name):
-                self.assertEqual(
-                    muon_state_owner.param_groups[0][config_name],
-                    expected_value,
-                )
-        for parameter_fqn, expected_main_param in expected_main_params.items():
-            model_parameter = dict(model.named_parameters())[parameter_fqn]
-            self.assertTrue(
-                torch.equal(model_parameter.main_param, expected_main_param)
-            )
+
+class TestOptimizerParameterDtypeValidation(unittest.TestCase):
+    """Validate optimizer parameter dtype requirements before optimizer wrapping."""
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_fp16_parameters_require_fp32_main_params(self) -> None:
+        """Reject FP16 parameters without an FP32 main copy.
+
+        Feature: Optimizer update dtype validation after model initialization.
+        Description: Validate an FP16 model with FP32 main parameters disabled.
+        Expectation: Validation raises an error describing supported configurations.
+        """
+        model = nn.Linear(4, 4, bias=False).to(torch.float16)
+
+        with self.assertRaisesRegex(ValueError, "fp32_main_params.*model_init_dtype"):
+            _validate_optimize_dtype(model, fp32_main_params=False)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_bf16_parameters_allow_native_optimizer_state(self) -> None:
+        """Allow BF16 parameters without an FP32 main copy.
+
+        Feature: Native BF16 optimizer update dtype.
+        Description: Validate a BF16 dense parameter beside an FP32 Host parameter.
+        Expectation: Neither parameter needs an FP32 main copy.
+        """
+        model = _MixedDtypeModel()
+        _validate_optimize_dtype(model, fp32_main_params=False)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_fp32_main_params_allows_low_precision_parameters(self) -> None:
+        """Allow low-precision parameters when fp32 main params are enabled.
+
+        Feature: Optimizer update dtype validation after model initialization.
+        Description: Validate a bf16 model with fp32 main parameters enabled.
+        Expectation: Validation accepts the model without changing its parameters.
+        """
+        model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+
+        _validate_optimize_dtype(model, fp32_main_params=True)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_fp32_parameters_are_allowed(self) -> None:
+        """Allow optimizer updates when model parameters are already fp32.
+
+        Feature: Optimizer update dtype validation after model initialization.
+        Description: Validate an fp32 model with fp32 main parameters disabled.
+        Expectation: Validation accepts the model without requiring a main copy.
+        """
+        model = nn.Linear(4, 4, bias=False)
+
+        _validate_optimize_dtype(model, fp32_main_params=False)
 
 
 class TestMuonMainParamConstruction(unittest.TestCase):

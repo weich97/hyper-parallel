@@ -28,11 +28,12 @@ from hyper_parallel.core.optimizer.swap_optimizer import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Torch-only optimizer implementations import torch at module load. Keep them
-# off the eager path so MindSpore-only environments can import SwapOptimizer.
+# Optimizer implementations import torch at module load. Keep them off the
+# eager path so importing the package does not pull in torch.
 _LAZY_EXPORTS = {
     "AdamW": ".adamw",
     "Muon": ".muon",
+    "Sinkhorn": ".sinkhorn",
     "ChainedOptimizer": ".optimizer",
     "detect_dtensor_backend": ".dtensor_compat",
 }
@@ -67,18 +68,16 @@ def _load_torch_optimizer_runtime():
 
 
 def _effective_optimizer_config(
-        optimizer_class: Any,
-        configured_values: Dict[str, Any],
-        runtime_optimizer: Any,
+    optimizer_class: Any,
+    configured_values: Dict[str, Any],
+    runtime_optimizer: Any,
 ) -> Dict[str, Any]:
     """Merge constructor defaults, user values, and resolved runtime defaults."""
     signature = inspect.signature(optimizer_class.__init__)
-    effective_config = {
-        name: parameter.default
-        for name, parameter in signature.parameters.items()
-        if name not in {"self", "params"}
-        and parameter.default is not inspect.Parameter.empty
-    }
+    effective_config = {}
+    for name, parameter in signature.parameters.items():
+        if name not in {"self", "params"} and parameter.default is not inspect.Parameter.empty:
+            effective_config[name] = parameter.default
     effective_config.update(configured_values)
     effective_config.update(runtime_optimizer.defaults)
     if hasattr(runtime_optimizer, "hsdp_replica_count"):
@@ -142,8 +141,11 @@ def get_hyper_optimizer(
         adamw_params: List[Dict[str, Any]],
         muon_kwargs: Optional[Dict[str, Any]] = None,
         adamw_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        sinkhorn_params: Optional[List[Dict[str, Any]]] = None,
+        sinkhorn_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Create a chained Muon + AdamW optimizer.
+    """Create a chained Muon + AdamW optimizer with optional Sinkhorn groups.
 
     Args:
         model: The neural network model.
@@ -151,6 +153,8 @@ def get_hyper_optimizer(
         adamw_params: Param groups for AdamW. Empty list disables AdamW.
         muon_kwargs: Dedicated configurations dict for Muon.
         adamw_kwargs: Dedicated configurations dict for AdamW.
+        sinkhorn_params: Optional Sinkhorn groups. Empty or None disables Sinkhorn.
+        sinkhorn_kwargs: Dedicated configurations dict for Sinkhorn.
 
     Example:
         from hyper_parallel.core.optimizer import get_hyper_optimizer
@@ -195,7 +199,7 @@ def get_hyper_optimizer(
         muon_kwargs,
     )
     optimizers = {}
-    detect_dtensor_backend(adamw_params, muon_params)
+    detect_dtensor_backend(adamw_params or sinkhorn_params or [], muon_params)
 
     if adamw_params:
         optimizers["adamw"] = _build_configured_optimizer(
@@ -213,7 +217,14 @@ def get_hyper_optimizer(
             filtered_muon_config,
         )
 
-    flatten = bool(adamw_params and muon_params)
+    if sinkhorn_params:
+        sinkhorn_class = __getattr__("Sinkhorn")
+        filtered_sinkhorn_config = _filter_optimizer_config("sinkhorn", sinkhorn_class, sinkhorn_kwargs)
+        optimizers["sinkhorn"] = _build_configured_optimizer(
+            "sinkhorn", sinkhorn_class, sinkhorn_params, filtered_sinkhorn_config,
+        )
+
+    flatten = len(optimizers) > 1
 
     return ChainedOptimizer(
         model,

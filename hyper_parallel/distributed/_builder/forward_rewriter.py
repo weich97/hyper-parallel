@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header,forbidden-backend-import
 """forward_rewriter: forward-mutation machinery for the sharding applier.
 
 All boundary forward generation, validation and installation lives here:
@@ -142,12 +143,13 @@ def _validate_required_compute_parameters(
 ) -> None:
     """Require the compute function to accept every required forward parameter."""
     fn_names = {param.name for param in fn_params}
-    required = [
-        param.name
-        for param in fwd_params
-        if param.default is inspect.Parameter.empty
-        and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-    ]
+    required = []
+    for param in fwd_params:
+        if param.default is not inspect.Parameter.empty:
+            continue
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        required.append(param.name)
     missing = [name for name in required if name not in fn_names]
     if missing:
         raise TypeError(
@@ -258,8 +260,8 @@ def _make_bias_free_forward(owner: nn.Module, original: Callable[..., Any]) -> C
     def bias_free_forward(*args: Any, **kwargs: Any) -> Any:
         """Run the owner's forward with its bias temporarily hidden."""
         bias = owner.bias
+        owner._parameters["bias"] = None  # pylint: disable=protected-access
         try:
-            owner._parameters["bias"] = None  # pylint: disable=protected-access
             return original(*args, **kwargs)
         finally:
             owner._parameters["bias"] = bias  # pylint: disable=protected-access
@@ -337,6 +339,17 @@ def _maybe_add_deferred_biases(module, spec, output):
     return output
 
 
+def _unwrap_dtensor_outputs(output):
+    """Return local tensors while preserving tuple/list output structure."""
+    if isinstance(output, DTensor):
+        return output.to_local()
+    if isinstance(output, tuple):
+        return tuple(_unwrap_dtensor_outputs(item) for item in output)
+    if isinstance(output, list):
+        return [_unwrap_dtensor_outputs(item) for item in output]
+    return output
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Production/validate boundary wrappers and output-contract validation
 # ────────────────────────────────────────────────────────────────────────────
@@ -359,10 +372,11 @@ def _descendant_boundary_fqns(plan, module_fqn):
     module.named_parameters(recurse=True)); the root spec (fqn "") treats
     every other boundary as a descendant.
     """
+    boundaries = [fqn for fqn, spec in plan.modules.items() if spec.is_boundary]
     if module_fqn == "":
-        return [f for f in plan.modules if f]
+        return [f for f in boundaries if f]
     prefix = module_fqn + "."
-    return [f[len(prefix):] for f in plan.modules if f.startswith(prefix)]
+    return [f[len(prefix):] for f in boundaries if f.startswith(prefix)]
 
 
 def _bind_input_indices(boundary, module):
@@ -469,13 +483,7 @@ def _wrap_validate_forward(
         # unbroken; the outermost boundary exit unwraps.
         if nested or keep_output_dtensor:
             return outputs
-        if isinstance(outputs, DTensor):
-            outputs = outputs.to_local()
-        elif isinstance(outputs, (tuple, list)):
-            outputs = tuple(
-                t.to_local() if isinstance(t, DTensor) else t for t in outputs
-            )
-        return outputs
+        return _unwrap_dtensor_outputs(outputs)
 
     module.forward = validate_forward
 
@@ -497,6 +505,16 @@ def _normalize_placements_ndim(placements, ndim):
         else:
             out.append(p)
     return tuple(out)
+
+
+def _validate_output_placement(tensor, expected_named, mesh_dim_names, module_name, stage):
+    """Validate one DTensor output's declared placement."""
+    ndim = len(tensor.shape)
+    expected = _normalize_placements_ndim(
+        tuple(resolve_placements(expected_named, mesh_dim_names)), ndim)
+    actual = _normalize_placements_ndim(tuple(tensor.placements), ndim)
+    if expected != actual:
+        raise PlacementMismatchError(module_name, expected, actual, stage)
 
 
 def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
@@ -522,15 +540,9 @@ def _validate_outputs(outputs, spec, mesh_dim_names, module_name, stage):
         tensor = items[idx]
         if not isinstance(tensor, DTensor):
             continue
-        ndim = len(tensor.shape)
-        expected = _normalize_placements_ndim(
-            tuple(resolve_placements(expected_named, mesh_dim_names)), ndim)
-        actual = _normalize_placements_ndim(tuple(tensor.placements), ndim)
-        if expected != actual:
-            suffix = f"[{out_name}]" if len(declared) > 1 else ""
-            raise PlacementMismatchError(
-                module_name, expected, actual, f"{stage}{suffix}"
-            )
+        suffix = f"[{out_name}]" if len(declared) > 1 else ""
+        _validate_output_placement(
+            tensor, expected_named, mesh_dim_names, module_name, f"{stage}{suffix}")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -590,20 +602,19 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
                                exclude_subtrees=()):
     """Generic local-region forward wrapper (D-03', formerly the _wrap_moe_forward skeleton).
 
-    Structure: boundary entry -> local region -> re-wrap per the declared
-    out_src -> boundary exit. Applies to any module containing data-dependent
-    logic that DTensor dispatch cannot express (e.g. MoE all-to-all) --
-    injected by _apply_phase_c when _resolve_local_compute_fn resolves to
-    non-None (derived gate, 05 §4.4.3).
+    Structure: boundary entry -> local region -> boundary exit. Applies to any
+    module containing data-dependent logic that DTensor dispatch cannot express
+    (e.g. MoE all-to-all) -- injected by _apply_phase_c when
+    _resolve_local_compute_fn resolves to non-None (derived gate, 05 §4.4.3).
 
     production: parameters were permanently unpacked at build time and inputs
-    are local (boundary passthrough); validate: inputs are DTensors ->
-    to_local -> temporarily unwrap parameters -> local computation -> re-wrap
-    the output per the declared out_src via from_local (for data-dependent
-    modules out_src is declarative validation -- the data dependence of
-    all-to-all makes the placement underivable; this is an inherent
-    limitation). Both modes share the same wrapper code (local_region
-    tolerant passthrough semantics).
+    are local (boundary passthrough), and the output stays local for lowered
+    boundary operations; validate: inputs are DTensors -> to_local ->
+    temporarily unwrap parameters -> local computation -> re-wrap the output
+    per the declared out_src via from_local (for data-dependent modules out_src
+    is declarative validation -- the data dependence of all-to-all makes the
+    placement underivable; this is an inherent limitation). Both modes share
+    the same wrapper code (local_region tolerant passthrough semantics).
 
     compute_fn: the function actually executed inside the region; defaults to
     the module's own forward. Resolved uniformly by
@@ -619,12 +630,6 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
     if compute_fn is None:
         compute_fn = original_forward
 
-
-    out_src_placements = None  # pylint: disable=unused-variable
-    if spec.out_src:
-        out_src_named = next(iter(spec.out_src.values()))
-        out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
-
     dispatch_through = bool(getattr(spec, "region_dispatch", None))
     if validate_mode and not dispatch_through:
         install_local_compute_forward_adapters(module, exclude=exclude_subtrees)
@@ -632,8 +637,7 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
     @functools.wraps(original_forward)
     def local_region_forward(*args: Any, **kwargs: Any) -> Any:
         """Local-region forward: boundary entry → local region computation →
-        re-wrap per the declared out_src → boundary exit (both modes share
-        this wrapper)."""
+        validate re-wrap → boundary exit (both modes share this wrapper)."""
         # Step 1: PrecompiledBoundary entry (e.g. TP all-gather; identity passthrough)
         args, kwargs = boundary.redistribute_inputs(
             args, kwargs, as_dtensor=validate_mode)
@@ -672,20 +676,19 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         else:
             output = compute_fn(*args, **kwargs)
 
-        # Step 3: local -> DTensor (re-wrap per the declared out_src, restoring
-        # the DTensor metadata broken by all-to-all; under production the
-        # boundary exit needs the same contract)
-        if not isinstance(output, DTensor):
+        # Step 3: validate restores the DTensor metadata broken by all-to-all.
+        # Production keeps the output local so lowered boundary operations can
+        # execute directly; an unlowerable transition wraps only in its
+        # necessary DTensor fallback inside RedistOp.
+        if validate_mode and not isinstance(output, DTensor):
             output = _rewrap_local_outputs(
                 output, spec, mesh, mesh_dim_names, type(module).__name__)
 
         # Step 4: PrecompiledBoundary exit (e.g. TP reduce-scatter)
         output = boundary.redistribute_outputs(
             output, as_dtensor_input=validate_mode)
-        # The final boundary exit is always local (when out_plan is empty, the
-        # from_local wrap from Step 3 must also be unwrapped here)
-        if isinstance(output, DTensor):
-            output = output.to_local()
+        # The final boundary exit is always local.
+        output = _unwrap_dtensor_outputs(output)
         # D-22: deferred rowwise biases — added once after the exit reduction
         return _maybe_add_deferred_biases(module, spec, output)
 
@@ -933,18 +936,35 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
         module, spec, cp_mesh, mesh, tp_mesh=tp_mesh, ep_mesh=ep_mesh)
     if resolved is None:
         return None
-    name, target, apply_fn = resolved
-    if validate_mode and getattr(spec, "region_dispatch", None) is False:
-        # A black-box inner wrapper receives local tensors and local parameter
-        # shards in validate mode. Cached head counts must therefore match the
-        # TP-local projection widths, just as they already do in production.
-        maybe_update_head_counts(
-            target,
-            spec,
-            module_fqn or type(module).__name__,
-            mesh,
-            mesh_dim_names,
-        )
+    name, target = _apply_resolved_inner_wrapper(
+        module, resolved, spec, mesh, mesh_dim_names, validate_mode, module_fqn)
+    target_name = _inner_target_name(module, target)
+    if spec is not None:
+        spec._resolved_inner_wrapper = name  # pylint: disable=protected-access
+        spec._resolved_inner_target = target_name  # pylint: disable=protected-access
+    if name == "custom":
+        source = "custom callable"
+    elif spec is not None and isinstance(
+            getattr(spec, "inner_wrapper", None), str):
+        source = "explicitly specified (registry)"
+    else:
+        source = "explicitly specified (Target)"
+    logger.info("inner-wrap: %s target=%s <- wrapper %r (%s)",
+                type(module).__name__, target_name, name, source)
+    return name
+
+
+def _rollback_inner_rewrite(target, saved_state, committed_secondaries):
+    """Restore primary and secondary targets after a failed inner rewrite."""
+    for secondary_target, secondary_state in reversed(committed_secondaries):
+        for attr, saved in secondary_state.items():
+            _restore_attr(secondary_target, attr, saved)
+    for attr, saved in saved_state.items():
+        _restore_attr(target, attr, saved)
+
+
+def _prepare_inner_rewrite(target, apply_fn, name):
+    """Apply an inner wrapper and retain the state needed for rollback."""
     orig_forward = target.forward
     # Record the pre-rewrite state for failure rollback: an in-place wrapper
     # writes an instance attribute, so __dict__ holds the full mutation.
@@ -979,6 +999,33 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
                 setattr(target, attr, value)
             new_forward = primary.forward
             replaced = True
+    except Exception:
+        _rollback_inner_rewrite(
+            target, saved_state, committed_secondaries)
+        raise
+    return (orig_forward, new_forward, replaced, saved_state,
+            committed_secondaries)
+
+
+def _apply_resolved_inner_wrapper(module, resolved, spec, mesh, mesh_dim_names,
+                                  validate_mode, module_fqn):
+    """Apply, validate, and atomically install a resolved inner wrapper."""
+    name, target, apply_fn = resolved
+    if validate_mode and getattr(spec, "region_dispatch", None) is False:
+        # A black-box inner wrapper receives local tensors and local parameter
+        # shards in validate mode. Cached head counts must therefore match the
+        # TP-local projection widths, just as they already do in production.
+        maybe_update_head_counts(
+            target,
+            spec,
+            module_fqn or type(module).__name__,
+            mesh,
+            mesh_dim_names,
+        )
+    (orig_forward, new_forward, replaced, saved_state,
+     committed_secondaries) = _prepare_inner_rewrite(
+         target, apply_fn, name)
+    try:
         if replaced:
             # Principle 1: the replaced forward must accept all inputs of the
             # original forward
@@ -994,28 +1041,10 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
                 target, new_forward, module, spec, mesh, mesh_dim_names, name,
                 validate_mode=validate_mode)
     except Exception:
-        # Failure rollback: restore every attribute written during the
-        # rewrite so a half-installed wrapper never survives.
-        for secondary_target, secondary_state in reversed(committed_secondaries):
-            for attr, saved in secondary_state.items():
-                _restore_attr(secondary_target, attr, saved)
-        for attr, saved in saved_state.items():
-            _restore_attr(target, attr, saved)
+        _rollback_inner_rewrite(
+            target, saved_state, committed_secondaries)
         raise
-    target_name = _inner_target_name(module, target)
-    if spec is not None:
-        spec._resolved_inner_wrapper = name  # pylint: disable=protected-access
-        spec._resolved_inner_target = target_name  # pylint: disable=protected-access
-    if name == "custom":
-        source = "custom callable"
-    elif spec is not None and isinstance(
-            getattr(spec, "inner_wrapper", None), str):
-        source = "explicitly specified (registry)"
-    else:
-        source = "explicitly specified (Target)"
-    logger.info("inner-wrap: %s target=%s <- wrapper %r (%s)",
-                type(module).__name__, target_name, name, source)
-    return name
+    return name, target
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1041,9 +1070,18 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     interval [lo, hi) are zeroed and indices are shifted by the offset, so the
     output is naturally a Partial contribution and the boundary exit's
     Partial->Shard(1) reduction is unchanged.
+
+    The interval must come from the *local* vocab shard. The applier reaches
+    this after the Phase C one-shot ``_local_params_context`` unwrap (plain
+    local parameter), but a caller may install the boundary while the weight
+    is still a DTensor -- ``DTensor.shape`` is the global shape and would give
+    a wrong interval -- so the local shard is read explicitly.
     """
     original_forward = module.forward
-    v_local = module.weight.shape[0]
+    weight = module.weight
+    to_local = getattr(weight, "to_local", None)
+    local_weight = to_local() if callable(to_local) else weight
+    v_local = local_weight.shape[0]
     lo = tp_mesh.get_local_rank() * v_local
     hi = lo + v_local
 
@@ -1053,7 +1091,13 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     ) -> torch.Tensor:
         """Masked vocab-parallel embedding forward: zero out-of-range token
         ids, shift indices by the local vocab offset, and mask the output so
-        it is a pure Partial contribution."""
+        it is a pure Partial contribution.
+
+        Args:
+            input_ids: Global token IDs at the vocab-parallel boundary.
+            *args: Additional original embedding arguments.
+            **kwargs: Additional original embedding keyword arguments.
+        """
         mask = (input_ids >= lo) & (input_ids < hi)
         local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
         out = original_forward(local_ids, *args, **kwargs)
@@ -1081,7 +1125,8 @@ class _ForwardRewriteRequest:
 
     __slots__ = ("target", "forward", "companion_attrs")
 
-    def __init__(self, target, forward, companion_attrs=()):
+    def __init__(self, target: nn.Module, forward: Callable[..., Any], companion_attrs: Any = ()) -> None:
+        """Keep one forward replacement and its companion attribute updates."""
         self.target = target
         self.forward = forward
         self.companion_attrs = dict(companion_attrs)

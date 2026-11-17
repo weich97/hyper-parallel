@@ -1,0 +1,2 @@
+timestamp	commit	metric	status	description
+2026-11-11T14:35:33-05:00	4d4a9f16	15.65	keep	16K CP2 HSDP8 GBS64: combine the node-local dense sharding and backward prefetch from 40745 with scoped Sparse Flash MLA Grad tiling from 40761. Retain global PyTorch and HCCL determinism. [c3_job=40765 c3_seconds=377 tokens_per_second_per_die=527.1422]

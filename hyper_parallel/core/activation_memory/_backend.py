@@ -36,13 +36,7 @@ __all__ = [
 import torch
 from torch import Tensor
 
-
-def get_device_handle(device_type: str = "npu"):
-    """Return the torch device module (e.g. ``torch.npu`` or ``torch.cuda``)."""
-    try:
-        return getattr(torch, device_type)
-    except AttributeError as e:
-        raise RuntimeError(f"expect got device handle: 'torch.{device_type}' failed.") from e
+from hyper_parallel.core.utils.communication import get_device_handle
 
 
 def new_stream():

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -17,7 +17,15 @@
 namespace ops {
 class HyperMegaMoeGrad : public OpDef {
  public:
-    explicit HyperMegaMoeGrad(const char* name) : OpDef(name) {  // lizard:ignore
+    explicit HyperMegaMoeGrad(const char* name) : OpDef(name) {
+        RegisterInputs0();
+        RegisterInputs1();
+        RegisterInputs2();
+        RegisterOutputsAndConfiguration();
+    }
+
+ private:
+    void RegisterInputs0() {
         this->Input("dispatch_target")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
@@ -78,6 +86,9 @@ class HyperMegaMoeGrad : public OpDef {
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND,         ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND,         ge::FORMAT_ND});
+    }
+
+    void RegisterInputs1() {
         this->Input("gate_dx")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
@@ -138,6 +149,9 @@ class HyperMegaMoeGrad : public OpDef {
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+    }
+
+    void RegisterInputs2() {
         this->Input("swiglu_grad_tiling")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
@@ -163,11 +177,14 @@ class HyperMegaMoeGrad : public OpDef {
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        this->Input("profile_buffer")
+        this->Input("diagnostic_buffer")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+    }
+
+    void RegisterOutputsAndConfiguration() {
         this->Output("dispatch_target")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})

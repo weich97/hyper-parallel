@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,10 +21,43 @@ an adapter from ``MOE_ROUTER_ADAPTERS`` BY NAME in its own code — the choice
 is explicit, never inferred. Each adapter maps
 ``(module, hidden) -> (topk_idx [T,K] int64, topk_w [T,K] float)``.
 
+Benchmark-only balanced variants are derived from a real adapter with
+:func:`make_balanced_router` and registered as ``<adapter>_fixed``, so an
+archetype opts in with one flag (``fix_router``, see :func:`resolve_moe_router`)
+instead of carrying its own copy of the wrapper.
+
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+import logging
+import math
+import os
+from typing import Optional
+
 import torch
+
+logger = logging.getLogger(__name__)
+
+# float32 represents every integer up to 2**24 exactly, so a smaller expert count
+# can use the AICore float sort (see ``experts._SORT_KEY_FP32_LIMIT``).
+_SORT_KEY_FP32_LIMIT = 1 << 24
+
+# Which slots inside an over-capacity expert survive (``HP_EP_CAPACITY_ORDER``):
+#
+# * ``score`` (default): the heaviest routing weights -- the contributions whose removal
+#   perturbs the routed sum the least.  A cap exists to bound memory, and spending the bound
+#   on the cheapest slots is what makes "which slots die" a defined policy instead of an
+#   accident of the sort order;
+# * ``first``: the first slots of the expert-major order, i.e. what the archived
+#   ``HP_EP_CAPACITY_FACTOR`` sweeps (drop rate / peak / step time) were measured with.
+#
+# Both policies keep exactly the same number of slots per expert, which is the invariant the
+# memory bound rests on, so the choice cannot move a peak, a row count or a step time -- it
+# only decides whose contribution is lost.
+_CAPACITY_ORDER_SCORE = "score"
+_CAPACITY_ORDER_FIRST = "first"
+_CAPACITY_ORDERS = (_CAPACITY_ORDER_SCORE, _CAPACITY_ORDER_FIRST)
+_FP32_KEY_WARNED = False
 
 
 def _softmax_topk_router(module, hidden_states):
@@ -55,9 +88,7 @@ def _softmax_topk_router(module, hidden_states):
 
 
 def _topk_router_module(module, hidden_states):
-    """Qwen2/Qwen3/Mixtral adapter: gate is a TopKRouter module (after the HF 2025
-    refactor); forward directly returns (logits, scores [T,K], indices [T,K])
-    -- take the latter two."""
+    """Adapt both tuple-returning TopKRouter and legacy linear gate modules."""
     gate = getattr(module, "gate", None)
     if gate is None:
         gate = getattr(module, "router", None)
@@ -65,9 +96,25 @@ def _topk_router_module(module, hidden_states):
     if isinstance(out, (tuple, list)) and len(out) == 3:
         _, scores, indices = out
         return indices, scores
+    if isinstance(out, torch.Tensor):
+        logits = out.reshape(-1, out.shape[-1])
+        config = getattr(module, "config", None)
+        top_k = (getattr(module, "top_k", None)
+                 or getattr(config, "num_experts_per_tok", None)
+                 or getattr(config, "top_k", None))
+        if top_k is None:
+            raise ValueError(f"{type(module).__name__}: linear router requires top_k")
+        weights = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        scores, indices = weights.topk(int(top_k), dim=-1)
+        norm_topk_prob = getattr(module, "norm_topk_prob", None)
+        if norm_topk_prob is None:
+            norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        if norm_topk_prob:
+            scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        return indices, scores.to(hidden_states.dtype)
     raise TypeError(
-        f"{type(module).__name__}: TopKRouter should return (logits, scores, indices), "
-        f"got {type(out).__name__} -- use the default adapter or register a custom adapter"
+        f"{type(module).__name__}: router should return a Tensor or "
+        f"(logits, scores, indices), got {type(out).__name__}"
     )
 
 
@@ -136,7 +183,330 @@ def _sigmoid_group_router(module, hidden_states):
     return topk_idx, topk_w
 
 
+def apply_capacity_limit(
+    topk_idx: "torch.Tensor",
+    capacity_factor: Optional[float],
+    num_experts: int,
+    weights: Optional["torch.Tensor"] = None,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Capacity mask for a routed assignment (MoE token dropping).
+
+    Real routing is skewed: on the 2-SN benchmark the busiest rank has been measured at
+    **6x** the mean token count.  A rank's expert buffers are sized by the rows it
+    receives, so that skew -- not the balanced case -- decides whether the step fits in
+    memory: at GBS 256 / seq 8192 the balanced peak is 41.5 GB while real routing reached
+    55.3 GiB and failed to allocate a 5.23 GiB expert output.  Every *switch* that does not
+    change the routed row count (GBS, prefetch depth, ``swap_inputs``, ``overlap_shared_expert``,
+    even a 25% shorter sequence) bought at most 1.8 GB, because none of them bound the
+    busiest rank.
+
+    Capping each expert at ``capacity_factor x (T*K / E)`` slots bounds it directly, which is
+    the standard GShard/Switch/Megatron answer to routing skew.  Tokens beyond capacity are
+    *dropped* (their contribution is removed), so this changes the model, exactly as it does
+    in those implementations; the returned drop rate is what makes the trade measurable.
+
+    The cap is what bounds memory, and it is policy-independent: every expert keeps exactly
+    ``min(count_e, capacity)`` slots.  *Which* slots those are is decided by
+    ``HP_EP_CAPACITY_ORDER``:
+
+    * ``score`` (default): the ``capacity`` heaviest ``weights`` of each expert, so the
+      contributions dropped are the cheapest ones.  Cheap and deterministic -- the expert index
+      and the inverted weight share a single fp32 sort key, keeping the AICore float sort (see
+      :func:`_expert_score_order`);
+    * ``first``: the first slots of the expert-major order (see :func:`_expert_major_order`).
+      Deterministic for a given input and backend as well, but not a policy with a meaning:
+      within one expert it is "not necessarily first in token order".
+
+    Args:
+        topk_idx: Routed expert per slot, shape ``[T, K]``.
+        capacity_factor: Multiplier on the mean load, or ``None`` to disable the cap.
+        num_experts: Total routed experts ``E``.
+        weights: Routing weight of every slot, shaped like ``topk_idx``.  Only the ``score``
+            policy reads it, so a caller that passes ``None`` gets the ``first`` policy.
+
+    Returns:
+        ``(keep, dropped)`` where ``keep`` is a bool tensor shaped like ``topk_idx`` and
+        ``dropped`` is the number of dropped slots as a 0-dim tensor on the plan's device.
+        Draining it costs a host sync, so callers must not read it on the hot path -- the one
+        caller logs it once and then sparsely (see ``ep_routed_dispatch``).
+
+    Raises:
+        ValueError: If ``num_experts`` is not positive, or ``HP_EP_CAPACITY_ORDER`` is neither
+            ``score`` nor ``first``.
+    """
+    if capacity_factor is None or float(capacity_factor) <= 0:
+        return (
+            torch.ones_like(topk_idx, dtype=torch.bool),
+            torch.zeros((), dtype=torch.int64, device=topk_idx.device),
+        )
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+
+    flat_expert = topk_idx.reshape(-1).to(torch.int64)
+    slots = flat_expert.numel()
+    capacity = int(math.ceil(float(capacity_factor) * slots / float(num_experts)))
+    keep_flat = torch.zeros_like(flat_expert, dtype=torch.bool)
+    if capacity > 0:
+        order = _slot_order(flat_expert, weights, num_experts)
+        counts = torch.bincount(flat_expert, minlength=num_experts)
+        starts = torch.cumsum(counts, dim=0) - counts
+        ranks = torch.arange(slots, device=flat_expert.device) - starts[flat_expert[order]]
+        keep_flat[order] = ranks < capacity
+    # ``dropped`` stays a device tensor on purpose: draining it costs a host sync, and this
+    # runs once per MoE layer, so callers that want the number must ask for it explicitly
+    # (they log it once, see ``ep_routed_dispatch``) instead of paying it every layer.
+    return keep_flat.view_as(topk_idx), (~keep_flat).sum()
+
+
+def _resolve_capacity_order() -> str:
+    """Resolve ``HP_EP_CAPACITY_ORDER`` for the current call.
+
+    Read per call rather than at import time, like the capacity factor itself, so the policy
+    can be switched without reloading the module.
+
+    Returns:
+        ``"score"`` or ``"first"``.
+
+    Raises:
+        ValueError: If the knob is neither; a typo must not silently keep a policy the
+            operator did not ask for.
+    """
+    raw = os.environ.get("HP_EP_CAPACITY_ORDER", _CAPACITY_ORDER_SCORE).strip().lower()
+    if raw not in _CAPACITY_ORDERS:
+        raise ValueError(
+            f"HP_EP_CAPACITY_ORDER must be one of {list(_CAPACITY_ORDERS)}, but got {raw!r}"
+        )
+    return raw
+
+
+def _slot_order(
+    flat_expert: "torch.Tensor",
+    flat_weights: Optional["torch.Tensor"],
+    num_experts: int,
+) -> "torch.Tensor":
+    """Order slots by expert, and under the ``score`` policy by descending weight as well."""
+    if flat_weights is None or _resolve_capacity_order() == _CAPACITY_ORDER_FIRST:
+        return _expert_major_order(flat_expert, num_experts)
+    return _expert_score_order(flat_expert, flat_weights, num_experts)
+
+
+def _expert_score_order(
+    flat_expert: "torch.Tensor",
+    flat_weights: "torch.Tensor",
+    num_experts: int,
+) -> "torch.Tensor":
+    """Expert-major order that puts the heaviest slot of every expert first.
+
+    Both keys travel in ONE fp32 sort key: the integer part is the expert index and the
+    fractional part carries the inverted, normalized weight, so a heavier slot always sorts
+    earlier and the fraction can never carry into the next expert.  One key also means one sort
+    -- the AICore float sort the expert-major order already uses.  A lexicographic or int64 key
+    would lose that kernel (the same reason ``HP_EP_SORT_FP32`` exists for the dispatch sort),
+    and a second pass is not needed either.
+
+    Resolution limit: fp32 spends the integer part's exponent on the expert index, so the
+    fractional step is about ``2**-15`` around ``num_experts = 2**8..2**9`` (and ``2**-11``
+    around ``2**12``).  Weights closer together than that, relative to the plan's spread, tie
+    and their relative order is arbitrary -- the *count* kept per expert, which is what bounds
+    the busiest rank, is exact either way.  ``HP_EP_CAPACITY_ORDER=first`` stays available for a
+    bit-exact reproduction of the archived sweeps.
+
+    Args:
+        flat_expert: Expert index of every routed slot, shape ``[T*K]``.
+        flat_weights: Routing weight of every slot, same shape.
+        num_experts: Size of the expert index space.
+
+    Returns:
+        An int64 permutation of ``range(flat_expert.numel())``.
+
+    Raises:
+        ValueError: If ``flat_weights`` does not carry exactly one weight per slot.
+    """
+    if flat_weights.numel() != flat_expert.numel():
+        raise ValueError(
+            f"weights must have one entry per slot: got {flat_weights.numel()} for "
+            f"{flat_expert.numel()} slots"
+        )
+    if not 0 < num_experts <= _SORT_KEY_FP32_LIMIT:
+        global _FP32_KEY_WARNED  # pylint: disable=global-statement
+        if not _FP32_KEY_WARNED:
+            _FP32_KEY_WARNED = True
+            logger.warning(
+                "HP_EP_CAPACITY_ORDER=score needs the expert index to be exact in a float32 "
+                "key, but num_experts=%d is outside (0, 2**24]; keeping the expert-major order",
+                num_experts,
+            )
+        return _expert_major_order(flat_expert, num_experts)
+    weight = flat_weights.reshape(-1).to(torch.float32)
+    inverted = weight.max() - weight
+    # ``clamp_min`` rather than a host-side ``if span == 0``: reading the span would drain the
+    # device, and this runs once per MoE layer.  A zero span leaves every ``inverted`` at zero,
+    # so the fraction stays zero and the expert-major order stands.  ``0 * inf`` cannot happen:
+    # a zero span means ``inverted`` is exactly zero.
+    span = inverted.max().clamp_min(torch.finfo(weight.dtype).tiny)
+    # One multiply-add instead of three elementwise passes: ``expert + inverted * 0.5 / span``.
+    key = torch.addcmul(flat_expert.to(torch.float32), inverted, 0.5 / span)
+    return key.argsort()
+
+
+def _expert_major_order(flat_expert: "torch.Tensor", num_experts: int) -> "torch.Tensor":
+    """Return the permutation that groups slots by expert.
+
+    Integer ``argsort`` has no AICore kernel on this stack (the same reason
+    ``HP_EP_SORT_FP32`` exists for the dispatch sort), so keys are cast to float32 when the
+    expert count is exactly representable.  Ties inside one expert may then be ordered
+    arbitrarily rather than by token: the *count* kept per expert -- which is what bounds the
+    busiest rank's memory -- is unaffected, and the result is still deterministic for a given
+    input and backend.
+
+    Args:
+        flat_expert: Expert index of every routed slot, shape ``[T*K]``.
+        num_experts: Size of the expert index space.
+
+    Returns:
+        An int64 permutation of ``range(flat_expert.numel())`` ordering slots by expert.
+    """
+    if 0 < num_experts <= _SORT_KEY_FP32_LIMIT:
+        return flat_expert.to(torch.float32).argsort()
+    return torch.argsort(flat_expert, stable=True)
+
+
+def _global_expert_count(module):
+    """Model-level routed expert count (mirrors ``experts._get_global_expert_count``).
+
+    Kept local so this module stays a torch-only leaf (it is imported by
+    model adapters that do not want the expert compute machinery).
+    """
+    for owner in (getattr(module, "experts", None), module):
+        count = getattr(owner, "num_experts", None)
+        if count is not None:
+            return int(count)
+    cfg = getattr(module, "config", None)
+    for name in ("num_experts", "n_routed_experts"):
+        count = getattr(cfg, name, None)
+        if count is not None:
+            return int(count)
+    raise ValueError(
+        f"{type(module).__name__}: cannot determine the global routed expert count"
+    )
+
+
+def _balanced_expert_indices(
+    token_count: int,
+    experts_per_token: int,
+    expert_count: int,
+    local_count: int,
+    *,
+    device,
+) -> "torch.Tensor":
+    """Round-robin the ``T*K`` slots over the DESTINATION ranks.
+
+    Local slot ``i`` goes to one of the ``L`` experts owned by destination
+    ``i mod Q`` (``Q = E/L``), so every rank receives exactly ``T*K/Q`` slots
+    instead of a data-dependent count.
+
+    Spreading by *rank* rather than by expert is what makes this exact: the
+    per-expert token count cannot be made uniform at all when ``E`` does not
+    divide ``T*K``, and a per-expert round robin (``i mod E``) replays the same
+    residue pattern on every rank, so the leftover slots pile onto the same
+    fixed group of ranks (measured: 0.8% above the mean on the busiest rank,
+    2.4% spread between rank groups). Going through the destination first
+    absorbs that leftover per rank instead.
+
+    Args:
+        token_count: Local tokens ``T``.
+        experts_per_token: Routed experts per token ``K``.
+        expert_count: Global routed experts ``E``.
+        local_count: Experts this rank owns ``L``.
+        device: Device for the returned index tensor.
+
+    Returns:
+        ``[T, K]`` int64 indices naming the expert each slot is routed to.
+
+    Raises:
+        ValueError: If ``E`` is not divisible by ``L``.
+    """
+    if local_count <= 0 or expert_count % local_count != 0:
+        raise ValueError(
+            f"num_experts ({expert_count}) must be divisible by the local "
+            f"expert count ({local_count})"
+        )
+    destinations = expert_count // local_count
+    slots = torch.arange(token_count * experts_per_token, device=device)
+    indices = (slots % destinations) * local_count + (slots // destinations) % local_count
+    return indices.view(token_count, experts_per_token)
+
+
+def make_balanced_router(real_router):
+    """Wrap ``real_router`` in a benchmark-only variant with a uniform expert load.
+
+    The real adapter still runs -- so its weights stay differentiable and the
+    router GEMM stays in the compute profile -- but the chosen experts are
+    replaced by a round-robin assignment that spreads the local slots over the
+    **destination ranks** (see :func:`_balanced_expert_indices`). Every rank
+    therefore receives exactly ``T*K/Q`` tokens instead of a data-dependent
+    count, whatever routing semantics ``real_router`` implements.
+
+    Why: unbalanced routing is the dominant source of step-time jitter on MoE
+    training runs -- the slowest rank in a step is the one whose experts drew
+    the most tokens, so identical configurations can differ by tens of percent
+    step to step. Measured on the 293B/18-layer config, the real router put
+    **6.3x** the mean token count on the busiest rank (leaving some experts
+    empty) while the balanced one stayed at 1.00x. Flattening the load makes a
+    step-to-step comparison converge in 2-3 steps instead of needing a dozen,
+    which is what makes small (1-3%) kernel-level effects measurable at all.
+
+    **Benchmark-only.** The assignment ignores the gate scores, so:
+
+    - ``loss`` / ``grad_norm`` / any convergence signal is meaningless here;
+    - expert hit distributions and "effective MFU" are optimistic (the load is
+      artificially flat), so numbers from this mode must not be reported as an
+      efficiency result.
+
+    Correctness must be validated with the switch OFF (``fix_router: False``),
+    where ``real_router`` runs unchanged. The true ``topk_w`` are kept so the
+    gate still receives gradient.
+
+    Args:
+        real_router: A ``(module, hidden) -> (topk_idx, topk_w)`` adapter, e.g.
+            any entry of :data:`MOE_ROUTER_ADAPTERS`.
+
+    Returns:
+        A ``(module, hidden) -> (topk_idx, topk_w)`` adapter with a uniform
+        destination load; its ``__name__`` records the wrapped adapter.
+    """
+
+    def balanced_router(module, hidden_states):
+        """Run ``real_router`` and replace its destinations round-robin."""
+        topk_idx, topk_w = real_router(module, hidden_states)
+        token_count, experts_per_token = topk_idx.shape
+        balanced_idx = _balanced_expert_indices(
+            int(token_count),
+            int(experts_per_token),
+            _global_expert_count(module),
+            # Set by the EP binder (bind_local_expert_forward) before any forward; a
+            # missing value degrades to a plain per-expert round robin.
+            int(getattr(getattr(module, "experts", None),
+                        "local_expert_count", None) or 1),
+            device=topk_idx.device,
+        )
+        return balanced_idx.to(topk_idx.dtype), topk_w
+
+    # A callable object or a functools.partial has no ``__name__``; its class name is
+    # then the most informative thing the log line can carry.
+    real_name = getattr(real_router, "__name__", None) or type(real_router).__name__
+    balanced_router.__name__ = f"balanced_{real_name}"
+    balanced_router.__doc__ = (
+        f"Benchmark-only variant of ``{real_name}`` with a uniform destination "
+        "load (see :func:`make_balanced_router`)."
+    )
+    return balanced_router
+
+
 MOE_ROUTER_ADAPTERS = {
+    "softmax_topk": _softmax_topk_router,
+    "topk_router_module": _topk_router_module,
+    "sigmoid_group": _sigmoid_group_router,
     "default": _softmax_topk_router,
     "qwen2moe": _topk_router_module,
     "qwen2_moe": _topk_router_module,
@@ -148,3 +518,50 @@ MOE_ROUTER_ADAPTERS = {
     "glm4moe": _sigmoid_group_router,
     "glm4_moe": _sigmoid_group_router,
 }
+
+# One balanced wrapper per distinct real adapter, published as ``<name>_fixed`` for
+# every alias: the convention ``fix_router`` resolves through.
+_BALANCED_VARIANTS = {
+    adapter: make_balanced_router(adapter)
+    for adapter in dict.fromkeys(MOE_ROUTER_ADAPTERS.values())
+}
+# The archived benchmark router: the balanced wrapper over the sigmoid-group adapter,
+# kept as a module-level name because the recipes' docs and the earlier 2-SN sweeps
+# refer to it.
+_balanced_router = _BALANCED_VARIANTS[_sigmoid_group_router]
+for _alias, _adapter in list(MOE_ROUTER_ADAPTERS.items()):
+    MOE_ROUTER_ADAPTERS[f"{_alias}_fixed"] = _BALANCED_VARIANTS[_adapter]
+del _alias, _adapter
+
+
+def resolve_moe_router(router, fix_router: bool = False):
+    """Resolve a router adapter, optionally to its benchmark-only balanced variant.
+
+    ``fix_router`` is the switch every archetype factory exposes; it has to mean the
+    same thing everywhere, so it is resolved here rather than re-implemented per
+    factory (see :func:`make_balanced_router` for what it does and why its numbers are
+    not efficiency results).
+
+    Args:
+        router: An adapter callable, or the name of an entry in
+            :data:`MOE_ROUTER_ADAPTERS`.
+        fix_router: When true, return the balanced variant: the ``<name>_fixed``
+            registry entry for a name, or ``make_balanced_router(router)`` for a
+            callable.
+
+    Returns:
+        A ``(module, hidden) -> (topk_idx, topk_w)`` adapter.
+
+    Raises:
+        KeyError: If ``router`` is a name that is not registered.
+        TypeError: If ``router`` is neither a registry name nor callable.
+    """
+    if isinstance(router, str):
+        key = f"{router}_fixed" if fix_router else router
+        return MOE_ROUTER_ADAPTERS[key]
+    if not callable(router):
+        raise TypeError(
+            "router must be a registry name or a callable, got "
+            f"{type(router).__name__}"
+        )
+    return make_balanced_router(router) if fix_router else router

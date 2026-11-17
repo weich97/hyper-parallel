@@ -53,12 +53,17 @@ class TestBuildOptionsFields(unittest.TestCase):
             _field_snapshot(CompileConfig),
             [
                 ("enabled", "False"),
+                ("use_joint_graph", "False"),
                 ("mode", "'default'"),
                 ("fullgraph", "False"),
                 ("dynamic", "False"),
                 ("backend", "None"),
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
+                ("dynamic_arg_dims", "None"),
+                ("fsdp_allgather_prefetch", "True"),
+                ("fsdp_overlap_grad_reduce", "True"),
+                ("max_in_flight_gb", "0.25"),
             ],
         )
 
@@ -74,6 +79,7 @@ class TestBuildOptionsFields(unittest.TestCase):
                 "reshard_after_backward", "requires_grad_sync",
                 "backward_prefetch_depth", "forward_prefetch_depth",
                 "comm_fusion", "comm_fusion_zero_copy",
+                "wrapper_class",
             ],
         )
         config = FSDP2Config()
@@ -82,6 +88,7 @@ class TestBuildOptionsFields(unittest.TestCase):
         self.assertIsInstance(config.mix_precision, FSDP2MixedPrecisionConfig)
         self.assertIsNone(config.mix_precision.param_dtype)
         self.assertIsNone(config.comm_fusion_zero_copy)
+        self.assertTrue(config.reshard_after_forward)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -102,12 +109,34 @@ class TestBuildOptionsFields(unittest.TestCase):
         """CompileConfig rejects non-bool flags and contradictory options."""
         with self.assertRaisesRegex(TypeError, "compile.enabled must be a bool"):
             CompileConfig(enabled=1)
+        with self.assertRaisesRegex(TypeError, "compile.use_joint_graph must be a bool"):
+            CompileConfig(use_joint_graph=1)
         with self.assertRaisesRegex(ValueError, "compile.mode"):
             CompileConfig(mode="  ")
         with self.assertRaisesRegex(ValueError, "compile.options"):
             CompileConfig(mode="reduce-overhead", options={"triton": True})
         with self.assertRaisesRegex(ValueError, "dynamo_cache_size_limit"):
             CompileConfig(dynamo_cache_size_limit=0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_use_joint_graph_selects_graph_compiler(self):
+        """Graph-mode trainer selection is driven by compile.enabled + flag."""
+        config = CompileConfig(
+            enabled=True,
+            use_joint_graph=True,
+            mode="reduce-overhead",
+            options={"triton": True},
+        )
+
+        self.assertTrue(config.selects_graph_compiler())
+        self.assertEqual(config.mode, "reduce-overhead")
+        self.assertEqual(config.options, {"triton": True})
+        self.assertFalse(
+            CompileConfig(
+                enabled=True, use_joint_graph=False
+            ).selects_graph_compiler()
+        )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

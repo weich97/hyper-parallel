@@ -25,10 +25,8 @@ import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-
-# The launcher activates CANN and the multicore payload before importing this
+# The launcher activates the Ascend runtime and multicore payload before importing this
 # worker. Framework imports stay out of the ``test_mega_moe.py`` launcher.
-# pylint: disable=wrong-import-position
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -38,8 +36,6 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 from hyper_parallel.core.multicore import MegaMoeExperts
 from hyper_parallel.components.modules.moe import GroupedExperts
-
-# pylint: enable=wrong-import-position
 
 _RTOL = 2e-2
 _ATOL = 2e-3
@@ -215,29 +211,50 @@ def _copy_common_weights_to_mega(
     up_weight = _local_tensor(common_moe.w3)
     down_weight = _local_tensor(common_moe.w2)
     with torch.no_grad():
-        mega.gate_up_weight.copy_(
-            torch.cat(
-                (gate_weight.transpose(1, 2), up_weight.transpose(1, 2)),
-                dim=-1,
+        if mega.expert_weight_layout == "EOI":
+            mega.gate_up_weight.copy_(torch.cat((gate_weight, up_weight), dim=1))
+            mega.down_weight.copy_(down_weight)
+        else:
+            mega.gate_up_weight.copy_(
+                torch.cat(
+                    (gate_weight.transpose(1, 2), up_weight.transpose(1, 2)),
+                    dim=-1,
+                )
             )
-        )
-        mega.down_weight.copy_(down_weight.transpose(1, 2))
+            mega.down_weight.copy_(down_weight.transpose(1, 2))
 
 
 def new_layers(
     shape: MoeShape,
     *,
-    expert_capacity_factor: float | None = None,
+    initial_capacity_factor: float | None = None,
+    capacity_growth_factor: float | None = None,
+    dispatch_mode: str | None = None,
+    expert_weight_layout: str = "EIO",
 ) -> tuple[MegaMoeExperts, torch.nn.Module]:
-    """Construct parameter-aligned MegaMoe and common expert layers."""
+    """Construct parameter-aligned MegaMoe and common expert layers.
+
+    Args:
+        shape: Local token and expert dimensions.
+        initial_capacity_factor: Optional initial push receive factor.
+        dispatch_mode: MegaMoe dispatch transport.
+        capacity_growth_factor: Optional push growth multiplier.
+        expert_weight_layout: Public expert parameter layout.
+
+    Returns:
+        MegaMoe and common expert modules with identical local parameters.
+    """
     common_moe = new_common_moe(shape)
+    mode = dispatch_mode or os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     mega = MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        expert_capacity_factor=expert_capacity_factor,
+        initial_capacity_factor=initial_capacity_factor if mode == "push" else None,
+        capacity_growth_factor=capacity_growth_factor if mode == "push" else None,
+        dispatch_mode=mode,
+        expert_weight_layout=expert_weight_layout,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(device=DEVICE, dtype=torch.bfloat16)
@@ -299,19 +316,35 @@ def run_layer(
     topk_weights: torch.Tensor,
     tokens_per_expert: torch.Tensor | None,
     grad_output: torch.Tensor,
+    *,
+    accumulation_steps: int = 1,
 ) -> _RunResult:
-    """Run one layer F+B plus SGD and detach all compared tensors."""
+    """Accumulate F+B microbatches, take one SGD step, and detach compared tensors."""
     layer.zero_grad(set_to_none=True)
     hidden = hidden_states.detach().clone().requires_grad_(True)
     route_weights = topk_weights.detach().clone().requires_grad_(True)
-    output = forward_layer(
-        layer,
-        hidden,
-        topk_ids,
-        route_weights,
-        tokens_per_expert=tokens_per_expert,
-    )
-    output.backward(grad_output)
+    first_weight_gradients = ()
+    for microbatch in range(accumulation_steps):
+        output = forward_layer(
+            layer,
+            hidden,
+            topk_ids,
+            route_weights,
+            tokens_per_expert=tokens_per_expert,
+        )
+        output.backward(grad_output)
+        if accumulation_steps > 1:
+            gradients = expert_weight_gradients(layer)
+            if microbatch == 0:
+                first_weight_gradients = tuple(gradient.detach().clone() for gradient in gradients)
+            else:
+                for name, gradient, first in zip(("gate/up", "down"), gradients, first_weight_gradients):
+                    assert_close(f"{name} accumulated gradient", gradient, first * (microbatch + 1))
+    if isinstance(layer, MegaMoeExperts):
+        for weight in (layer.gate_up_weight, layer.down_weight):
+            assert weight.grad.stride() == weight.stride(), (
+                f"rank={RANK}: expected gradient stride={weight.stride()}, actual={weight.grad.stride()}."
+            )
     optimizer = torch.optim.SGD(layer.parameters(), lr=1e-3)
     optimizer.step()
     torch.npu.synchronize(DEVICE)
@@ -342,6 +375,13 @@ def expert_weight_gradients(
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Return expert gradients in MegaMoe's packed local layout."""
     if isinstance(layer, MegaMoeExperts):
+        if layer.expert_weight_layout == "EOI":
+            gate_up_grad = layer.gate_up_weight.grad
+            down_grad = layer.down_weight.grad
+            return (
+                None if gate_up_grad is None else gate_up_grad.transpose(1, 2),
+                None if down_grad is None else down_grad.transpose(1, 2),
+            )
         return layer.gate_up_weight.grad, layer.down_weight.grad
     if not isinstance(layer, GroupedExperts):
         raise TypeError(f"unsupported expert layer type {type(layer).__name__}.")
@@ -367,6 +407,11 @@ def expert_weights(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return expert weights in MegaMoe's packed local layout."""
     if isinstance(layer, MegaMoeExperts):
+        if layer.expert_weight_layout == "EOI":
+            return (
+                layer.gate_up_weight.transpose(1, 2),
+                layer.down_weight.transpose(1, 2),
+            )
         return layer.gate_up_weight, layer.down_weight
     if not isinstance(layer, GroupedExperts):
         raise TypeError(f"unsupported expert layer type {type(layer).__name__}.")
@@ -451,8 +496,8 @@ def assert_results_close(common_result: _RunResult, mega_result: _RunResult) -> 
         assert_close(field_name, mega_tensor, common_tensor)
 
 
-def _run_precision_case() -> None:
-    """Compare routed-expert F+B and optimizer updates with common MoE."""
+def test_mega_moe_level0_balanced() -> None:
+    """Compare EIO/EOI routed-expert F+B and optimizer updates with common MoE."""
     shape = MoeShape()
     hidden_states, grad_output = make_data(shape)
     mega, common_moe = new_layers(shape)
@@ -495,52 +540,29 @@ def _run_precision_case() -> None:
     finally:
         mega.close()
 
-    bounded, bounded_common = new_layers(shape, expert_capacity_factor=1.5)
-    topk_ids, topk_weights, tokens_per_expert = make_balanced_route(shape)
+    # Reuse the bounded-capacity scenario to cover TorchTitan-native EOI storage
+    # in the same process group as the default EIO routing cases.
+    bounded, bounded_common = new_layers(shape, initial_capacity_factor=1.5, expert_weight_layout="EOI")
     try:
-        bounded_common_result = run_layer(
-            bounded_common,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            grad_output,
-        )
-        bounded_result = run_layer(
-            bounded,
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            tokens_per_expert,
-            grad_output,
-        )
-        assert_results_close(bounded_common_result, bounded_result)
-        overflow_ids, overflow_weights, overflow_counts = _make_fixed_route(
-            shape,
-            "single_destination",
-        )
-        try:
-            bounded(
-                hidden_states,
-                overflow_ids,
-                overflow_weights,
-                tokens_per_expert=overflow_counts,
-            )
-        except RuntimeError as error:
-            assert "capacity overflow" in str(error), (
-                f"rank={RANK}: bounded overflow reported the wrong error: {error}."
-            )
-        else:
-            raise AssertionError(
-                f"rank={RANK}: bounded MegaMoe accepted an overflowing route."
-            )
+        for pattern in ("balanced", "zero_token_experts", "skew", "single_destination"):
+            ids, probabilities, counts = _make_fixed_route(shape, pattern)
+            if pattern == "balanced":
+                weights = (bounded.gate_up_weight, bounded.down_weight)
+                output = forward_layer(bounded, hidden_states, ids, probabilities, tokens_per_expert=counts)
+                gradients = torch.autograd.grad(output, weights, grad_output)
+                for weight, gradient in zip(weights, gradients):
+                    assert gradient.stride() == weight.stride(), (
+                        f"rank={RANK}: native gradient stride expected={weight.stride()}, "
+                        f"actual={gradient.stride()}."
+                    )
+            accumulation_steps = 2 if pattern == "balanced" else 1
+            reference = run_layer(bounded_common, hidden_states, ids, probabilities, counts, grad_output,
+                                  accumulation_steps=accumulation_steps)
+            actual = run_layer(bounded, hidden_states, ids, probabilities, counts, grad_output,
+                               accumulation_steps=accumulation_steps)
+            assert_results_close(reference, actual)
     finally:
         bounded.close()
-
-
-def test_mega_moe_level0_balanced() -> None:
-    """Compare routed-expert training results with the reference implementation."""
-    _run_precision_case()
 
 
 def performance_shape() -> MoeShape:
@@ -567,12 +589,11 @@ def _new_performance_layer(
             f"HP_MEGA_MOE_PERF_BACKEND must be common or mega_moe, got {backend!r}."
         )
     return MegaMoeExperts(
-        local_num_tokens=shape.local_num_tokens,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
         num_experts=shape.num_experts,
         top_k=shape.top_k,
-        expert_capacity_factor=1.5,
+        initial_capacity_factor=1.5 if os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push") == "push" else None,
         ep_size=shape.ep_size,
         ep_group=dist.group.WORLD,
     ).to(

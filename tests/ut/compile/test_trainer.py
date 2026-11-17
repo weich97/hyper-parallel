@@ -54,17 +54,17 @@ def _make_model() -> nn.Linear:
     return nn.Linear(4, 4)
 
 
-def _mse_train_fn(model, x, y) -> torch.Tensor:
+def _mse_train_fn(model, *, x, y) -> torch.Tensor:
     """Training function: mean-squared error between prediction and target."""
     return ((model(x) - y) ** 2).mean()
 
 
 def _batches(n=2, dim=2):
-    """Yield ``n`` ``(input, label)`` batches."""
+    """Yield ``n`` model-input dicts (the kwargs ``train_fn`` consumes)."""
     x = torch.randn(dim, 4)
     y = torch.randn(dim, 4)
     for _ in range(n):
-        yield x, y
+        yield {"x": x, "y": y}
 
 
 class TestGraphTrainerCompile(unittest.TestCase):
@@ -86,13 +86,15 @@ class TestGraphTrainerCompile(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        loss, loss_dict = tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsNotNone(
             tr._compiler._joint_graph, "compile should populate the joint graph"
         )
         self.assertIsNotNone(tr.optimizer)
         self.assertIsInstance(loss, torch.Tensor)
+        # A bare-loss ``train_fn`` emits no named loss_dict outputs.
+        self.assertEqual(loss_dict, {})
         # A real forward/backward ran: the model now holds a non-zero grad.
         self.assertIsNotNone(model.weight.grad)
         self.assertGreater(float(model.weight.grad.abs().sum()), 0.0)
@@ -108,8 +110,8 @@ class TestGraphTrainerCompile(unittest.TestCase):
         )
         before = model.weight.detach().clone()  # pylint: disable=not-callable
 
-        tr.compile(torch.randn(2, 4), torch.randn(2, 4))
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
         tr.optimizer_step()
 
         self.assertFalse(
@@ -129,14 +131,14 @@ class TestGraphTrainerCompile(unittest.TestCase):
             optimizer_config={"lr": 1e-3, "grad_clip": 1.0},
             device=torch.device("cpu"),
         )
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         # A very large loss guarantees an un-clipped gradient of norm > 1.
         with torch.no_grad():
             model.weight.mul_(10.0)
         # Reset the graph so the next step recomputes a huge loss.
         tr._compiler._joint_graph = None
-        tr.train_step(torch.randn(2, 4), torch.randn(2, 4))
+        tr.train_step(x=torch.randn(2, 4), y=torch.randn(2, 4))
         grad_norm = float(model.weight.grad.norm())
         self.assertGreater(grad_norm, 1.0)
 
@@ -251,7 +253,7 @@ class TestGraphTrainerHelpers(unittest.TestCase):
         self.assertEqual(tr._compiler.device, torch.device("cpu"))
 
     def test_place_on_device_moves_tensors_only(self):
-        """Test ``_place_on_device`` moves tensors and leaves other objects."""
+        """Test ``_place_on_device`` moves tensors and leaves other values."""
         tr = GraphTrainer(
             model=_make_model(),
             train_fn=_mse_train_fn,
@@ -259,9 +261,9 @@ class TestGraphTrainerHelpers(unittest.TestCase):
             device=torch.device("cpu"),
         )
         t = torch.randn(2, 4)
-        result = tr._place_on_device((t, "not-a-tensor"))
-        self.assertIsInstance(result[0], torch.Tensor)
-        self.assertEqual(result[1], "not-a-tensor")
+        result = tr._place_on_device({"x": t, "y": "not-a-tensor"})
+        self.assertIsInstance(result["x"], torch.Tensor)
+        self.assertEqual(result["y"], "not-a-tensor")
 
 
 if __name__ == "__main__":

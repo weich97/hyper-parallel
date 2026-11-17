@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Verify Torch fully_shard hook state transitions with activation checkpointing."""
+import copy
 import os
 
 os.environ.setdefault("HP_LOG_CONFIG", "FSDP:DEBUG")
@@ -23,7 +24,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel import init_device_mesh
+from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.fully_shard.api import _extend_module_with_hsdp_interface
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
@@ -38,7 +39,23 @@ class _Block(nn.Module):
         self.weight = nn.Parameter(torch.arange(16, dtype=torch.float32).view(4, 4) / 16)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Apply the block's deterministic linear transform and activation."""
         return torch.relu(inputs @ self.weight)
+
+
+class _ConditionalModel(nn.Module):
+    """Keep one FSDP child active only in the first accumulation microbatch."""
+
+    def __init__(self) -> None:
+        """Construct the common and conditionally executed blocks."""
+        super().__init__()
+        self.common = _Block()
+        self.early = _Block()
+
+    def forward(self, inputs: torch.Tensor, use_early: bool) -> torch.Tensor:
+        """Run the common block and, when selected, the early block."""
+        result = self.common(inputs)
+        return result + self.early(inputs) if use_early else result
 
 
 class _TracingHSDPScheduler(HSDPSchedulerV2):
@@ -142,6 +159,116 @@ def _run_scenario(scenario: str, mesh) -> list[tuple[str, str, str]]:
     return scheduler.trace
 
 
+def _accumulation_inputs(rank: int, micro: int, requires_grad: bool) -> torch.Tensor:
+    """Create distinct, deterministic inputs for each rank and microbatch."""
+    return torch.tensor(
+        [[rank + 1.0, micro + 1.0, rank + micro + 1.0, 2.0]],
+        dtype=torch.float32,
+        requires_grad=requires_grad,
+    )
+
+
+def _assert_accumulation_gradients(model: nn.Module, reference: nn.Module, main_grad: bool) -> None:
+    """Compare every reduced gradient shard to an ordinary Torch reference."""
+    expected_params = dict(reference.named_parameters())
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    for name, param in model.named_parameters():
+        grad = getattr(param, "main_grad", None) if main_grad else param.grad
+        assert grad is not None, f"Expected a reduced gradient for {name}, got {grad}"
+        expected = expected_params[name].grad.chunk(world_size, dim=0)[rank]
+        torch.testing.assert_close(grad.to_local(), expected, rtol=0, atol=0)
+
+
+def _assert_backward_boundary(model: nn.Module, expected_callbacks: int) -> None:
+    """Verify per-backward state reset and exactly-once callback execution."""
+    context = model.hsdp_scheduler.scheduler_ctx
+    states = [scheduler.scheduler_state for scheduler in context.all_hsdp_schedulers]
+    assert all(state is None for state in states), f"Expected idle scheduler states, got {states}"
+    assert not context.post_backward_final_callback_queued, (
+        f"Expected no queued root callback, got {context.post_backward_final_callback_queued}"
+    )
+    root_exits = [event for event in model.hsdp_scheduler.trace if event[0] == "root_backward_exit"]
+    assert len(root_exits) == expected_callbacks, (
+        f"Expected {expected_callbacks} root callbacks, got {len(root_exits)}"
+    )
+
+
+def _run_multiple_forward_backward(model: nn.Module, reference: nn.Module, input_grad: bool, main_grad: bool) -> None:
+    """Check separate and combined backwards after multiple forwards."""
+    rank = dist.get_rank()
+    for source_rank in range(dist.get_world_size()):
+        for micro in (3, 4):
+            reference(_accumulation_inputs(source_rank, micro, input_grad), True).sum().backward()
+    losses = [model(_accumulation_inputs(rank, micro, input_grad), True).sum() for micro in (3, 4)]
+    for index, loss in enumerate(losses):
+        model.set_requires_gradient_sync(index == 1)
+        loss.backward()
+        _assert_backward_boundary(model, index + 4)
+    _assert_accumulation_gradients(model, reference, main_grad)
+
+    for source_rank in range(dist.get_world_size()):
+        for micro in (5, 6):
+            reference(_accumulation_inputs(source_rank, micro, input_grad), True).sum().backward()
+    losses = [model(_accumulation_inputs(rank, micro, input_grad), True).sum() for micro in (5, 6)]
+    sum(losses).backward()
+    _assert_backward_boundary(model, 6)
+    _assert_accumulation_gradients(model, reference, main_grad)
+
+
+def _run_nested_accumulation(mesh, comm_fusion: bool, input_grad: bool, main_grad: bool) -> None:
+    """Compare accumulated and child-only gradients with an ordinary Torch model."""
+    reference = _ConditionalModel()
+    model = copy.deepcopy(reference)
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32,
+        reduce_dtype=torch.float32,
+        output_dtype=torch.float32,
+        cast_forward_inputs=False,
+        apply_grad_on_fp32_main_grad=main_grad,
+    )
+    for unit in (model.common, model.early, model):
+        _extend_module_with_hsdp_interface(unit)
+        unit.hsdp_scheduler = _TracingHSDPScheduler(
+            "nested_accumulation", unit, mesh, True, None, policy, OffloadPolicy(),
+            set(), set(), torch.device("cpu"), comm_fusion,
+        )
+    model.set_reduce_op_type("sum")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    for source_rank in range(world_size):
+        for micro in range(2):
+            reference(_accumulation_inputs(source_rank, micro, input_grad), micro == 0).sum().backward()
+
+    with SkipDTensorDispatch():
+        for micro in range(2):
+            model.set_requires_gradient_sync(micro == 1)
+            model(_accumulation_inputs(rank, micro, input_grad), micro == 0).sum().backward()
+            _assert_backward_boundary(model, micro + 1)
+            early_param = model.early.hsdp_scheduler.hsdp_state.hsdp_params[0]
+            if micro == 0:
+                assert early_param.unsharded_accumulated_grad is not None, (
+                    f"Expected no-sync gradient for early, got {early_param.unsharded_accumulated_grad}"
+                )
+
+        _assert_accumulation_gradients(model, reference, main_grad)
+        assert early_param.unsharded_accumulated_grad is None, (
+            f"Expected early's accumulated gradient to be reduced, got {early_param.unsharded_accumulated_grad}"
+        )
+        for source_rank in range(world_size):
+            reference.early(_accumulation_inputs(source_rank, 2, input_grad)).sum().backward()
+        model.early(_accumulation_inputs(rank, 2, input_grad)).sum().backward()
+        _assert_backward_boundary(model, 3)
+        _assert_accumulation_gradients(model, reference, main_grad)
+
+        _run_multiple_forward_backward(model, reference, input_grad, main_grad)
+        for scheduler in model.hsdp_scheduler.scheduler_ctx.all_hsdp_schedulers:
+            for param in scheduler.hsdp_state.hsdp_params:
+                assert param.unsharded_accumulated_grad is None, (
+                    f"Expected no pending gradient for {param}, got {param.unsharded_accumulated_grad}"
+                )
+
+
 def test_torch_fully_shard_hook_state_machine() -> None:
     """Verify normal, non-reentrant, and reentrant hook state transitions with real autograd."""
     init_dist_gloo()
@@ -157,7 +284,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("backward_pre", "FORWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
         "non_reentrant": [
             ("forward_pre", "NONE", "PRE_FORWARD"),
@@ -166,7 +293,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("forward_pre", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
         "reentrant": [
             ("forward_pre", "NONE", "PRE_FORWARD"),
@@ -176,7 +303,7 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             ("backward_pre", "FORWARD", "PRE_BACKWARD"),
             ("root_backward_enter", "PRE_BACKWARD", "PRE_BACKWARD"),
             ("backward", "PRE_BACKWARD", "BACKWARD"),
-            ("root_backward_exit", "PRE_BACKWARD", "BACKWARD"),
+            ("root_backward_exit", "PRE_BACKWARD", "NONE"),
         ],
     }
 
@@ -186,3 +313,8 @@ def test_torch_fully_shard_hook_state_machine() -> None:
             f"Unexpected hook state trace for scenario={scenario}: "
             f"expected={expected_trace}, got={actual_trace}"
         )
+
+    for comm_fusion in (False, True):
+        for input_grad in (False, True):
+            for main_grad in (False, True):
+                _run_nested_accumulation(mesh, comm_fusion, input_grad, main_grad)

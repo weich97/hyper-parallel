@@ -12,28 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Format-specific autograd functions and NPU operator adapters."""
+"""Low-precision strategies, shared autograd flows, and operator adapters."""
 
+from hyper_parallel.components.quantization.functional.base_linear_func import (
+    LinearStrategy,
+    _LinearFunction,
+)
 from hyper_parallel.components.quantization.functional.hifloat8_gmm_func import (
-    hifloat8_grouped_linear,
+    HiFloat8GroupedLinear,
 )
 from hyper_parallel.components.quantization.functional.hifloat8_linear_func import (
-    hifloat8_linear,
+    HiFloat8LinearStrategy,
+)
+from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
+    build_linear_strategy,
 )
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import (
-    npu_quant_grouped_linear,
+    MXFP8GroupedLinear,
 )
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import (
-    mxfp8_linear,
+    MXFP8LinearStrategy,
 )
-from hyper_parallel.components.quantization.functional.npu_hifloat8 import (
+# Compatibility re-exports; NPU operator implementations live in ``quantization.ops``.
+from hyper_parallel.components.quantization.ops.npu_hifloat8 import (
     HiFloat8NpuOps,
     hifloat8_grouped_matmul,
     hifloat8_matmul,
     validate_hifloat8_gmm_runtime,
     validate_hifloat8_runtime,
 )
-from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
+from hyper_parallel.components.quantization.ops.npu_mxfp8 import (
     LowPrecisionCapabilityError,
     MXFP8NpuOps,
     mxfp8_grouped_matmul,
@@ -41,19 +49,56 @@ from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
     validate_npu_gmm_runtime,
     validate_npu_runtime,
 )
+from hyper_parallel.components.quantization.ops.npu_w4a8 import (
+    W4A8CapabilityError,
+    W4A8NpuOps,
+    validate_w4a8_gmm_runtime,
+)
+from hyper_parallel.components.quantization.functional.base_gmm_func import (
+    GroupedLinear,
+    _GroupedLinearFunction,
+)
+from hyper_parallel.components.quantization.functional.strategy_factory import (
+    build_low_precision_strategy,
+)
+from hyper_parallel.components.quantization.functional.w4a8_gmm_func import (
+    W4A8GroupedLinear,
+)
+from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import (
+    FakeW4A8GroupedLinear,
+)
+from hyper_parallel.components.quantization.ops.npu_fake_w4a8 import (
+    FakeW4A8CapabilityError,
+    FakeW4A8NpuOps,
+    validate_fake_w4a8_gmm_runtime,
+)
 
 __all__ = [
     "HiFloat8NpuOps",
+    "HiFloat8GroupedLinear",
+    "HiFloat8LinearStrategy",
     "LowPrecisionCapabilityError",
+    "LinearStrategy",
     "MXFP8NpuOps",
-    "hifloat8_grouped_linear",
+    "MXFP8LinearStrategy",
     "hifloat8_grouped_matmul",
-    "hifloat8_linear",
     "hifloat8_matmul",
     "mxfp8_grouped_matmul",
-    "mxfp8_linear",
     "mxfp8_matmul",
-    "npu_quant_grouped_linear",
+    "MXFP8GroupedLinear",
+    "GroupedLinear",
+    "_LinearFunction",
+    "_GroupedLinearFunction",
+    "W4A8CapabilityError",
+    "W4A8NpuOps",
+    "W4A8GroupedLinear",
+    "FakeW4A8GroupedLinear",
+    "FakeW4A8CapabilityError",
+    "FakeW4A8NpuOps",
+    "build_linear_strategy",
+    "build_low_precision_strategy",
+    "validate_w4a8_gmm_runtime",
+    "validate_fake_w4a8_gmm_runtime",
     "validate_hifloat8_gmm_runtime",
     "validate_hifloat8_runtime",
     "validate_npu_gmm_runtime",

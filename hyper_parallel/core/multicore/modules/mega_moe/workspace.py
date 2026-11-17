@@ -16,20 +16,23 @@
 
 from __future__ import annotations
 
-import os
+import math
 import threading
+import weakref
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
-from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore import _collective, shmem
 from hyper_parallel.core.multicore.scheduler.config import (
     MIN_EVENT_CAPACITY,
     event_workspace_bytes,
     mega_moe_event_capacity,
 )
+from hyper_parallel.core.multicore.shmem import _lifecycle
 
 from .spec import MegaMoeSpec, _resolve_receive_capacity
 
@@ -39,72 +42,60 @@ from .spec import MegaMoeSpec, _resolve_receive_capacity
 _GMM_WORKSPACE_BYTES = 512
 _SWIGLU_GRAD_WORKSPACE_BYTES = 512
 _WORKSPACE_ALIGNMENT = 512
-_HEAP_GRANULARITY_BYTES = 64 * 1024 * 1024
 
 
-def _round_up(value: int, granularity: int) -> int:
-    """Round ``value`` up to a positive ``granularity``."""
-    return (value + granularity - 1) // granularity * granularity
+def _workspace_allocation_specs(
+    *,
+    dispatch_mode: str,
+    routed_slots: int,
+    receive_capacity: int,
+    hidden_size: int,
+    ep_size: int,
+    num_experts: int,
+    dtype: torch.dtype,
+) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
+    """Return the single ordered physical Allocation description for a workspace."""
+    data_field = "source_buffer" if dispatch_mode == "pull" else "expert_buffer"
+    data_rows = routed_slots if dispatch_mode == "pull" else receive_capacity
+    event_bytes = event_workspace_bytes(ep_size, num_experts)
+    allocation_spec = _lifecycle._AllocationSpec  # pylint: disable=protected-access
+    return (
+        (data_field, allocation_spec((data_rows, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
+        ("routed_buffer", allocation_spec((routed_slots, hidden_size), dtype, _WORKSPACE_ALIGNMENT)),
+        ("forward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
+        ("backward_event_counters", allocation_spec((event_bytes,), torch.uint8, _WORKSPACE_ALIGNMENT)),
+    )
 
 
-def _spec_workspace_bytes(specification: Mapping[str, Any], element_size: int) -> int:
+def _spec_workspace_bytes(
+    specification: Mapping[str, Any], dtype: torch.dtype, *, receive_capacity: int | None = None,
+) -> int:
     """Return planned symmetric bytes for one execution-resource group."""
     local_tokens = specification["local_num_tokens"]
     routed_slots = local_tokens * specification["top_k"]
     capacity = _resolve_receive_capacity(
-        specification["expert_capacity_factor"],
+        specification["initial_capacity_factor"],
         routed_slots,
         specification["ep_size"],
     )
-    tensor_bytes = (
-        (capacity + routed_slots) * specification["hidden_size"] * element_size
+    if receive_capacity is not None:
+        capacity = receive_capacity
+    if specification.get("dispatch_mode", "push") == "pull":
+        capacity = routed_slots
+    allocations = _workspace_allocation_specs(
+        dispatch_mode=specification.get("dispatch_mode", "push"),
+        routed_slots=routed_slots,
+        receive_capacity=capacity,
+        hidden_size=specification["hidden_size"],
+        ep_size=specification["ep_size"],
+        num_experts=specification["num_experts"],
+        dtype=dtype,
     )
-    event_bytes = event_workspace_bytes(specification["ep_size"], specification["num_experts"])
-    return tensor_bytes + 2 * event_bytes + 4 * (_WORKSPACE_ALIGNMENT - 1)
-
-
-def configure_symmetric_heap(
-    active_specifications: tuple[Any, ...],
-    tensor: torch.Tensor,
-) -> int:
-    """Size the fixed SHMEM heap once for all active resource groups.
-
-    Args:
-        active_specifications: Specifications for every live compatible resource group.
-        tensor: First input tensor used to determine element size.
-
-    Returns:
-        Configured symmetric heap size in bytes.
-
-    Raises:
-        ValueError: If the configured heap size is invalid.
-        RuntimeError: If an explicit heap is smaller than the required workspace.
-    """
-    required_bytes = sum(
-        _spec_workspace_bytes(specification, tensor.element_size()) for specification in active_specifications
+    return sum(
+        spec.dtype.itemsize * math.prod(spec.shape)
+        + spec.alignment_bytes - 1
+        for _, spec in allocations
     )
-    required_bytes = _round_up(required_bytes, _HEAP_GRANULARITY_BYTES)
-    configured = os.getenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE")
-    if configured is None:
-        os.environ["HYPER_PARALLEL_SHMEM_HEAP_SIZE"] = str(required_bytes)
-        return required_bytes
-    try:
-        configured_bytes = int(configured)
-    except ValueError as error:
-        raise ValueError(
-            "HYPER_PARALLEL_SHMEM_HEAP_SIZE must be a positive integer number of bytes, "
-            f"got {configured!r}."
-        ) from error
-    if configured_bytes <= 0:
-        raise ValueError(
-            f"HYPER_PARALLEL_SHMEM_HEAP_SIZE must be positive, got {configured_bytes}."
-        )
-    if configured_bytes < required_bytes:
-        raise RuntimeError(
-            "HYPER_PARALLEL_SHMEM_HEAP_SIZE is too small for active MegaMoe resources: "
-            f"configured {configured_bytes} bytes, requires at least {required_bytes} bytes."
-        )
-    return configured_bytes
 
 
 @dataclass
@@ -116,6 +107,8 @@ class MegaMoeWorkspace:
     device: Any | None = None
     expert_capacity: int = 0
     routed_slots: int = 0
+    dispatch_mode: str = "push"
+    source_buffer: Any | None = None
     expert_buffer: Any | None = None
     routed_buffer: Any | None = None
     forward_event_counters: Any | None = None
@@ -124,11 +117,149 @@ class MegaMoeWorkspace:
     swiglu_grad_workspace: Any | None = None
     completion_event: Any | None = None
     in_use: bool = False
+    closing: bool = False
     used: bool = False
     event_counter_bytes: int = MIN_EVENT_CAPACITY * 4
     forward_ready_initialized: bool = False
     backward_ready_initialized: bool = False
+    capacity_floor: int = 0
+    heap_manager: Any | None = field(default=None, repr=False)
+    route_cache: Any | None = field(default=None, repr=False)
+    route_header_cache: Any | None = field(default=None, repr=False)
+    route_cache_probe_after: int = field(default=0, repr=False)
     lock: Any = field(default_factory=threading.Lock, repr=False)
+    graphs: Any = field(default_factory=weakref.WeakSet, repr=False)
+
+    def describe_restart_allocations(
+        self,
+        spec: MegaMoeSpec,
+        dtype: torch.dtype,
+        receive_capacity: int,
+    ) -> tuple[_lifecycle._AllocationReplacement, ...]:  # pylint: disable=protected-access
+        """Project materialized symmetric fields into ordered restart replacements."""
+        if self.completion_event is None:
+            return ()
+        targets = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=receive_capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            dtype=dtype,
+        )
+        replacement = _lifecycle._AllocationReplacement  # pylint: disable=protected-access
+        return tuple(replacement(getattr(self, field_name), target) for field_name, target in targets)
+
+    def validate_restart_allocations(
+        self,
+        spec: MegaMoeSpec,
+        dtype: torch.dtype,
+        current_capacity: int,
+        replacements: tuple[_lifecycle._AllocationReplacement, ...],  # pylint: disable=protected-access
+    ) -> bool:
+        """Validate the read-only workspace state captured for restart preflight."""
+        if self.in_use:
+            raise RuntimeError("active workspace lease prevents heap growth")
+        if self.closing:
+            raise RuntimeError("closing workspace prevents heap growth")
+        materialized = self.completion_event is not None
+        if not materialized:
+            if replacements:
+                raise RuntimeError("lazy workspace must not describe restart Allocations")
+            return False
+        expected = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=current_capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            dtype=dtype,
+        )
+        if len(replacements) != len(expected):
+            raise RuntimeError("materialized workspace has an incomplete restart Allocation mapping")
+        for (field_name, current_spec), replacement in zip(expected, replacements):
+            tensor = getattr(self, field_name)
+            if replacement.current is not tensor or tensor is None:
+                raise RuntimeError("workspace restart Allocation mapping changed during preflight")
+            if tuple(tensor.shape) != current_spec.shape or tensor.dtype != current_spec.dtype:
+                raise RuntimeError("workspace symmetric Allocation does not match its committed layout")
+        return True
+
+    def bind_restarted_allocations(
+        self,
+        spec: MegaMoeSpec,
+        dtype: torch.dtype,
+        device: Any,
+        receive_capacity: int,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Bind validated replacement Tensors without allocating or running collectives."""
+        targets = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=receive_capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            dtype=dtype,
+        )
+        self.source_buffer = None
+        self.expert_buffer = None
+        for tensor, (field_name, _) in zip(tensors, targets):
+            setattr(self, field_name, tensor)
+        self.dispatch_mode = spec.dispatch_mode
+        self.dtype = dtype
+        self.device = device
+        self.expert_capacity = receive_capacity
+        self.routed_slots = spec.routed_slots
+        self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
+        self.forward_ready_initialized = False
+        self.backward_ready_initialized = False
+
+    def validate_restarted_allocations(
+        self,
+        spec: MegaMoeSpec,
+        dtype: torch.dtype,
+        receive_capacity: int,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Validate a complete replacement slice without modifying workspace state."""
+        targets = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=receive_capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            dtype=dtype,
+        )
+        if len(tensors) != len(targets):
+            raise RuntimeError("SHMEM restart returned an unexpected Allocation count")
+        for tensor, (_, target) in zip(tensors, targets):
+            if tuple(tensor.shape) != target.shape or tensor.dtype != target.dtype:
+                raise RuntimeError("SHMEM restart returned an unexpected Allocation specification")
+
+    def track_graph(self, context: Any) -> None:
+        """Retain a weak lease while this context can still run backward.
+
+        Args:
+            context: Autograd context that may still access workspace buffers.
+        """
+        self.graphs.add(context)
+
+    def can_close(self) -> bool:
+        """Check active calls and weak graph leases without unpacking saved tensors."""
+        return not self.in_use and not self.graphs
+
+    def release_graph(self, context: Any) -> None:
+        """Retire this context's lease after successful non-retained backward.
+
+        Args:
+            context: Autograd context whose final backward completed.
+        """
+        self.graphs.discard(context)
 
     def ensure(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
         """Allocate the fixed configured route capacity once.
@@ -138,10 +269,22 @@ class MegaMoeWorkspace:
             dtype: Element dtype for symmetric data buffers.
             device: Device that owns local and symmetric buffers.
         """
-        requested_capacity = spec.receive_capacity
-        if self.expert_buffer is not None:
+        with self._access():
+            self._ensure_buffers(spec, dtype, device)
+
+    def _access(self) -> Any:
+        """Exclude submissions during a root Runtime restart."""
+        return self.heap_manager.access() if self.heap_manager is not None else nullcontext()
+
+    def _ensure_buffers(self, spec: MegaMoeSpec, dtype: Any, device: Any) -> None:
+        """Allocate this workspace at its current monotonic capacity."""
+        if self.closing:
+            raise RuntimeError("cannot allocate a closing MegaMoe workspace.")
+        requested_capacity = max(spec.receive_capacity, self.capacity_floor)
+        if self.expert_buffer is not None or self.source_buffer is not None:
             compatible = (
-                self.dtype == dtype
+                self.dispatch_mode == spec.dispatch_mode
+                and self.dtype == dtype
                 and self.device == device
                 and self.routed_slots == spec.routed_slots
                 and self.expert_capacity == requested_capacity
@@ -150,33 +293,28 @@ class MegaMoeWorkspace:
                 raise ValueError("MegaMoe workspace cannot change device, dtype, routed shape, or capacity.")
             return
 
+        allocations = _workspace_allocation_specs(
+            dispatch_mode=spec.dispatch_mode,
+            routed_slots=spec.routed_slots,
+            receive_capacity=requested_capacity,
+            hidden_size=spec.hidden_size,
+            ep_size=spec.ep_size,
+            num_experts=spec.num_experts,
+            dtype=dtype,
+        )
+        self.dispatch_mode = spec.dispatch_mode
         self.dtype = dtype
         self.device = device
         self.expert_capacity = requested_capacity
         self.routed_slots = spec.routed_slots
         self.event_counter_bytes = mega_moe_event_capacity(spec.num_experts, spec.ep_size) * 4
-        event_bytes = event_workspace_bytes(spec.ep_size, spec.num_experts)
         try:
-            self.expert_buffer = shmem.empty(
-                (requested_capacity, spec.hidden_size),
-                dtype=dtype,
-                alignment=_WORKSPACE_ALIGNMENT,
-            )
-            self.routed_buffer = shmem.empty(
-                (spec.routed_slots, spec.hidden_size),
-                dtype=dtype,
-                alignment=_WORKSPACE_ALIGNMENT,
-            )
-            self.forward_event_counters = shmem.empty(
-                (event_bytes,),
-                dtype=torch.uint8,
-                alignment=_WORKSPACE_ALIGNMENT,
-            )
-            self.backward_event_counters = shmem.empty(
-                (event_bytes,),
-                dtype=torch.uint8,
-                alignment=_WORKSPACE_ALIGNMENT,
-            )
+            for field_name, allocation in allocations:
+                setattr(self, field_name, shmem.empty(
+                    allocation.shape,
+                    dtype=allocation.dtype,
+                    alignment=allocation.alignment_bytes,
+                ))
             self.gmm_workspace = torch.empty(
                 (_GMM_WORKSPACE_BYTES,),
                 dtype=torch.uint8,
@@ -220,13 +358,15 @@ class MegaMoeWorkspace:
 
     def wait_for_reuse(self) -> None:
         """Order count exchange after the previous workspace lease."""
-        with self.lock:
+        with self._access(), self.lock:
             if self.used:
                 torch.npu.current_stream(self.device).wait_event(self.completion_event)
 
     def claim(self) -> None:
         """Claim the serial workspace and order it after the previous stream."""
-        with self.lock:
+        with self._access(), self.lock:
+            if self.closing:
+                raise RuntimeError("cannot claim a closing MegaMoe workspace.")
             if self.in_use:
                 raise RuntimeError("MegaMoe execution resources do not support concurrent calls.")
             if self.used:
@@ -235,7 +375,7 @@ class MegaMoeWorkspace:
 
     def release(self) -> None:
         """Record completion ordering and release the serial workspace lease."""
-        with self.lock:
+        with self._access(), self.lock:
             if not self.in_use:
                 raise RuntimeError("MegaMoe workspace was released without an active lease.")
             self.completion_event.record(torch.npu.current_stream())
@@ -244,7 +384,19 @@ class MegaMoeWorkspace:
 
     def _free_symmetric_tensors(self) -> None:
         """Free each unique SHMEM allocation and invalidate its tensor view."""
+        if self.closing:
+            remaining = tuple(tensor is not None for tensor in (
+                self.source_buffer, self.expert_buffer, self.routed_buffer,
+                self.forward_event_counters, self.backward_event_counters))
+            peers = _collective.exchange(
+                remaining,
+                group=self._root_group(),
+                failure_prefix="MegaMoe symmetric workspace release failed while converging rank results",
+            )
+            if any(peer != remaining for peer in peers):
+                raise RuntimeError("partial symmetric teardown differs across ranks; restart the process")
         for field_name in (
+            "source_buffer",
             "expert_buffer",
             "routed_buffer",
             "forward_event_counters",
@@ -269,21 +421,62 @@ class MegaMoeWorkspace:
             tensor.untyped_storage().resize_(0)
             setattr(self, field_name, None)
 
+    def _root_group(self) -> Any:
+        """Require an owning manager for collective teardown without a default-group fallback."""
+        if self.heap_manager is None:
+            raise RuntimeError("MegaMoe workspace collective teardown requires an owning HeapManager")
+        return self.heap_manager.root_group
+
     def close(self) -> None:
-        """Synchronize, release all buffers, and reset the workspace."""
-        with self.lock:
+        """Synchronize and release physical buffers on the owning HeapManager's Root."""
+        with self._access(), self.lock:
             if self.in_use:
                 raise RuntimeError("cannot close MegaMoe workspace during an active call.")
-            if self.expert_buffer is None and self.gmm_workspace is None:
-                return
-        torch.npu.synchronize(self.device)
+            if not self.can_close():
+                raise RuntimeError("cannot close MegaMoe workspace while backward graphs still need its buffers.")
+            empty = all(tensor is None for tensor in (
+                self.source_buffer,
+                self.expert_buffer,
+                self.routed_buffer,
+                self.forward_event_counters,
+                self.backward_event_counters,
+                self.gmm_workspace,
+                self.swiglu_grad_workspace,
+                self.completion_event,
+            ))
+            root_group = self._root_group()
+            self.closing = True
+            self.route_cache = None
+            self.route_header_cache = None
+            self.route_cache_probe_after = 0
+        # An empty rank must still participate when peers retain buffers after a failure.
+        peers = _collective.exchange(
+            empty, group=root_group, failure_prefix="MegaMoe workspace close failed while converging rank results",
+        )
+        if all(peers):
+            self.closing = True
+            return
+        _collective.collective_call(
+            lambda: None if empty else torch.npu.synchronize(self.device),
+            stage="MegaMoe workspace synchronization",
+            group=root_group,
+        )
         # Workspace teardown requires each collective barrier to complete before
         # the following free or local Tensor release.
         shmem.host_barrier()
-        self._free_symmetric_tensors()
+        _collective.collective_call(
+            self._free_symmetric_tensors,
+            stage="MegaMoe symmetric workspace release",
+            group=root_group,
+        )
         shmem.host_barrier()
-        self._free_local_tensors()
+        _collective.collective_call(
+            self._free_local_tensors,
+            stage="MegaMoe local workspace release",
+            group=root_group,
+        )
         self.dtype = None
         self.device = None
         self.completion_event = None
         self.used = False
+        self.closing = True

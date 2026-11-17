@@ -46,9 +46,6 @@ from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables impor
     get_w1_grad_tiling_bytes,
     get_w2_grad_tiling_bytes,
 )
-from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
-    _configure_mega_moe_profile_metadata,
-)
 from hyper_parallel.core.multicore.scheduler.builder import allocate_graph_config
 from hyper_parallel.core.multicore.scheduler.config import (
     RuntimeConfigC,
@@ -106,6 +103,9 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
         tsv: Task split values for the target topology.
         rank_id: Rank-local identifier.
         num_cube_cores: Available cube-core count.
+
+    Returns:
+        Validated runtime image including transport handshakes and profiler metadata.
     """
     cfg = allocate_graph_config(graph, tsv)
     cfg.num_workers    = 2 * num_cube_cores   # NUM_WORKERS_VECTOR = 2 × NUM_WORKERS_CUBE
@@ -131,7 +131,7 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     add_terminate(cfg, tsv,
                   w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
-    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num)
+    revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num, combine_op.task_num)
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
     add_dynamic_data(cfg, tsv, dynamic_input_position=19)
 
@@ -139,13 +139,6 @@ def build_config_for_rank(graph: ComputeGraph, tsv: TaskSplitValue, rank_id: int
     cfg.atomic_add_values[0] = 1
     configure_ready_handshake(cfg, tsv)
     validate_runtime_config(cfg, tsv, num_cube_cores)
-    _configure_mega_moe_profile_metadata(
-        cfg,
-        graph,
-        tsv,
-        num_cube_cores=num_cube_cores,
-        is_backward=True,
-    )
     return cfg
 
 

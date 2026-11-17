@@ -14,6 +14,8 @@
 # ============================================================================
 """Per-step structured terminal logging callback."""
 
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -65,18 +67,36 @@ class LoggingCallback(Callback):
             return
         logger.info("%s", message)
 
-    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:
+    def on_step_end(
+        self,
+        state: TrainerState,
+        loss: float,
+        loss_dict: dict[str, float],
+        grad_norm: float,
+        **kwargs: Any,
+    ) -> None:
         """Log all shared environment metrics at the configured cadence."""
-        del kwargs
-        if (
-            self.logging_steps <= 0
-            or getattr(self.trainer, "global_rank", 0) != 0
-            or state.global_step % self.logging_steps != 0
-            or self._last_logged_step == state.global_step
-        ):
+        del loss, grad_norm, kwargs
+        if self.logging_steps <= 0:
+            return
+        if getattr(self.trainer, "global_rank", 0) != 0:
+            return
+        if state.global_step % self.logging_steps != 0:
+            return
+        if self._last_logged_step == state.global_step:
             return
 
-        metrics = getattr(self.trainer, "step_env_metrics", {})
+        metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
+        if "training/router_aux_loss" not in metrics:
+            # Without the meter, callers supply their own step aggregation.
+            # The logger does not normalize local values across micro-batches or ranks.
+            aux_loss = loss_dict.get("router_aux_loss") if loss_dict is not None else None
+            if aux_loss is None:
+                moe_monitor = getattr(self.trainer, "moe_monitor", None)
+                if moe_monitor is not None:
+                    aux_loss = moe_monitor.last_mean_aux_loss
+            if aux_loss is not None:
+                metrics["training/router_aux_loss"] = float(aux_loss)
         if not metrics:
             return
         self._write(self._format_message(state, metrics))

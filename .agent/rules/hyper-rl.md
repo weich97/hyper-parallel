@@ -14,74 +14,71 @@ paths:
 
 # Hyper-RL
 
-Start here for RL code, tests, docs, and agent rules. Use the [module map](rl/module-map.md) to locate ownership,
-[architecture](../../docs/rl-architecture.md) for project boundaries, and
-[feature navigation](../../docs/rl-navigation.md) for configuration, implementation, metrics, and representative tests.
-Load the affected product contract rather than every RL document.
+Start here for RL-owned code, tests and docs. Use the [module map](rl/module-map.md) for ownership,
+[architecture](../../docs/rl-architecture.md) for boundaries, and
+[feature navigation](../../docs/rl-navigation.md) for configuration, implementation and test traces.
+Read the affected product contract rather than every RL document.
 
-## Scope and runtime
+## Runtime and ownership
 
-- Run commands from the repository root. `hyper_parallel/rl/` is the source root imported as `rl.*`.
-  Follow the [runtime installation guide](../../hyper_parallel/rl/docker/README.md) for dependencies
-  and vLLM plugin registration; the root package installation alone is not a complete RL runtime.
-- RL and `hyper_parallel/models/qwen3/` use native Torch APIs. Do not introduce Platform dispatch or `get_platform()`.
-  Qwen3 adapters belong in `models/qwen3/`; main-project callers use the shared AutoModel builder.
-  RL construction compatibility belongs in `hyper_parallel/rl/rl/roles/qwen3_builder.py`; value heads and Critic behavior
-  belong in `hyper_parallel/rl/rl/roles/policy/critic.py`.
-- The built-in algorithms are GRPO and PPO. Model registration accepts Qwen3 dense; training supports FSDP sharding
-  with TP1/TP2 and `dp_replicate=cp=pp=ep=1`. Rollout uses shared vLLM in colocated or disjoint mode.
-  Check `rl/config.py` and `rl/roles/model_setup.py` for the executable boundary; do not infer RL support from a main-project API.
-- Weight synchronization selects `full_gather` or `direct_reshard`, with IPC for colocated and HCCL for disjoint.
-  Publication errors propagate; there is no automatic fallback. Preserve this contract when fixing failures.
-- Shared HyperParallel modules retain their own rules. For Qwen3 integration, also follow applicable model and
-  distributed rules; do not apply RL policy to unrelated code or change shared contracts without examining other callers.
+- Run from the repository root. `hyper_parallel/rl/` is imported as `rl.*`; follow the
+  [runtime installation guide](../../hyper_parallel/rl/docker/README.md). Installing the main project alone is insufficient.
+- Use native Torch APIs. Do not reintroduce Platform dispatch or `get_platform()`.
+  Shared HyperParallel modules retain their own model, distributed and coding rules.
+- Shared model loading belongs in `hyper_parallel/models/`; RL Qwen3 construction compatibility belongs in
+  `rl/workers/adapters/qwen3.py`, Critic/value-head integration in `rl/workers/critic.py`, and
+  RL-only probability/recomputation adapters in `rl/workers/adapters/token_log_probs.py` and `log_probs.py`.
+- `SyncTrainer` owns synchronous execution; `rl/async_runtime/` owns the independent rayless loop.
+  Both reuse the role runtime and publication machinery. CPU preparation overlap is still synchronous RL.
+- Supported model/algorithm/topology combinations are checked by `rl/config/validate.py` and `rl/workers/engine/model.py`.
+  Consult [support boundaries](../../hyper_parallel/rl/README.md#支持范围),
+  [MoE contracts](../../hyper_parallel/rl/docs/moe_code_agent.md#功能与支持边界), and
+  [Qwen3.5-family recipes](../../hyper_parallel/rl/examples/swe_smith/README.md#模型配方).
+  Main-project capability, successful config parsing and real-device acceptance are different evidence.
+- Task prompts, workspace contents and scoring stay in `examples/`. Shared Agent code handles contracts and execution,
+  not task-name-specific reward branches. DeepSeek Harness is a program integration, not a supported model claim.
+- Detailed experiment results, historical baselines and one-off analysis tools stay outside tracked source.
+  Examples retain runnable recipes and concise result boundaries; tracked launchers/tests must not depend on `output/`.
 
-## Readability
+## Contracts to preserve
 
-Human readability comes first; agent traceability is the minimum gate.
+- Preserve actual sampled tokens, masks, call/episode identity and policy versions. External Codex/DeepSeek programs
+  train each call under its actual prompt with episode-level GRPO; segmented PPO is rejected.
+  DP padding has zero loss and is excluded from episode statistics. Legacy continuous trajectories require exact prefixes.
+- Keep sampling probabilities separate from Actor-recomputed anchors. Follow the configured `old_log_prob_source`;
+  missing sampling probabilities must not be presented as a zero discrepancy. See the
+  [training contract](../../hyper_parallel/rl/docs/architecture.md#一个训练步).
+- Publication supports explicit `full_gather` and IPC/HCCL according to deployment.
+  Errors propagate without fallback. Asynchronous admission, lag, group consumption and recovery follow the
+  [async contract](../../hyper_parallel/rl/docs/architecture.md#rayless-asynchronous-grpo), not synchronous version assumptions.
+- In synchronous Agent execution, infrastructure/unknown failures reject the update; verified model failures may
+  remain trainable. Do not infer budget exhaustion from an unexplained CLI exit. Preserve parser evidence and shutdown
+  behavior described in the [Agent contract](../../hyper_parallel/rl/docs/agentic_rl.md).
+- Private code tests and dataset labels remain outside agent-visible workspaces. Only the TP request owner executes
+  internal environments. Repository tasks retain authenticated session relays, isolated candidate/grader workspaces
+  and independent frozen-artifact grading. See [code](../../hyper_parallel/rl/examples/code/README.md) and
+  [repository tasks](../../hyper_parallel/rl/examples/swe_smith/README.md).
+- Optional Reward Model scoring keeps task scorers in examples; `rl/reward_model/` owns the frozen service.
+  Rollout sleeps before RM wake; RM sleeps before training/publication. See the
+  [RM contract](../../hyper_parallel/rl/docs/reward_model.md). Distillation has its own
+  [teacher contract](../../hyper_parallel/rl/examples/distillation/README.md).
 
-- Treat hard-to-follow code as a bug; simplify only when readability improves without changing required behavior.
-- Add an abstraction only when it reduces reading cost or defines a real contract.
-- Do not add configuration, abstractions, or compatibility branches for hypothetical requirements.
-- Keep each fact in one authoritative place.
-- Preserve features, defaults, performance knobs, and observability.
-- Scope bug fixes to supported recipes and public extension contracts; do not expand a change for hypothetical problems
-  in unsupported scenarios.
+## Editing and validation
 
-## Flow
-
-Documentation is event-driven. Update this file when working policy changes, [module-map.md](rl/module-map.md) when
-ownership or paths change, [rl-architecture.md](../../docs/rl-architecture.md) when module boundaries change, and
-[rl-navigation.md](../../docs/rl-navigation.md) when configuration, entry points, branches, data, metrics, or representative
-tests change. Update the existing product document when its public contract, supported runtime behavior, operating
-procedure, or cross-project boundary changes. Internal refactoring that leaves those facts unchanged needs no docs edit.
-
-Create a new document only for a stable contract or operating procedure with its own scope and maintenance lifecycle
-that does not fit an existing source of truth. Link it from the module map. Do not create docs for one-off implementation
-plans, temporary validation results, or facts already owned elsewhere.
-
-1. **Scope.** Define affected behavior and contracts; update the corresponding navigation rows, using `—` where a field
-   does not apply. Treat required shared-project changes under their own module rules.
-2. **Design.** For changes to feature scope, component boundaries, abstractions, or backends, consult
-   [design goals and principles](../../hyper_parallel/rl/docs/design.md). Before changing code, present the approach,
-   affected interfaces and edge cases, touched files, and test method. Wait for approval once.
-3. **Implement.** Complete the scoped change and necessary tests. Keep the diff focused; avoid unrelated refactoring.
-4. **Finish.** Apply the validation below and report changed files, results, and checks not run. Keep one commit per PR
-   as required by [AGENTS.md](../../AGENTS.md); amend subsequent fixes without including unrelated local changes.
-
-## Validation and test ownership
-
-- UT lives in `tests/ut/rl/`; NPU ST and its launch helpers live in `hyper_parallel/rl/tests/st/`.
-  Shared recipe data and configuration construction live in `tests/common/rl_st_cases.py` so UT can run without the ST
-  archive. Do not introduce a UT dependency on the standalone ST directory. The UT conftest also collects `agentic_ut.py`.
-- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch,
-  MindSpore, or HyperParallel during collection. Use the [UT guide](../../hyper_parallel/rl/docs/hyper_rl_ut.md) and
-  [ST guide](../../hyper_parallel/rl/README.md#系统测试) for execution commands and resources.
-- For docs and agent rules, run `python3 .agent/scripts/check_agents_catalog.py`, Markdown lint, and checks for changed
-  relative links and referenced paths. The catalog script only compares Skills/Agents tables against disk; it does not
-  validate navigation symbols, config keys, metrics, or test semantics. Check those against code and tests separately.
-- For code, run affected tests from the repository root. Broaden regression coverage for shared contracts, core flows,
-  or uncertain impact; a full `tests/ut/rl/` run is not mandatory for every local edit.
-- Run the applicable real-NPU acceptance when the changed product contract requires it. RL ST is retained under the RL subproject and temporarily excluded from the main-project PR gate.
-  It requires explicit invocation and resources; default PR CI success or mocked UT does not prove every RL recipe passed. Report missing
-  hardware or resources as not run, and preserve learning, policy-version, and consistency assertions.
+- Keep each fact in one authoritative document. Prefer readable, focused changes; preserve features and observability.
+  Add abstractions only for an existing contract or real reuse, not hypothetical extensions.
+- Update this rule for policy changes, the module map for ownership, architecture for boundaries, navigation for
+  config/code/test traces, and product docs for public behavior. Internal refactoring does not require narrative history.
+  Create a document only when a stable contract cannot fit an existing owner.
+- For feature or boundary changes, consult [design goals](../../hyper_parallel/rl/docs/design.md), describe the approach,
+  interfaces, edge cases, affected files and validation, and obtain approval once before implementing.
+- UT belongs in `tests/ut/rl/`; ST in `hyper_parallel/rl/tests/st/`; shared recipes in `tests/common/rl_st_cases.py`.
+  UT must not depend on the standalone ST directory. `conftest.py` also collects `agentic_ut.py`.
+  Follow [testing](testing.md), [UT rules](unit-test.md) and the [UT guide](../skills/add-unit-test/SKILL.md).
+  ST launchers must not import Torch/HyperParallel during collection.
+- Run affected tests and report failures or unrun checks. Broaden coverage for shared contracts or unresolved concerns;
+  a full RL UT run is not required for every edit. NPU ST requires explicit invocation and resources and is outside
+  the main-project PR gate; mocked/CPU checks do not prove communication, numerical parity or learning.
+- For Markdown changes, run `python3 .agent/scripts/check_agents_catalog.py`, Markdown lint and link/path checks.
+  The catalog checker validates Skills/Agents lists only; separately verify referenced symbols and configuration semantics.
+- Keep one commit per PR under [AGENTS.md](../../AGENTS.md), back up before rewriting history, and exclude unrelated changes.

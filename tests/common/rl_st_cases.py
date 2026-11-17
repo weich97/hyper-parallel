@@ -35,7 +35,6 @@ class Case:
     runner: str = "internal"
     disjoint: bool = False
     resume: bool = False
-    exact: bool = False
     algorithm: str = "grpo"
 
     @property
@@ -50,12 +49,18 @@ class Case:
 
 
 CASES = (
-    Case("dense-tp2-consistency-full", tp=2, exact=True),
-    Case("dense-tp2-direct", tp=2, strategy="direct_reshard"),
+    Case("dense-tp2-native-full", tp=2),
+    Case("dense-tp2-native-diverse", tp=2, strategy="full_gather"),
     Case("checkpoint-resume", resume=True),
     Case("codex-agent", runner="codex"),
     Case("deepseek-agent", runner="deepseek"),
     Case("ppo-tp1-full", algorithm="ppo"),
+    Case("gspo-tp1-full", algorithm="gspo"),
+    Case("gspo-tp2-native-full", algorithm="gspo", tp=2),
+    Case("gspo-checkpoint-resume", algorithm="gspo", resume=True),
+    Case("reward-model-tp1", algorithm="gspo"),
+    Case("reward-model-tp2", algorithm="gspo", tp=2),
+    Case("reward-model-resume", algorithm="gspo", resume=True),
 )
 
 AGENT_INSTRUCTIONS = {
@@ -80,30 +85,38 @@ Problem: {prompt}""",
 
 
 def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list[int]) -> dict:
-    """Derive a bounded ST workload from the shipped production YAML."""
-    if case.runner != "internal":
+    """Derive a bounded ST workload from the shipped base recipe."""
+    if case.runner == "codex":
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml"
+    elif case.runner != "internal":
         recipe = EXAMPLES / f"gsm8k/configs/{case.runner}_multi_turn.yaml"
     elif case.algorithm == "ppo":
         recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml"
+    elif case.name.startswith("reward-model-"):
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml"
+    elif case.algorithm == "gspo":
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_gspo.yaml"
     else:
-        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml"
+        recipe = EXAMPLES / "gsm8k/configs/qwen3_4b_gsm8k_base.yaml"
     config = yaml.safe_load(recipe.read_text())
     config["model"].update(weights_path="/model", tokenizer_path="/model")
-    config["consistency"]["enabled"] = case.exact
     config["data"].update(train_path="/data/train.parquet", test_path="/data/test.parquet",
                           max_train_samples=8, shuffle=False, num_workers=0)
     # Dense Qwen3 needs room to finish reasoning before the answer is scored.
     generation_budget = 512 if case.runner == "internal" else 256
     config["rollout"].update(num_return_sequences=4, max_new_tokens=generation_budget, seed=20260908)
-    if case.name == "dense-tp2-direct":
+    if case.name == "dense-tp2-native-diverse":
         # More diverse responses make a non-zero GRPO update observable.
         config["rollout"].update(num_return_sequences=8, temperature=1.1)
     vllm = config["rollout"]["vllm"]
     vllm.update(deployment="disjoint" if case.disjoint else "colocated",
                 data_parallel_size=2, tensor_parallel_size=case.tp, port=ports[0],
-                model_implementation="native" if case.runner != "internal" else "hyper",
-                enforce_eager=True, batch_invariant=case.exact,
+                model_implementation="native",
+                enforce_eager=True, batch_invariant=False,
                 max_num_seqs=4)
+    if case.runner == "codex":
+        # Keep the small ST reservation independent of the full-run KV allocation.
+        vllm.update(gpu_memory_utilization=0.35, kv_cache_memory_bytes=8589934592)
     vllm["weight_sync"].update(strategy=case.strategy, bucket_size_mb=128)
     if case.disjoint:
         vllm["visible_devices"] = ",".join(map(str, devices[case.world:]))
@@ -113,6 +126,8 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
                  response_mini_batch_size=8)
     if case.algorithm == "ppo" and case.resume and phase == 2:
         train["max_steps"] = 3
+    if case.name == "reward-model-resume":
+        train["max_steps"] = 2 if phase == 1 else 4
     train["accelerator"].update(dp_replicate=1, dp_shard=2, tp=case.tp,
                                  ep=1,
                                  cpu_offload=True, activation_checkpoint="full")
@@ -121,12 +136,20 @@ def prepare_config(case: Case, phase: int, ports: tuple[int, int], devices: list
     train["learning_gate"]["enabled"] = False
     # Production evaluation is scheduled at checkpoint boundaries.
     train["checkpoint"].update(output_dir="/results/checkpoints", save_steps=0,
-                                save_final=case.resume or case.name == "dense-tp1-full", verify_reload=False,
-                                load_path="/results/checkpoints/step_1" if phase == 2 else None)
-    config["evaluation"].update(enabled=case.name == "dense-tp1-full",
+                                save_final=case.resume or case.name == "dense-tp1-full"
+                                or case.name.startswith("reward-model-"), verify_reload=False,
+                                load_path=("/results/checkpoints/step_2" if case.name == "reward-model-resume"
+                                           else "/results/checkpoints/step_1") if phase == 2 else None)
+    config["evaluation"].update(enabled=case.name == "dense-tp1-full"
+                                 or case.name.startswith("reward-model-"),
                                  batch_size=1, max_samples=8, max_new_tokens=512)
     config["logging"].update(backends=["console"], log_steps=1)
     config["logging"]["wandb"]["mode"] = "disabled"
+    if case.name.startswith("reward-model-"):
+        config["reward_model"].update(
+            model_path="/model", tensor_parallel_size=case.tp, data_parallel_size=2,
+            port=ports[1], log_path=f"/results/reward-model-phase-{phase}.log",
+        )
     if case.runner != "internal":
         config["agentic"][case.runner].update(
             gateway_port=ports[1], session_root="/results/sessions",

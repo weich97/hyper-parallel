@@ -14,18 +14,28 @@
 # limitations under the License.
 """VLM Trainer assembled from the shared BaseTrainer stages."""
 
+__all__ = ["VLMTrainer"]
+
 from collections import defaultdict
+from itertools import count
 from typing import Any, Dict
 
-from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.utils import clip_grad_norm_
+import torch  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.data.batching import calculate_num_micro_batches
-from hyper_parallel.data.vlm import build_processor, build_vlm_get_batch
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch
+from hyper_parallel.data.omni import OmniDataTransform
+from hyper_parallel.data.omni.metadata import vlm_sample_metadata
+from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
+from hyper_parallel.distributed.encoder_parallel.transport import EncoderParallelBatchTransport
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
+from hyper_parallel.trainer.runtime.memory_profiler import memory_profiler
 from hyper_parallel.trainer.runtime.device import synchronize  # pylint: disable=syntax-error
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.distributed_data import DistributedDataLoader
 from hyper_parallel.trainer.config import TrainerConfig
 
 logger = create_logger(__name__)
@@ -42,6 +52,12 @@ class VLMTrainer:
         self.base.config = config
 
         self.base._setup()
+        memory_profiler.reset(
+            self.base.config.memory,
+            global_rank=self.base.global_rank,
+            tp_rank=self.base.mesh.tp_rank,
+            dp_rank=self.base.mesh.dp_rank,
+        )
         self.base._build_model()
         self.base._build_loss()
 
@@ -52,49 +68,64 @@ class VLMTrainer:
 
         # dataloader
         self._build_collate_fn()
-        self.base._build_dataloader()
+        self.base._build_dataloader(metadata_fn=vlm_sample_metadata)
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
-        """Build processor-backed assets for VLM training."""
+        """Build and publish the processor consumed by the Omni transform."""
         config: TrainerConfig = self.base.config
         if config.dataset is None:
             raise ValueError("dataset must define a build target")
 
-        processor_path = (
-            getattr(config.model, "tokenizer_path", None)
-            or getattr(config.model, "pretrained_model_name_or_path", None)
+        # The model-owned processor is built through the Omni ``model_assets``
+        # target; forward the model's ``trust_remote_code`` flag so a natively
+        # registered architecture such as the Kimi-K2.6 family (``kimi_k26``)
+        # stays on the local implementation unless the config opts into remote
+        # code.
+        processor = config.dataset.model_assets.build(
+            trust_remote_code=bool(
+                getattr(config.model, "trust_remote_code", True)
+            ),
         )
-        if processor_path is None:
-            self.base.processor = None
-        else:
-            self.base.processor = build_processor(processor_path)
-        self.base.tokenizer = getattr(self.base.processor, "tokenizer", None)
-        self.base.chat_template = None
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError("dataset.model_assets must build a processor with a tokenizer")
 
-        self.base.model_assets = [self.base.model_config]
-        if self.base.processor is not None:
-            self.base.model_assets.append(self.base.processor)
+        self.base.processor = processor
+        self.base.tokenizer = tokenizer
+        self.base.chat_template = getattr(processor, "chat_template", None)
+        self.base.model_assets = [self.base.model_config, processor]
 
     def _build_data_transform(self) -> None:
-        """Build the configured multimodal sample transform."""
+        """Build the Omni encoding lifecycle from the prebuilt processor."""
         dataset_config = self.base.config.dataset
         if dataset_config is None:
             raise ValueError("dataset must define a build target")
+
         if dataset_config.data_transform is None:
-            self.base.data_transform = None
-            return
-        self.base.data_transform = dataset_config.data_transform.build(
+            raise ValueError("dataset.data_transform must define an Omni transform build target")
+
+        if dataset_config.training_mode is None:
+            raise ValueError("dataset.training_mode must be explicitly set to 'sft' or 'pretrain' for VLM training")
+
+        data_transform = dataset_config.data_transform.build(
             processor=self.base.processor,
+            training_mode=dataset_config.training_mode,
         )
+        if not isinstance(data_transform, OmniDataTransform):
+            raise TypeError("dataset.data_transform must build an OmniDataTransform")
+
+        self.base.data_transform = data_transform
 
     def _build_collate_fn(self) -> None:
         """Build the VLM collator and gradient-accumulation batch count."""
@@ -107,21 +138,40 @@ class VLMTrainer:
             micro_batch_size=training_config.micro_batch_size,
             dp_world_size=self.base.mesh.dp_size,
         )
-        self.base.collate_fn = dataloader_config.collate_fn.build()
+        self.base.collate_fn = dataloader_config.collate_fn.build(
+            mesh_context=self.base.mesh,
+        )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-VLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
-        get_batch_builder = (
-            config.dataloader.get_batch.build
-            if config.dataloader.get_batch
-            else build_vlm_get_batch
-        )
-        self.base.get_batch = get_batch_builder(
+        if config.dataloader.get_batch is None:
+            raise ValueError("dataloader.get_batch must define a batching runtime target")
+        if getattr(config.dataloader.get_batch, "encoder_parallel", None) is not None:
+            raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
+        encoder_runtime = build_encoder_parallel_runtime(
+            config=config.accelerator.encoder_parallel,
             mesh_context=self.base.mesh,
+            model=self.base.model,
+            model_adapter_spec=resolve_model_adapter(self.base.model),
+            execution_options={
+                "micro_batch_size": int(config.training.micro_batch_size),
+                "compile_enabled": bool(config.compile.enabled),
+                "validate_placement": bool(getattr(config.model, "validate_placement", False)),
+            },
+        )
+        get_batch = config.dataloader.get_batch.build(
+            mesh_context=self.base.mesh,
+            dataloader_context=self.base.dataloader_context,
             device=self.base.device,
+            data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+        if encoder_runtime is not None:
+            if not isinstance(get_batch, OmniParallelBatch):
+                raise ValueError("encoder parallel requires OmniParallelBatch")
+            get_batch.batch_transport = EncoderParallelBatchTransport(runtime=encoder_runtime)
+        self.base.get_batch = get_batch
 
     @property
     def distributed_setup(self) -> Any:
@@ -154,9 +204,25 @@ class VLMTrainer:
         """Dispatch the epoch-end lifecycle hook."""
         self.base.on_epoch_end()
 
-    def on_step_begin(self, micro_batches: Any = None) -> None:
+    def on_step_begin(self) -> None:
         """Dispatch the step-begin lifecycle hook."""
-        self.base.on_step_begin(micro_batches=micro_batches)
+        self.base.on_step_begin()
+
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
+
+        Args:
+            micro_batch: Prepared inputs and lightweight metric metadata.
+        """
+        self.base.on_micro_step_begin(micro_batch)
+
+    def on_micro_step_end(self, loss_dict: dict[str, torch.Tensor]) -> None:
+        """Dispatch the micro-step-end lifecycle hook.
+
+        Args:
+            loss_dict: Named losses and metrics from the completed forward-backward step.
+        """
+        self.base.on_micro_step_end(loss_dict)
 
     def on_step_end(
             self,
@@ -164,136 +230,172 @@ class VLMTrainer:
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregate step loss.
+            loss_dict: Named step losses.
+            grad_norm: Measured gradient norm.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
             grad_norm=grad_norm,
         )
 
-    def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step."""
-        config = self.base.config
-        first_training_batch = self.base.get_batch(data_iterator)
-        num_micro_steps = self.base.num_micro_batches
-        training_batches = [first_training_batch]
-        for _ in range(1, num_micro_steps):
-            training_batches.append(self.base.get_batch(data_iterator))
+    def forward_backward_step(
+            self,
+            data_iterator: Any,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Fetch and execute one forward-backward micro-step.
 
-        self.on_step_begin(
-            micro_batches=[model_inputs for model_inputs, _ in training_batches]
-        )
+        Args:
+            data_iterator: Iterator providing one multimodal batch per call.
+
+        Returns:
+            Loss tensor and named loss tensors for this FB step.
+        """
+        model_inputs, loss_inputs = self.base.get_batch(data_iterator)
+        self.base.current_token_counts = count_loss_token(loss_inputs)
+        self.on_micro_step_begin(model_inputs)
+        loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
+        self.on_micro_step_end(loss_dict)
+
+        return loss, loss_dict
+
+    def train_step(self, data_iterator: Any) -> Dict[str, float]:
+        """Execute one VLM training step.
+
+        Args:
+            data_iterator: Iterator providing multimodal micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm.
+        """
+        memory_profiler.step()
+        num_micro_steps = self.base.num_micro_batches
+        self.base.begin_loss_step()
+
+        self.on_step_begin()
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss = 0.0
         total_loss_dict = defaultdict(int)
 
-        for micro_step, batch in enumerate(training_batches):
-            model_inputs, loss_inputs = batch
+        for micro_step in range(num_micro_steps):
             self.base.model_reshard(micro_step, num_micro_steps)
             self.base.configure_fsdp_gradient_sync(
                 micro_step,
                 num_micro_steps,
             )
-            self.base.current_token_counts = count_loss_token(loss_inputs)
-            self.base.step_token_counts = {
-                name: token_count * num_micro_steps
-                for name, token_count in self.base.current_token_counts.items()
-            }
-            loss, loss_dict = self.base.forward_backward_step(model_inputs)
-
-            # Release each device batch as soon as its backward pass completes;
-            # prefetching all micro-batches must not pin them until step end.
-            training_batches[micro_step] = None
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
+            loss, loss_dict = self.forward_backward_step(
+                data_iterator,
+            )
 
             total_loss += loss.item()
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = clip_grad_norm_(
-            self.base.model,
-            config.training.max_grad_norm,
-        )
+        total_loss, grad_norm = self.base.prepare_optimizer_step(total_loss, total_loss_dict)
+        self.base.step_optimizers_and_schedulers()
 
-        optimizers = (
-            self.base.optimizer
-            if isinstance(self.base.optimizer, list)
-            else [self.base.optimizer]
-        )
-        for optimizer in optimizers:
-            with SkipDTensorDispatch():
-                optimizer.step()
-            optimizer.zero_grad()
-
-        schedulers = (
-            self.base.lr_scheduler
-            if isinstance(self.base.lr_scheduler, list)
-            else (
-                [self.base.lr_scheduler]
-                if self.base.lr_scheduler is not None
-                else []
-            )
-        )
-        for scheduler in schedulers:
-            scheduler.step()
-
+        # Checkpoint and logging callbacks observe completed optimizer updates.
+        self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        # The base trainer owns this integration hook and the VLM subclass only
+        # mirrors the base step order, so reaching the private method is intended.
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm_value,
         )
 
-        self.base.state.global_step += 1
-
-        return {
+        step_metrics = {
             "loss": total_loss,
             "grad_norm": grad_norm_value,
         }
+        return step_metrics
+
+    def _train_epoch(self, epoch: int, balanced_loader: bool) -> bool:
+        """Run complete optimizer steps and report actual Dataset exhaustion."""
+        train_dataloader = self.base.train_dataloader
+        data_iterator = iter(train_dataloader) if train_dataloader is not None else None
+        start_step = self.base.state.global_step - epoch * self.base.train_steps
+        train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
+        if balanced_loader:
+            start_step = 0
+            train_steps = self.base.train_iters - self.base.state.global_step
+        for _ in range(start_step, train_steps):
+            try:
+                self.train_step(data_iterator)
+            except StopIteration:
+                optimizers = self.base.optimizer
+                for optimizer in optimizers if isinstance(optimizers, list) else [optimizers]:
+                    optimizer.zero_grad()
+                logger.info(
+                    "epoch:%s Dataloader finished with drop_last %s", epoch, self.base.config.dataloader.drop_last
+                )
+                return True
+        return False
 
     def train(self) -> None:
         """Run the VLM training loop."""
-        config = self.base.config
-        self.on_train_begin()
-        logger.info(
-            "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
-            self.base.local_rank,
-            self.base.state.global_step,
-            self.base.train_iters,
-            self.base.state.epoch,
-            self.base.train_epochs,
-        )
+        try:
+            self.on_train_begin()
+            logger.info(
+                "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
+                self.base.local_rank,
+                self.base.state.global_step,
+                self.base.train_iters,
+                self.base.state.epoch,
+                self.base.train_epochs,
+            )
 
-        # Checkpoint resume restores state.global_step, state.epoch, and the DataLoader cursor.
-        for epoch in range(self.base.state.epoch, self.base.train_epochs):
             train_dataloader = self.base.train_dataloader
-
-            if hasattr(train_dataloader, "set_epoch"):
-                train_dataloader.set_epoch(epoch)
-
-            self.on_epoch_begin()
-            data_iterator = iter(train_dataloader) if train_dataloader is not None else None
-
-            start_step = self.base.state.global_step - epoch * self.base.train_steps
-            train_steps = min(self.base.train_steps, self.base.train_iters - epoch * self.base.train_steps)
-            for _ in range(start_step, train_steps):
-                try:
-                    self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info("epoch:%s Dataloader finished with drop_last %s", epoch, config.dataloader.drop_last)
+            balanced_loader = isinstance(train_dataloader, DistributedDataLoader)
+            start_epoch = self.base.state.epoch
+            epochs = count(start_epoch) if balanced_loader else range(start_epoch, self.base.train_epochs)
+            for epoch in epochs:
+                if self.base.state.global_step >= self.base.train_iters:
                     break
+                # Do not erase the cursor restored by on_train_begin on the first epoch.
+                if hasattr(train_dataloader, "set_epoch") and (not balanced_loader or epoch != start_epoch):
+                    train_dataloader.set_epoch(epoch)
 
-            self.on_epoch_end()
-            self.base.state.epoch = epoch + 1
-            print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+                self.base.state.epoch = epoch
+                self.on_epoch_begin()
+                epoch_start_step = self.base.state.global_step
+                epoch_exhausted = self._train_epoch(epoch, balanced_loader)
+                if balanced_loader and epoch != start_epoch and self.base.state.global_step == epoch_start_step:
+                    raise ValueError("VLM Dataset epoch cannot provide one complete optimizer step")
 
-            if self.base.state.global_step >= self.base.train_iters:
-                break
+                self.on_epoch_end()
+                self.base.state.epoch = epoch + 1 if not balanced_loader or epoch_exhausted else epoch
+                print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
-        self.on_train_end()
+            memory_profiler.stop()
+            self.on_train_end()
+
+        except BaseException:
+            try:
+                memory_profiler.stop()
+            # Snapshot export must preserve the training error even if interrupted.
+            except BaseException:  # pylint: disable=broad-exception-caught
+                logger.exception("Failed to save memory snapshot after training error.")
+            finally:
+                self.base.abort_profilers()
+            raise
+
+        if balanced_loader:
+            try:
+                train_dataloader.wait_for_prefetch()
+            finally:
+                train_dataloader.close()
 
         synchronize()
         self.base.destroy_distributed()
-
-
-__all__ = ["VLMTrainer"]
