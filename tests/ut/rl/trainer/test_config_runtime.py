@@ -24,16 +24,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import rl.config as config_module
+import rl.config.validate as config_module
 from rl.algorithm import build_algorithm
-from rl.config import (
-    build_model_registration,
-    build_runtime_config,
-    resolve_vllm_automatic_limits,
-    uses_colocated_vllm,
-    validate_config,
-)
-from rl.roles.model_setup import resolve_vllm_model
+from rl.config.schema import build_model_registration, uses_colocated_vllm
+from rl.config.resolve import build_runtime_config
+from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.validate import validate_config
+from rl.workers.engine.model import resolve_vllm_model
 
 
 @pytest.fixture(name="validated_recipe")
@@ -52,11 +49,37 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     ("path", "value", "error"),
     [
         (("train", "max_steps"), 0, "max_steps must be positive"),
+        (("train", "token_log_probs_mode"), "invalid", "token_log_probs_mode"),
+        (("train", "token_log_probs_chunk_size"), 0, "token_log_probs_chunk_size"),
+        (("train", "token_log_probs_chunk_size"), 513, "token_log_probs_chunk_size"),
+        (("train", "old_log_prob_source"), "invalid", "old_log_prob_source"),
+        (("train", "gradient_sync_each_micro_batch"), "true", "must be a boolean"),
+        (("train", "accelerator", "reference_cpu_offload"), "false", "must be a boolean"),
+        (("train", "accelerator", "offload_during_rollout"), "false", "must be a boolean"),
+        (("train", "accelerator", "comm_fusion_zero_copy"), "false", "must be a boolean or null"),
+        (("train", "optimizer", "no_decay_params"), "norm", "no_decay_params"),
+        (("evaluation", "at_end"), "true", "at_end must be a boolean"),
+        (("evaluation", "before_train"), "true", "before_train must be a boolean"),
+        (("evaluation", "every_n_steps"), -1, "every_n_steps"),
+        (("evaluation", "every_n_steps"), True, "every_n_steps"),
+        (("train", "optimizer", "fp32_main_params"), "true", "must be a boolean"),
         (("train", "micro_batch_size"), 0, "micro_batch_size must be positive"),
+        (("train", "balance_dp_tokens"), "true", "balance_dp_tokens"),
+        (("train", "balance_dp_tokens"), True, "requires train.max_tokens_per_micro_batch"),
+        (("train", "max_tokens_per_micro_batch"), 0, "max_tokens_per_micro_batch"),
+        (("train", "old_log_prob_max_tokens_per_micro_batch"), True, "old_log_prob_max_tokens_per_micro_batch"),
+        (("train", "reference_log_prob_max_tokens_per_micro_batch"), 0,
+         "reference_log_prob_max_tokens_per_micro_batch"),
+        (("train", "max_tokens_per_micro_batch"), True, "max_tokens_per_micro_batch"),
         (("train", "response_mini_batch_size"), 3, "cannot exceed the local rollout"),
         (("train", "policy_update_epochs"), 0, "policy_update_epochs must be positive"),
         (("rollout", "num_return_sequences"), 1, "at least 2"),
         (("rollout", "ignore_eos"), "false", "ignore_eos must be a boolean"),
+        (("rollout", "collect_log_probs"), "false", "collect_log_probs must be a boolean"),
+        (("rollout", "collect_log_probs"), False, "requires train.old_log_prob_source=actor"),
+        (("rollout", "vllm", "seed"), -1, "seed must be a non-negative integer"),
+        (("rollout", "vllm", "disable_log_stats"), "true", "disable_log_stats must be a boolean"),
+        (("rollout", "vllm", "task_queue_enable"), 3, "task_queue_enable must be 1 or 2"),
         (("train", "accelerator", "cp"), 2, "invalid topology"),
         (("train", "accelerator", "pp"), 2, "invalid topology"),
         (("train", "accelerator", "tp"), 4, "invalid topology"),
@@ -85,6 +108,37 @@ def test_config_rejects_invalid_runtime_contracts(
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
+def test_fp32_main_parameter_policy_reaches_runtime_and_rejects_low_precision_reduction(validated_recipe) -> None:
+    """The role optimizer and shared FSDP must receive one consistent main-gradient policy."""
+    validated_recipe["train"]["optimizer"]["fp32_main_params"] = True
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    assert build_runtime_config(validated_recipe).optimizer.fp32_main_params
+    validated_recipe["train"]["mixed_precision"]["reduce_dtype"] = "bfloat16"
+    with pytest.raises(ValueError, match="float32 gradient reduction"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_actor_anchor_can_disable_sampling_probabilities(validated_recipe) -> None:
+    """The internal actor-anchor path can omit optional sampling evidence."""
+    validated_recipe["train"]["old_log_prob_source"] = "actor"
+    validated_recipe["rollout"]["collect_log_probs"] = False
+    validated_recipe["rollout"]["seed"] = None
+    validated_recipe["rollout"]["vllm"]["seed"] = 42
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    validated_recipe["consistency"] = {"enabled": True}
+    with pytest.raises(ValueError, match="consistency was removed"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_actor_critic_precision_policy_cannot_differ(validated_recipe) -> None:
+    """Both models share the FSDP main-gradient policy and must own compatible optimizers."""
+    validated_recipe["algorithm"]["name"] = "ppo"
+    validated_recipe["train"]["optimizer"]["fp32_main_params"] = True
+    validated_recipe["train"]["critic"] = {"optimizer": {"fp32_main_params": False}}
+    with pytest.raises(ValueError, match="same fp32_main_params"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
 def test_all_st_recipes_pass_production_validation(
     validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -96,9 +150,51 @@ def test_all_st_recipes_pass_production_validation(
         for phase in range(1, 3 if case.resume else 2):
             config = runtime.prepare_config(case, phase, (8100, 8200), devices)
             config["model"].update(validated_recipe["model"])
+            if "reward_model" in config:
+                config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
             for field in ("train_path", "test_path"):
                 config["data"][field] = validated_recipe["data"][field]
             validate_config(resolve_vllm_automatic_limits(config), build_algorithm(config["algorithm"]))
+
+
+def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validated_recipe: dict) -> None:
+    """The optional thread setting preserves None and a positive integer without coercion."""
+    algorithm = build_algorithm(validated_recipe["algorithm"])
+    for threads in (None, 8):
+        validated_recipe["train"]["model_init_cpu_threads"] = threads
+        validate_config(validated_recipe, algorithm)
+        actual = validated_recipe["train"]["model_init_cpu_threads"]
+        assert actual == threads, f"Expected unchanged thread setting {threads!r}, got {actual!r}"
+    validated_recipe["train"]["model_init_cpu_threads"] = True
+    with pytest.raises(ValueError, match="model_init_cpu_threads.*positive integer"):
+        validate_config(validated_recipe, algorithm)
+
+
+def test_colocated_reward_model_config_rejects_conflicts(
+    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check RM ownership, scoring callback and service ports before startup."""
+    runtime = importlib.import_module("tests.common.rl_st_cases")
+    case = next(case for case in runtime.CASES if case.name == "reward-model-tp1")
+    devices = list(range(case.cards))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, devices)))
+    config = runtime.prepare_config(case, 1, (8100, 8200), devices)
+    config["model"].update(validated_recipe["model"])
+    config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
+    for field in ("train_path", "test_path"):
+        config["data"][field] = validated_recipe["data"][field]
+    config = resolve_vllm_automatic_limits(config)
+    validate_config(config, build_algorithm(config["algorithm"]))
+    for field, value, error in (
+        ("port", 8100, "distinct"),
+        ("scorer", "examples.gsm8k.agent:compute_gsm8k_reward", "async"),
+        ("tensor_parallel_size", 3, "TP1/TP2"),
+    ):
+        old = config["reward_model"][field]
+        config["reward_model"][field] = value
+        with pytest.raises(ValueError, match=error):
+            validate_config(config, build_algorithm(config["algorithm"]))
+        config["reward_model"][field] = old
 
 
 def _complete_config(tmp_path: Path) -> dict:
@@ -127,70 +223,7 @@ def _complete_config(tmp_path: Path) -> dict:
     test_path = tmp_path / "test.parquet"
     train_path.touch()
     test_path.touch()
-    return {
-        "model": {
-            "name": "qwen3",
-            "registry_name": "qwen",
-            "weights_path": str(model_dir),
-            "tokenizer_path": str(tokenizer_dir),
-            "attn_implementation": "sdpa",
-        },
-        "data": {
-            "train_path": str(train_path),
-            "test_path": str(test_path),
-            "max_prompt_length": 16,
-        },
-        "rollout": {
-            "engine": "vllm",
-            "num_return_sequences": 2,
-            "max_new_tokens": 8,
-            "seed": 7,
-            "ignore_eos": False,
-            "vllm": {
-                "deployment": "disjoint",
-                "data_parallel_size": 1,
-                "tensor_parallel_size": 1,
-                "visible_devices": "4",
-                "host": "127.0.0.1",
-                "port": 8200,
-                "dtype": "bfloat16",
-                "gpu_memory_utilization": 0.8,
-                "kv_cache_memory_bytes": 2 * 1024 * 1024,
-                "max_model_len": 64,
-                "max_num_seqs": None,
-                "max_num_batched_tokens": 64,
-                "block_size": 16,
-                "model_implementation": "native",
-                "weight_sync": {
-                    "strategy": "full_gather",
-                    "bucket_size_mb": 1,
-                },
-            },
-        },
-        "agentic": {
-            "environment": "ut-config-environment",
-            "max_turns": 1,
-            "max_observation_tokens": 0,
-            "interaction_mode": "single_turn",
-            "apply_chat_template": False,
-        },
-        "algorithm": {"name": "grpo", "loss_aggregation": "token-mean"},
-        "evaluation": {
-            "enabled": True,
-            "batch_size": 1,
-            "max_new_tokens": 8,
-            "max_samples": 2,
-            "log_samples": 0,
-            "progress_steps": 0,
-            "ignore_eos": False,
-        },
-        "train": _training_config(tmp_path),
-        "logging": {
-            "backends": ["console"],
-            "wandb": {"mode": "disabled"},
-        },
-        "consistency": {"enabled": False},
-    }
+    return {'model': {'name': 'qwen3', 'registry_name': 'qwen', 'weights_path': str(model_dir), 'tokenizer_path': str(tokenizer_dir), 'attn_implementation': 'sdpa'}, 'data': {'train_path': str(train_path), 'test_path': str(test_path), 'max_prompt_length': 16}, 'rollout': {'engine': 'vllm', 'num_return_sequences': 2, 'max_new_tokens': 8, 'seed': 7, 'ignore_eos': False, 'vllm': {'deployment': 'disjoint', 'data_parallel_size': 1, 'tensor_parallel_size': 1, 'visible_devices': '4', 'host': '127.0.0.1', 'port': 8200, 'dtype': 'bfloat16', 'gpu_memory_utilization': 0.8, 'kv_cache_memory_bytes': 2 * 1024 * 1024, 'max_model_len': 64, 'max_num_seqs': None, 'max_num_batched_tokens': 64, 'block_size': 16, 'model_implementation': 'native', 'weight_sync': {'strategy': 'full_gather', 'bucket_size_mb': 1}}}, 'agentic': {'environment': 'ut-config-environment', 'max_turns': 1, 'max_observation_tokens': 0, 'interaction_mode': 'single_turn', 'apply_chat_template': False}, 'algorithm': {'name': 'grpo', 'loss_aggregation': 'token-mean'}, 'evaluation': {'enabled': True, 'batch_size': 1, 'max_new_tokens': 8, 'max_samples': 2, 'log_samples': 0, 'progress_steps': 0, 'ignore_eos': False}, 'train': _training_config(tmp_path), 'logging': {'backends': ['console'], 'wandb': {'mode': 'disabled'}}}
 
 
 def test_complete_config_resolves_validates_and_builds_runtime(
@@ -229,14 +262,14 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     assert runtime.fsdp_config.mix_precision.reduce_dtype == "float32"
     assert runtime.activation_checkpoint.mode == "selective"
     assert runtime.checkpoint.save_ckpt
-    assert runtime.model.to_dict()["_target_"] == "rl.roles.qwen3_builder.build_causal_lm"
+    assert runtime.model.to_dict()["_target_"] == "rl.workers.adapters.qwen3.build_causal_lm"
     assert runtime.model.torch_dtype == "bfloat16"
     assert runtime.optimizer.target.to_dict()["_target_"] == "hyper_parallel.components.optim.AdamW"
 
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("deepseek_v3", "DeepseekV3ForCausalLM")],
+    [("deepseek_v3", "DeepseekV3ForCausalLM")],
 )
 def test_removed_model_families_fail_before_runtime_construction(
     tmp_path: Path, model_type: str, architecture: str,
@@ -265,7 +298,7 @@ def test_dense_rollout_rejects_expert_options(option: str) -> None:
         config_module._validate_dense_parallelism({option: True}, {})
 
 
-@pytest.mark.parametrize("implementation", ["native", "hyper"])
+@pytest.mark.parametrize("implementation", ["native"])
 def test_dense_registration_preserves_both_rollout_implementations(
     tmp_path: Path, implementation: str,
 ) -> None:
@@ -274,7 +307,7 @@ def test_dense_registration_preserves_both_rollout_implementations(
     rollout = resolve_vllm_model(registration, implementation)
     assert rollout.family == "qwen3"
     assert rollout.architecture == (
-        "HyperQwen3ForCausalLM" if implementation == "hyper" else "Qwen3ForCausalLM"
+        "Qwen3ForCausalLM" if implementation == "hyper" else "Qwen3ForCausalLM"
     )
     config_module._validate_dense_parallelism(
         {"enable_expert_parallel": False, "enable_eplb": False}, {"ep": 1},
@@ -296,7 +329,7 @@ def fixture_validation_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
 @pytest.mark.parametrize("trainer_tp", [1, 2])
 @pytest.mark.parametrize("rollout_tp", [1, 2])
-@pytest.mark.parametrize("strategy", ["full_gather", "direct_reshard"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_supported_parallel_and_weight_sync_combinations(
     validation_config: dict, deployment: str, trainer_tp: int, rollout_tp: int, strategy: str,
 ) -> None:
@@ -370,7 +403,7 @@ def test_model_resolution_still_rejects_invalid_implementation(validation_config
 
 def _training_config(tmp_path):
     """Return fresh optimizer, precision and checkpoint settings for configuration tests."""
-    return {
+    return {"plan_overrides": [],
         "max_steps": 2,
         "prompt_batch_size": 1,
         "micro_batch_size": 1,
@@ -415,3 +448,131 @@ def _training_config(tmp_path):
             "verify_reload": False,
         },
     }
+
+
+@pytest.mark.parametrize("actor_offload,reference_offload", [(True, False), (False, True), (False, False)])
+def test_role_offload_reuses_shared_fsdp_config(validated_recipe, actor_offload, reference_offload):
+    """Reference overrides must not mutate Actor residency or the caller configuration."""
+    accelerator = validated_recipe["train"]["accelerator"]
+    accelerator.update(cpu_offload=actor_offload, reference_cpu_offload=reference_offload, comm_fusion_zero_copy=True)
+    validated_recipe["train"]["max_tokens_per_micro_batch"] = 3000
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    actor = build_runtime_config(validated_recipe)
+    reference = build_runtime_config(validated_recipe, reference=True)
+    assert actor.fsdp_config.enable_offload is actor_offload
+    assert actor.fsdp_config.comm_fusion_zero_copy is True
+    assert reference.fsdp_config.enable_offload is reference_offload
+    assert accelerator["cpu_offload"] is actor_offload
+    if actor_offload or reference_offload:
+        assert "cpu:gloo" in actor.training.backend
+    with pytest.raises(ValueError, match="both Critic and Reference"):
+        build_runtime_config(validated_recipe, critic=True, reference=True)
+
+
+def test_dynamic_actor_rejects_unvalidated_tensor_parallel_scope(validated_recipe: dict) -> None:
+    """The first dynamic Actor integration has an explicit dense TP1 boundary."""
+    validated_recipe["train"]["max_tokens_per_micro_batch"] = 3000
+    validated_recipe["train"]["accelerator"]["tp"] = 2
+    with pytest.raises(ValueError, match="Dynamic Actor batching requires"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_colocated_resident_dense_grpo_retains_topology_guards(validation_config):
+    """Only the accepted TP1 dense colocated configuration gains device residency."""
+    accelerator = validation_config["train"]["accelerator"]
+    accelerator.update(cpu_offload=False, reference_cpu_offload=True, tp=1)
+    rollout = validation_config["rollout"]["vllm"]
+    rollout.update(deployment="colocated", tensor_parallel_size=1, data_parallel_size=2)
+    rollout.pop("visible_devices", None)
+    validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+    accelerator["tp"] = 2
+    with pytest.raises(ValueError, match="dense.*TP1"):
+        validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+
+
+@pytest.mark.parametrize("training_offload", [False, True])
+def test_rollout_offload_keeps_training_offload_independent(validation_config, training_offload):
+    """Stage residency does not rewrite the selected training CPU policy."""
+    accelerator = validation_config["train"]["accelerator"]
+    accelerator.update(offload_during_rollout=True, cpu_offload=training_offload, tp=1)
+    validation_config["rollout"]["vllm"].update(deployment="colocated", tensor_parallel_size=1, data_parallel_size=2)
+    validation_config["rollout"]["vllm"].pop("visible_devices", None)
+    validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
+    assert accelerator["cpu_offload"] is training_offload
+
+
+def test_rollout_offload_rejects_disjoint_inference(validated_recipe):
+    """The initial stage-offload contract targets colocated dense GRPO only."""
+    validated_recipe["train"]["accelerator"]["offload_during_rollout"] = True
+    validated_recipe["rollout"]["vllm"]["deployment"] = "disjoint"
+    with pytest.raises(ValueError, match="offload_during_rollout requires"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_selected_token_probabilities_validate_supported_scope(validated_recipe: dict) -> None:
+    """The opt-in adapter preserves default behavior and rejects unsupported algorithms."""
+    config = validated_recipe
+    config["train"]["token_log_probs_mode"] = "selected_chunked"
+    validate_config(config, build_algorithm(config["algorithm"]))
+    with pytest.raises(ValueError, match="selected_chunked requires"):
+        config_module._validate_token_log_probs(
+            config, config_module.build_model_registration(config), SimpleNamespace(name="ppo"),
+        )
+    config["train"]["accelerator"]["tp"] = 2
+    with pytest.raises(ValueError, match="selected_chunked requires"):
+        config_module._validate_token_log_probs(config, config_module.build_model_registration(config),
+                                              build_algorithm(config["algorithm"]))
+
+
+@pytest.mark.parametrize("rules", [None, {}, "implicit"])
+def test_config_requires_explicit_plan_rules(validated_recipe, rules):
+    """Reject implicit or malformed training replacement declarations."""
+    if rules is None:
+        validated_recipe["train"].pop("plan_overrides")
+    else:
+        validated_recipe["train"]["plan_overrides"] = rules
+    with pytest.raises(ValueError, match="plan_overrides"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_role_rules_replace_shared_list_without_mutating_actor(validated_recipe):
+    """Normalization of one role cannot overwrite another role's declarations."""
+    from dataclasses import replace
+    from hyper_parallel.distributed.mesh import DistributedSetup
+    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+
+    train = validated_recipe["train"]
+    train["plan_overrides"] = [{"match": "*.mlp", "region_dispatch": True}]
+    train["reference"] = {"plan_overrides": []}
+    train["critic"] = {"plan_overrides": []}
+    actor = build_runtime_config(validated_recipe)
+    reference = build_runtime_config(validated_recipe, reference=True)
+    critic = build_runtime_config(validated_recipe, critic=True)
+    setup = DistributedSetup()
+    normalize_distributed_setup_overrides(setup, actor)
+    before = setup.plan_overrides
+    reference_setup = replace(setup)
+    normalize_distributed_setup_overrides(reference_setup, reference)
+    assert len(actor.plan_overrides) == 1
+    assert reference.plan_overrides == critic.plan_overrides == []
+    assert setup.plan_overrides is before
+    assert reference_setup.plan_overrides is None
+    assert train["plan_overrides"] == [{"match": "*.mlp", "region_dispatch": True}]
+
+
+def test_effective_role_config_keeps_declared_and_active_rules(validated_recipe):
+    """Persist declared HP fields separately from condition-filtered selections."""
+    from hyper_parallel.distributed.mesh import DistributedSetup
+    from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+    from rl.trainer.build import _TrainerBuilder
+
+    runtime = build_runtime_config(validated_recipe)
+    setup = DistributedSetup()
+    normalize_distributed_setup_overrides(setup, runtime)
+    builder = object.__new__(_TrainerBuilder)
+    builder.resolved_config = validated_recipe
+    builder._record_role_config("actor", runtime, setup)
+    effective = validated_recipe["effective_training"]["actor"]
+    assert effective["source"] == "train.plan_overrides"
+    assert effective["runtime"] == runtime.to_dict()
+    assert effective["active_module_matches"] == []

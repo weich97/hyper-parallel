@@ -15,19 +15,23 @@
 """Unit tests for model-agnostic activation-checkpoint block discovery."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 from torch import Tensor, nn
 
 
 from hyper_parallel.core.activation_memory.wrapper import ckpt_wrapper as _checkpoint_wrapper
+from hyper_parallel.core.activation_memory.wrapper import CheckpointExcludeWrapper
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
     _find_transformer_block_modules,
     _find_transformer_layer_container_infos,
+    _selected_checkpoint_layer_fqns,
     _wrap_layer_containers,
     apply_submodule_checkpointing,
 )
+from hyper_parallel.models.adapter_spec import RecomputePolicy
 
 
 _ACTIVATION_CHECKPOINT_MODULE = (
@@ -153,6 +157,44 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
 
         self.assertEqual([block.child_name for block in blocks], ["2"])
 
+    def test_layer_count_selects_leading_flattened_layers(self):
+        """A layer count should select a contiguous prefix in flattened order."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        selected = _selected_checkpoint_layer_fqns(
+            containers,
+            SimpleNamespace(layer_count=2, layer_indices=None),
+        )
+
+        self.assertEqual(
+            selected,
+            {"text_tower.decoder.2", "text_tower.decoder.7"},
+        )
+
+    def test_layer_indices_select_exact_flattened_layers(self):
+        """Explicit indices should select only the requested flattened layers."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        selected = _selected_checkpoint_layer_fqns(
+            containers,
+            SimpleNamespace(layer_count=None, layer_indices=[1, 3]),
+        )
+
+        self.assertEqual(
+            selected,
+            {"text_tower.decoder.7", "image_tower.decoder.7"},
+        )
+
+    def test_layer_indices_reject_out_of_range_index(self):
+        """Explicit indices should fail before wrapping when an index is absent."""
+        containers = _find_transformer_layer_container_infos(_DiscoveryModel())
+
+        with self.assertRaisesRegex(ValueError, "exceeds the maximum index 3"):
+            _selected_checkpoint_layer_fqns(
+                containers,
+                SimpleNamespace(layer_count=None, layer_indices=[4]),
+            )
+
     def test_wrapping_uses_actual_container_child_names(self):
         """Wrapping should preserve arbitrary ModuleDict keys."""
         model = _DiscoveryModel()
@@ -171,6 +213,167 @@ class TestTransformerBlockDiscovery(unittest.TestCase):
         """Activation checkpointing should fail instead of guessing a container."""
         with self.assertRaisesRegex(ValueError, "gradient_checkpointing"):
             _apply_activation_checkpointing(_UnmarkedDiscoveryModel(), "selective")
+
+    def test_kv_sharing_overrides_hf_native_full_checkpointing(self):
+        """Mutable cross-layer training state keeps attention outside replay."""
+        model = _DiscoveryOwner()
+        model.decoder["2"] = _CheckpointableSubmodules()
+        model.decoder["7"] = _CheckpointableSubmodules()
+        with (
+            patch(
+                f"{_ACTIVATION_CHECKPOINT_MODULE}._detect_kv_sharing_and_maybe_disable_cache",
+                return_value=True,
+            ),
+            patch(
+                f"{_ACTIVATION_CHECKPOINT_MODULE}._should_use_hf_native_gradient_checkpointing",
+                return_value=True,
+            ),
+        ):
+            _apply_activation_checkpointing(model, "full")
+
+        for block in model.decoder.values():
+            self.assertIsInstance(block.self_attn, nn.Linear)
+            self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+
+
+class TestModelAdapterRecomputeRegions(unittest.TestCase):
+    """Tests for adapter-declared recompute regions and their exclusions."""
+
+    @staticmethod
+    def _selection(**overrides):
+        """Return one model-adapter selection for the safe-region source."""
+        values = {
+            "source": "model_adapter_safe_regions",
+            "layer_count": 4,
+            "layer_indices": None,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _model(policy):
+        """Return a discovery fixture carrying one fake adapter policy."""
+        model = _DiscoveryModel()
+        model.config = SimpleNamespace(model_type="fixture")
+        for tower in (model.text_tower, model.image_tower):
+            tower.decoder["2"] = _CheckpointableSubmodules()
+            tower.decoder["7"] = _CheckpointableSubmodules()
+        return model, SimpleNamespace(recompute=lambda: policy)
+
+    @staticmethod
+    def _apply(model, adapter, selection):
+        """Apply the layer-region mode against the fake adapter."""
+        with (
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.get_model_adapter", return_value=adapter),
+            patch(f"{_ACTIVATION_CHECKPOINT_MODULE}.checkpoint_wrapper", new=_checkpoint_wrapper),
+        ):
+            _apply_activation_checkpointing(model, "selective", selection=selection)
+
+    def test_layer_region_wraps_layer_and_excludes_declared_descendant(self):
+        """One region per layer; the named descendant stays outside the recompute."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        self.assertEqual(len(blocks), 4)
+        for block in blocks:
+            self.assertTrue(hasattr(block, "_wrapped_module"))
+            self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+            self.assertIsInstance(block.mlp, nn.Linear)
+            self.assertIsInstance(block.input_layernorm, nn.LayerNorm)
+
+    def test_layer_region_calls_model_owned_hook_once(self):
+        """The model-owned hook runs after the regions are installed."""
+        applied = []
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*decoder.*.self_attn",),
+            on_applied=applied.append,
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        self.assertEqual(applied, [model])
+
+    def test_layer_region_requires_region_patterns(self):
+        """A policy without region patterns cannot be applied."""
+        policy = RecomputePolicy(
+            region_patterns=(),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "requires RecomputePolicy.region_patterns"):
+            self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_region_requires_one_excluded_module(self):
+        """An exclude pattern that matches nothing inside the regions is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_patterns=("*image_tower.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "exclusions matched no module"):
+            self._apply(model, adapter, self._selection(layer_count=2))
+
+    def test_leaf_region_patterns_keep_one_region_per_submodule(self):
+        """Leaf patterns keep the submodule-region shape without exclusions."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.mlp", "*decoder.*.input_layernorm"),
+        )
+        model, adapter = self._model(policy)
+
+        self._apply(model, adapter, self._selection())
+
+        blocks = [
+            block for tower in (model.text_tower, model.image_tower)
+            for block in tower.decoder.values()
+        ]
+        for block in blocks:
+            self.assertTrue(hasattr(block.mlp, "_wrapped_module"))
+            self.assertTrue(hasattr(block.input_layernorm, "_wrapped_module"))
+            self.assertIsInstance(block.post_attention_layernorm, nn.LayerNorm)
+            self.assertIsInstance(block.self_attn, nn.Linear)
+        self.assertFalse(hasattr(blocks[0], "_wrapped_module"))
+
+    def test_region_root_cannot_be_excluded(self):
+        """A module declared as both a region root and an exclusion is rejected."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*.self_attn",),
+            exclude_patterns=("*decoder.*.self_attn",),
+        )
+        model, adapter = self._model(policy)
+
+        with self.assertRaisesRegex(ValueError, "is also excluded"):
+            self._apply(model, adapter, self._selection(layer_count=1))
+
+    def test_exclude_predicate_keeps_named_modules_out_of_recompute(self):
+        """An attribute rule can express exclusions that a path cannot."""
+        policy = RecomputePolicy(
+            region_patterns=("*decoder.*",),
+            exclude_predicate=lambda fqn, module: bool(getattr(module, "keeps_state", False)),
+        )
+        model, adapter = self._model(policy)
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                block.self_attn.keeps_state = True
+
+        self._apply(model, adapter, self._selection())
+
+        for tower in (model.text_tower, model.image_tower):
+            for block in tower.decoder.values():
+                self.assertIsInstance(block.self_attn, CheckpointExcludeWrapper)
+                self.assertTrue(hasattr(block, "_wrapped_module"))
 
 
 class TestActivationCheckpointSwapInputs(unittest.TestCase):

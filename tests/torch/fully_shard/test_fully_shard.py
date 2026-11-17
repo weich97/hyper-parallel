@@ -14,10 +14,13 @@
 # ============================================================================
 """test fully_shard api"""
 
+import os
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
 _TEST_FULLY_SHARD = "_test_fully_shard.py"
+_TEST_HOOK_STATE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_hook_state_machine.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -27,12 +30,16 @@ def test_fully_shard_group1():
     Description:
         1.test_fully_shard_01
         2.test_fully_shard_02
+        3.FSDP backward state and gradient accumulation on CPU/Gloo
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_01", 12342, 4),
         TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_02", 12400, 4),
     ])
+    parallel_run([
+        TorchCase(_TEST_HOOK_STATE, "test_torch_fully_shard_hook_state_machine", num_proc=2),
+    ], global_num_proc=2)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")

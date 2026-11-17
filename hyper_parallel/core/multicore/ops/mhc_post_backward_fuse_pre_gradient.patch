@@ -1,0 +1,171 @@
+diff --git a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+--- a/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
++++ b/mhc/mhc_post_backward/op_kernel/arch22/mhc_post_backward_arch22.h
+@@ -39,6 +39,8 @@
+                                        GM_ADDR grad_h_out, GM_ADDR grad_h_post,
+                                        const MhcPostBackwardTilingDataArch22 &tilingData, TPipe *pipe,
+                                        uint64_t task_offset, uint64_t task_count);
++    __aicore__ inline void EnablePreGradient(GM_ADDR residual, GM_ADDR gradInput, GM_ADDR gradCube,
++                                             GM_ADDR preCoefficients, GM_ADDR gradRsqrt, TPipe *pipe);
+     __aicore__ inline void Process();
+
+ protected:
+@@ -54,7 +56,14 @@
+     TBuf<TPosition::VECCALC> dHLPostBuf, dFOutCastBuf, dHLResBuf, dxLCastBuf;
+     TBuf<TPosition::VECCALC> dFPostResBuf, FOutBuf, xLBuf, dFOutBuf, dxLBuf;
+     TBuf<TPosition::VECCALC> dHLResTmpBuf1, dHLResTmpBuf2, dHLResTmpBuf3, dHLResTmpBuf4;
++    __aicore__ inline void LoadPreGradientTile(uint64_t token, uint32_t offset, uint32_t channels);
++    __aicore__ inline void MergePreGradient(uint32_t channels);
++
+     TBuf<TPosition::VECCALC> dxLTmpBuf2;
++    TBuf<TPosition::VECCALC> preCoefficientsBuf, preRsqrtBuf;
++    GlobalTensor<T> preResidualGm, gradInputGm;
++    GlobalTensor<float> gradCubeGm, preCoefficientsGm, gradRsqrtGm;
++    LocalTensor<float> preCoefficientsUb, preRsqrtUb;
+
+     GlobalTensor<T> dFPostResGm, directGradYGm, FOutGm, xLGm;
+     GlobalTensor<float> HLResGm, HLPostGm;
+@@ -90,6 +99,7 @@
+     uint64_t hPostSize = 0;
+     bool addDirectGrad = false;
+     bool useScalarMix = false;
++    bool fusePreGradient = false;
+     bool taskMode = false;
+     uint64_t taskOffset = 0;
+     uint64_t taskCount = 0;
+@@ -188,6 +198,61 @@
+ }
+
+ template <typename T>
++__aicore__ inline void KernelMhcPostBackward<T>::EnablePreGradient(
++    GM_ADDR residual, GM_ADDR gradInput, GM_ADDR gradCube, GM_ADDR preCoefficients, GM_ADDR gradRsqrt, TPipe *pipe)
++{
++    this->fusePreGradient = true;
++    this->preResidualGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(residual));
++    this->gradInputGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(gradInput));
++    this->gradCubeGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gradCube));
++    this->preCoefficientsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(preCoefficients));
++    this->gradRsqrtGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(gradRsqrt));
++    pipe->InitBuffer(this->preCoefficientsBuf, 32);
++    pipe->InitBuffer(this->preRsqrtBuf, 32);
++    this->preCoefficientsUb = this->preCoefficientsBuf.template Get<float>();
++    this->preRsqrtUb = this->preRsqrtBuf.template Get<float>();
++}
++
++template <typename T>
++__aicore__ inline void KernelMhcPostBackward<T>::LoadPreGradientTile(
++    uint64_t token, uint32_t offset, uint32_t channels)
++{
++    // These two buffers were the prior channel tile's BF16 output staging.
++    SetFlag<HardEvent::MTE3_MTE2>(3);
++    WaitFlag<HardEvent::MTE3_MTE2>(3);
++    const uint64_t residualOffset = token * this->n * this->channel + offset;
++    const uint16_t rows = static_cast<uint16_t>(this->n);
++    const uint32_t gap = this->channel - channels;
++    DataCopyExtParams residualCopy{rows, static_cast<uint32_t>(channels * sizeof(T)), static_cast<uint32_t>(gap * sizeof(T)), 0, 0};
++    DataCopyExtParams cubeCopy{rows, static_cast<uint32_t>(channels * sizeof(float)), static_cast<uint32_t>(gap * sizeof(float)), 0, 0};
++    DataCopyExtParams inputCopy{1, static_cast<uint32_t>(channels * sizeof(T)), 0, 0, 0};
++    DataCopyPad(this->dxLCastUb, this->preResidualGm[residualOffset], residualCopy, this->padParams);
++    DataCopyPad(this->dHLResTmp1, this->gradCubeGm[residualOffset], cubeCopy, this->padParamsFloat);
++    DataCopyPad(this->dFOutCastUb, this->gradInputGm[token * this->channel + offset], inputCopy, this->padParams);
++}
++
++template <typename T>
++__aicore__ inline void KernelMhcPostBackward<T>::MergePreGradient(uint32_t channels)
++{
++    const uint32_t values = this->n * channels;
++    Cast(this->dxLUb, this->dxLCastUb, RoundMode::CAST_NONE, values);
++    Cast(this->dFOutUb, this->dFOutCastUb, RoundMode::CAST_NONE, channels);
++    PipeBarrier<PIPE_V>();
++    for (uint32_t row = 0; row < this->n; ++row) {
++        Muls(this->dFPostResUb[row * channels], this->dFOutUb, this->preCoefficientsUb.GetValue(row), channels);
++    }
++    PipeBarrier<PIPE_V>();
++    Axpy(this->dFPostResUb, this->dxLUb, this->preRsqrtUb.GetValue(0), values);
++    PipeBarrier<PIPE_V>();
++    Add(this->dFPostResUb, this->dHLResTmp1, this->dFPostResUb, values);
++    // Preserve the former BF16 rounding boundary before adding the upstream residual gradient.
++    PipeBarrier<PIPE_V>();
++    Cast(this->dFPostResCastUb, this->dFPostResUb, RoundMode::CAST_RINT, values);
++    PipeBarrier<PIPE_V>();
++    Cast(this->dFPostResUb, this->dFPostResCastUb, RoundMode::CAST_NONE, values);
++}
++
++template <typename T>
+ __aicore__ inline void KernelMhcPostBackward<T>::Process()
+ {
+     uint64_t startIdx = this->taskOffset;
+@@ -237,7 +302,13 @@
+         DataCopyPad(this->HLPostUb, this->HLPostGm[i * this->n], copyParamsHLPostUb, this->padParamsFloat);
+         DataCopyExtParams copyParamsHLResUb{1, static_cast<uint32_t>(this->n * this->n * sizeof(float)), 0, 0, 0};
+         DataCopyPad(this->HLResUb, this->HLResGm[i * this->n * this->n], copyParamsHLResUb, this->padParamsFloat);
+-        if (this->useScalarMix) {
++        if (this->fusePreGradient) {
++            DataCopyExtParams preCopy{1, static_cast<uint32_t>(this->n * sizeof(float)), 0, 0, 0};
++            DataCopyExtParams rsqrtCopy{1, sizeof(float), 0, 0, 0};
++            DataCopyPad(this->preCoefficientsUb, this->preCoefficientsGm[i * this->n], preCopy, this->padParamsFloat);
++            DataCopyPad(this->preRsqrtUb, this->gradRsqrtGm[i], rsqrtCopy, this->padParamsFloat);
++        }
++        if (this->useScalarMix || this->fusePreGradient) {
+             SetFlag<HardEvent::MTE2_S>(3);
+             WaitFlag<HardEvent::MTE2_S>(3);
+         }
+@@ -260,8 +331,12 @@
+             DataCopyExtParams copyParamsdFPostResUb{static_cast<uint16_t>(this->n),
+                                                     static_cast<uint32_t>(this->blockChannel * sizeof(T)),
+                                                     static_cast<uint32_t>(channelStride * sizeof(T)), 0, 0};
+-            DataCopyPad(this->dFPostResCastUb, this->dFPostResGm[i * this->n * this->channel + j * this->blockChannel],
+-                        copyParamsdFPostResUb, this->padParams);
++            if (this->fusePreGradient) {
++                LoadPreGradientTile(i, j * this->blockChannel, this->blockChannel);
++            } else {
++                DataCopyPad(this->dFPostResCastUb, this->dFPostResGm[i * this->n * this->channel + j * this->blockChannel],
++                            copyParamsdFPostResUb, this->padParams);
++            }
+             DataCopyExtParams copyParamsFOutUb{1, static_cast<uint32_t>(this->blockChannel * sizeof(T)), 0, 0, 0};
+             DataCopyPad(this->FOutCastUb, this->FOutGm[i * this->channel + j * this->blockChannel], copyParamsFOutUb,
+                         this->padParams);
+@@ -281,8 +356,12 @@
+             // dHLPost : Fout @ dFPostRes.T [1, blockChannel] @ [n, blockChannel]^T
+             // 搬运量：[1, n, blockChannel] + [1, 1, blockChannel]
+             // 输出：[1, n] 驻留在ub做累加
+-            Cast(this->dFPostResUb, this->dFPostResCastUb, RoundMode::CAST_NONE,
+-                 this->n * this->blockChannel);                                                   // bf16--> fp32
++            if (this->fusePreGradient) {
++                MergePreGradient(this->blockChannel);
++            } else {
++                Cast(this->dFPostResUb, this->dFPostResCastUb, RoundMode::CAST_NONE,
++                     this->n * this->blockChannel);                                                   // bf16--> fp32
++            }
+             Cast(this->FOutUb, this->FOutCastUb, RoundMode::CAST_NONE, this->blockChannel);       // bf16--> fp32
+             Cast(this->xLUb, this->xLCastUb, RoundMode::CAST_NONE, this->n * this->blockChannel); // bf16--> fp32
+
+@@ -349,9 +428,13 @@
+             DataCopyExtParams copyParamsdFPostResUb{static_cast<uint16_t>(this->n),
+                                                     static_cast<uint32_t>(this->tailC * sizeof(T)),
+                                                     static_cast<uint32_t>(channelStride * sizeof(T)), 0, 0};
+-            DataCopyPad(this->dFPostResCastUb,
+-                        this->dFPostResGm[i * this->n * this->channel + this->loopC * this->blockChannel],
+-                        copyParamsdFPostResUb, this->padParams);
++            if (this->fusePreGradient) {
++                LoadPreGradientTile(i, this->loopC * this->blockChannel, this->tailC);
++            } else {
++                DataCopyPad(this->dFPostResCastUb,
++                            this->dFPostResGm[i * this->n * this->channel + this->loopC * this->blockChannel],
++                            copyParamsdFPostResUb, this->padParams);
++            }
+
+             DataCopyExtParams copyParamsFOutUb{1, static_cast<uint32_t>(this->tailC * sizeof(T)), 0, 0, 0};
+             DataCopyPad(this->FOutCastUb, this->FOutGm[i * this->channel + this->loopC * this->blockChannel],
+@@ -370,6 +453,10 @@
+             // dHLPost : Fout @ dFPostRes.T [1, tailC] @ [n, tailC]^T
+             // 搬运量：[1, n, tailC] + [1, 1, tailC]
+             // 输出：[1, n] 驻留在ub做累加
+-            Cast(this->dFPostResUb, this->dFPostResCastUb, RoundMode::CAST_NONE, this->n * this->tailC); // bf16--> fp32
++            if (this->fusePreGradient) {
++                MergePreGradient(this->tailC);
++            } else {
++                Cast(this->dFPostResUb, this->dFPostResCastUb, RoundMode::CAST_NONE, this->n * this->tailC); // bf16--> fp32
++            }
+             Cast(this->FOutUb, this->FOutCastUb, RoundMode::CAST_NONE, this->tailC);                     // bf16--> fp32
+             Cast(this->xLUb, this->xLCastUb, RoundMode::CAST_NONE, this->n * this->tailC);               // bf16--> fp32

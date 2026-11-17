@@ -27,9 +27,12 @@ _TILING_POS_SWIGLU  = 18
 _TILING_POS_DN_PROJ = 19
 
 
-def _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
+def _build_fwd_tensor_specs(
+    tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
+):
     """Create all TensorSpec objects for the forward graph."""
     sre = tsv.single_rank_expert_num
+    weight_is_eoi = expert_weight_layout == "EOI"
     target = TensorSpec(
         "target", [tsv.per_rank_seq, hidden_size],
         param_position=0, dtype_size=dtype_size, is_dynamic=True)
@@ -46,8 +49,11 @@ def _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
         "size_d", [tsv.all_expert_num],
         param_position=4, dtype_size=4)
     up_proj_weight = TensorSpec(
-        "up_proj_weight", [sre, hidden_size, intermediate_size * 2],
-        param_position=5, dtype_size=dtype_size, tensor_type=1)
+        "up_proj_weight",
+        ([sre, intermediate_size * 2, hidden_size]
+         if weight_is_eoi else [sre, hidden_size, intermediate_size * 2]),
+        param_position=5, dtype_size=dtype_size, tensor_type=1,
+        transpose=weight_is_eoi)
     up_proj_glist = TensorSpec(
         "up_proj_glist", [sre],
         param_position=6, dtype_size=8)
@@ -58,8 +64,11 @@ def _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
         "swiglu_out", [tsv.per_rank_seq, intermediate_size],
         param_position=8, dtype_size=dtype_size, tensor_type=1, is_dynamic=True)
     down_proj_weight = TensorSpec(
-        "down_proj_weight", [sre, intermediate_size, hidden_size],
-        param_position=9, dtype_size=dtype_size, tensor_type=1)
+        "down_proj_weight",
+        ([sre, hidden_size, intermediate_size]
+         if weight_is_eoi else [sre, intermediate_size, hidden_size]),
+        param_position=9, dtype_size=dtype_size, tensor_type=1,
+        transpose=weight_is_eoi)
     down_proj_glist = TensorSpec(
         "down_proj_glist", [sre],
         param_position=10, dtype_size=8)
@@ -85,7 +94,7 @@ def _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size):
 
 
 def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
-                   down_proj_sv, combine_sv, num_cube_cores):
+                   down_proj_sv, combine_sv, num_cube_cores, swiglu_limit=None):
     """Create all OperatorNode objects for the forward graph."""
     (target, target_offset, src, src_offset, size_d,
      up_proj_weight, up_proj_glist, up_proj_y, swiglu_out,
@@ -129,7 +138,7 @@ def _build_fwd_ops(tsv, specs, *, dispatch_sv, up_proj_sv, swiglu_sv,
             task_num_fn=lambda tsv: (tsv.per_expert_seq // swiglu_sv) * tsv.single_rank_expert_num,
         ),
         tiling_position=_TILING_POS_SWIGLU,
-        fill_config=SwiGLUFillConfig(),
+        fill_config=SwiGLUFillConfig(clamp_limit=swiglu_limit),
     )
     down_proj = OperatorNode(
         name="down_proj", op_type=OpType.GMM,
@@ -168,7 +177,9 @@ def build_forward_graph(tsv, *,
                         hidden_size:       int = 7168,
                         intermediate_size: int = 2048,
                         dtype_size:        int = 2,
-                        num_cube_cores:    int = 24) -> ComputeGraph:
+                        num_cube_cores:    int = 24,
+                        swiglu_limit:      float | None = None,
+                        expert_weight_layout: str = "EIO") -> ComputeGraph:
     """Build the MoE-FFN forward DAG: dispatch -> up_proj -> swiglu -> down_proj -> combine.
 
     Operator execution order and param_positions (C++ memory slots):
@@ -189,15 +200,23 @@ def build_forward_graph(tsv, *,
         intermediate_size: FFN intermediate dimension after SwiGLU halving.
         dtype_size: bytes per activation element (2=bf16, 4=fp32).
         num_cube_cores: number of AIC cube cores on the target device.
+        swiglu_limit: optional positive clamp limit for SwiGLU; ``None`` keeps
+            the original unclamped operator path.
+        expert_weight_layout: Logical expert-weight axis order, either ``"EIO"`` or ``"EOI"``.
 
     Returns:
         A fully-connected ComputeGraph ready for propagate_splits().
     """
-    specs = _build_fwd_tensor_specs(tsv, hidden_size, intermediate_size, dtype_size)
+    if expert_weight_layout not in ("EIO", "EOI"):
+        raise ValueError(f"expert_weight_layout must be 'EIO' or 'EOI', got {expert_weight_layout!r}.")
+    specs = _build_fwd_tensor_specs(
+        tsv, hidden_size, intermediate_size, dtype_size, expert_weight_layout
+    )
     dispatch, up_proj, swiglu, down_proj, combine = _build_fwd_ops(
         tsv, specs,
         dispatch_sv=dispatch_sv, up_proj_sv=up_proj_sv, swiglu_sv=swiglu_sv,
         down_proj_sv=down_proj_sv, combine_sv=combine_sv, num_cube_cores=num_cube_cores,
+        swiglu_limit=swiglu_limit,
     )
     graph = ComputeGraph()
     (graph.add_op(dispatch).add_op(up_proj).add_op(swiglu).add_op(down_proj).add_op(combine)

@@ -21,7 +21,8 @@ Contains the user-visible plan/spec data model (05 §3.1/§3.2 canonical):
 - ``PlacementMismatchError``: error for placement declarations inconsistent with DTensor propagation;
 - ``resolve_placements`` / ``parse_placement`` / ``parse_named_placement`` / ``_normalize_out_fields``:
   placement utilities;
-- the injection DSL (``local_compute`` / ``inner_wrapper`` decorators,
+- the injection DSL (``forward_replacement`` / ``local_compute`` /
+  ``inner_wrapper`` decorators,
   ``InjectionMeta``, ``require_injection_meta``): the recipe-side input
   contract of the explicit injection mechanism.
 
@@ -393,13 +394,13 @@ class ModuleShardingSpec:
     # declare local_compute_fn explicitly (e.g. Target → an EP archetype
     # factory such as recipes.qwen2moe_ep_compute_fn).
     _ep_stack: Dict[str, List[str]] = field(default_factory=dict)
-    # D-10 (05 §6.4.8): TP-extend-EP parameter-sharding marker. When >0 this is
-    # the extended EP group size (= ep_size; the a2a communication domain
-    # includes TP ranks); the MoE uses an SP-in identity boundary + a derived
-    # expert mesh (edp, ep); expert weights are only Shard(0) along the expert
-    # dim. It drives ONLY the parameter sharding/expert-mesh derivation — the
-    # compute must be injected explicitly (apply-time preflight fails fast
-    # otherwise).
+    # D-10 (05 §6.4.8): virtual/TP-extended EP parameter-sharding marker. When
+    # >0 this is the extended EP group size (= ep_size; the a2a communication
+    # domain includes TP/CP ranks) and a derived expert mesh (edp, ep) owns
+    # every parameter whose placement explicitly contains ``EP: Shard(...)``.
+    # Routed MoE experts and sparse lookup tables share this generic source-
+    # layout path. It drives ONLY parameter sharding/expert-mesh derivation —
+    # matching all-to-all compute must be injected explicitly.
     _ep_size: int = 0
 
 
@@ -614,6 +615,19 @@ def _make_decorator(kind: str) -> Callable[[Callable[..., Any]], Callable[..., A
 
 local_compute = _make_decorator(LOCAL_COMPUTE)
 inner_wrapper = _make_decorator(INNER_WRAPPER)
+
+
+def forward_replacement(factory: Callable[..., Callable[..., Any]]) -> Callable[..., Callable[..., Any]]:
+    """Declare a forward factory hosted by the local-region executor.
+
+    Args:
+        factory: Called once at plan application with the mesh family; returns
+            an unbound compute function whose first argument is the module.
+
+    Returns:
+        The decorated factory with existing local-compute metadata.
+    """
+    return local_compute(factory)
 
 
 def require_injection_meta(fn: Callable[..., Any], kind: str, *, source: str) -> InjectionMeta:

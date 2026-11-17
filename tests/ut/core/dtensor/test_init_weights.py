@@ -35,6 +35,57 @@ def _fake_init_on_device(device, include_buffers=False):
 class TestInitEmptyWeights(unittest.TestCase):
     """Tests for InitEmptyWeights."""
 
+    def test_deterministic_meta_construction_does_not_fill_discarded_storage(self):
+        """Feature: Empty parameter initialization under deterministic algorithms.
+
+        Description: Inspect real factory calls while constructing a meta Linear.
+        Expectation: Skip filling discarded CPU storage and preserve deterministic algorithms.
+        """
+        enabled = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        fill = torch.utils.deterministic.fill_uninitialized_memory
+        original_empty = torch.empty
+        observed = []
+
+        def _observed_empty(*args, **kwargs):
+            observed.append(torch.utils.deterministic.fill_uninitialized_memory)
+            return original_empty(*args, **kwargs)
+
+        try:
+            torch.use_deterministic_algorithms(True)
+            torch.utils.deterministic.fill_uninitialized_memory = True
+            with patch.object(torch, "empty", side_effect=_observed_empty):
+                with init_weights_module.init_empty_weights():
+                    module = torch.nn.Linear(32, 32)
+            self.assertTrue(module.weight.is_meta, "The parameter must retain no physical storage")
+            self.assertTrue(observed, "Real tensor factories must execute during construction")
+            self.assertFalse(any(observed), "Discarded CPU allocations must not be filled")
+            self.assertTrue(torch.are_deterministic_algorithms_enabled(), "Keep deterministic algorithms enabled")
+            self.assertTrue(torch.utils.deterministic.fill_uninitialized_memory, "Restore the caller's fill policy")
+        finally:
+            torch.utils.deterministic.fill_uninitialized_memory = fill
+            torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+    def test_nested_empty_context_restores_fill_policy_after_exception(self):
+        """Feature: Scoped deterministic initialization state.
+
+        Description: Raise inside nested empty initialization for both caller fill policies.
+        Expectation: Restore the original fill policy even on exceptional exit.
+        """
+        original_fill = torch.utils.deterministic.fill_uninitialized_memory
+        try:
+            for fill in (True, False):
+                with self.subTest(fill=fill):
+                    torch.utils.deterministic.fill_uninitialized_memory = fill
+                    with self.assertRaisesRegex(RuntimeError, "construction failed"):
+                        with init_weights_module.init_empty_weights():
+                            with init_weights_module.init_empty_weights():
+                                raise RuntimeError("construction failed")
+                    self.assertEqual(torch.utils.deterministic.fill_uninitialized_memory, fill,
+                                     "Nested or exceptional construction must preserve caller state")
+        finally:
+            torch.utils.deterministic.fill_uninitialized_memory = original_fill
+
     @patch(_INIT_ON_DEVICE_TARGET, MagicMock(side_effect=_fake_init_on_device))
     def test_default_include_buffers_false(self):
         """Test default include buffers false."""

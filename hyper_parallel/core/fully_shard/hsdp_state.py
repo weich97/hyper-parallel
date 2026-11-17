@@ -229,7 +229,7 @@ class HSDPStateV2:
         )
 
     def _init_mp_dtypes(self):
-        """Initialize mixed-precision dtypes for all managed parameters."""
+        """Initialize dtype attributes for each parameter from the mixed-precision policy."""
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
 
@@ -344,7 +344,8 @@ class HSDPStateV2:
         params_to_reduce = []
         for hsdp_param in self.hsdp_params:
             skip_param = (
-                not hsdp_param.unsharded_param_buffers
+                not hasattr(hsdp_param, "_unsharded_param")
+                or not hsdp_param.unsharded_param_buffers
                 or not hsdp_param.sharded_param.requires_grad
                 or (
                     hsdp_param.unsharded_param.grad is None
@@ -485,6 +486,13 @@ class HSDPStateV2:
             elif pre_hsdp_param.reduce_partial_output is not None:
                 reduced_grad.add_(pre_hsdp_param.reduce_partial_output)
                 pre_hsdp_param.reduce_partial_output = None
+
+            if self.requires_all_reduce and hasattr(pre_hsdp_param.sharded_param, "_hp_staged_main_grad"):
+                # Consume the compact partial while this layer's reduced gradient is live.
+                pre_hsdp_param.all_reduce_source_replicate_grad_inplace(reduced_grad, self.reduce_op_type)
+                need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad)
+                pre_hsdp_param.clear_reduce_scatter_output()
+                self._sync_current_stream_if_needed(need_synchronize)
 
             if pre_hsdp_param.unsharded_accumulated_grad_data is not None:
                 pre_hsdp_param.unsharded_accumulated_grad = None

@@ -8,6 +8,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.18)
+
+# CMake must identify Bisheng during project configuration. Switching compilers
+# after project() leaves GNU-generated linker flags in the Bisheng link command.
+set(CMAKE_C_COMPILER bisheng)
+set(CMAKE_CXX_COMPILER bisheng)
 project(hyper_parallel_shmem_ops)
 
 # Build the SHMEM op device kernels and their host launchers into one fat
@@ -40,10 +45,6 @@ if(NOT DEFINED ENV{SHMEM_SOURCE_DIR})
 else()
     set(SHMEM_SOURCE_DIR $ENV{SHMEM_SOURCE_DIR})
 endif()
-
-set(CMAKE_COMPILER bisheng)
-set(CMAKE_C_COMPILER ${CMAKE_COMPILER})
-set(CMAKE_CXX_COMPILER ${CMAKE_COMPILER})
 
 add_compile_options(
     -O2 -std=c++17
@@ -128,6 +129,9 @@ target_link_libraries(hyper_parallel_shmem_ops PRIVATE hyper_parallel_shmem)
 hp_enable_link_hardening(hyper_parallel_shmem_ops)
 
 install(TARGETS hyper_parallel_shmem_ops LIBRARY DESTINATION lib)
+install(CODE [[
+    file(RPATH_REMOVE FILE "${CMAKE_INSTALL_PREFIX}/lib/libhyper_parallel_shmem_ops.so")
+]])
 # Stage the private SHMEM SDK libraries next to the kernel library so the
 # install tree is self-contained even when the legacy ops phase is removed.
 file(GLOB SHMEM_SO_FILES "${SHMEM_HOME_PATH}/shmem/lib/*")

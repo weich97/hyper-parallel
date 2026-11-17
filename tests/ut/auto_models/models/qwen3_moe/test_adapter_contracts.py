@@ -22,10 +22,10 @@ Post-M5 state (adjust doc §5.1-§5.3, M5): the legacy
 Qwen3-MoE rule lives at exactly one adapter home:
 
 * the ``@module_replacement`` factories in
-  ``models/qwen3_moe/adapter/replacements.py`` (declaring the generic
+  ``models/qwen3_moe/adapter/conversion/module_replacement.py`` (declaring the generic
   ``modules.RMSNorm`` / ``modules.GQAAttention`` entries);
 * the Qwen mask/cache attention contract in
-  ``models/qwen3_moe/adapter/attention.py``;
+  ``models/qwen3_moe/adapter/runtime/attention.py``;
 * the fused ``@inner_wrapper`` CP wrappers in
   ``adapter/distributed/context_parallel.py`` and the async (whole-forward,
   HF-structure) wrappers in ``adapter/distributed/context_parallel_async.py``
@@ -67,13 +67,11 @@ from hyper_parallel.distributed.recipe_spec import (
     INNER_WRAPPER,
     LOCAL_COMPUTE,
 )
-from hyper_parallel.models.qwen3_moe.adapter import (
-    attention as adapter_attention,
+from hyper_parallel.models.qwen3_moe.adapter.conversion import (
+    module_replacement as adapter_replacements,
 )
-from hyper_parallel.models.qwen3_moe.adapter import (
-    replacements as adapter_replacements,
-)
-from hyper_parallel.models.qwen3_moe.adapter.attention import (
+from hyper_parallel.models.qwen3_moe.adapter.runtime import attention as adapter_attention
+from hyper_parallel.models.qwen3_moe.adapter.runtime.attention import (
     run_qwen3_moe_flash_attention,
 )
 from hyper_parallel.models.qwen3_moe.adapter.distributed import (
@@ -302,13 +300,9 @@ class TestCpWrapperContracts(unittest.TestCase):
                 target.config = SimpleNamespace(
                     num_attention_heads=4, num_key_value_heads=2
                 )
-                sentinel_interface = lambda *args, **kwargs: None  # noqa: E731
+                sentinel_interface = unittest.mock.Mock()
                 target.attention_interface = sentinel_interface
-                calls = []
-
-                def recording_forward(*args, **kwargs):
-                    calls.append((args, kwargs))
-                    return "sentinel-output"
+                recording_forward = unittest.mock.Mock(return_value="sentinel-output")
 
                 target.forward = recording_forward
                 request = getattr(adapter_context_parallel, name)(
@@ -324,7 +318,7 @@ class TestCpWrapperContracts(unittest.TestCase):
                 self.assertIs(target.attention_interface, sentinel_interface)
                 # the returned forward passes through to the original forward
                 self.assertIs(request.forward("a", key=1), "sentinel-output")
-                self.assertEqual(calls, [(("a",), {"key": 1})])
+                recording_forward.assert_called_once_with("a", key=1)
 
 
 def _hf_structure_attention():
@@ -425,6 +419,26 @@ class TestAsyncCpWrapperContracts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_async_cp_expands_2d_padding_mask(self):
+        """A HuggingFace padding mask should become a local causal mask."""
+        query = torch.zeros(2, 2, 3, 4)
+        key = torch.zeros(2, 2, 6, 4)
+        padding_mask = torch.tensor([[1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0]])
+
+        mask = adapter_context_parallel_async._prepare_qwen3_moe_attention_mask(
+            padding_mask,
+            query,
+            key,
+            query_offset=3,
+        )
+
+        self.assertEqual(mask.shape, (2, 1, 3, 6))
+        self.assertEqual(mask.dtype, torch.bool)
+        self.assertFalse(mask[0, :, :, -1].any())
+        self.assertFalse(mask[1, :, :, -2:].any())
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_async_wrappers_return_rewrite_requests_without_mutating_forward(self):
         """M5: the async wrappers return a request and never assign forward.
 
@@ -471,12 +485,16 @@ class TestEpFactoryContract(unittest.TestCase):
         parameters = list(inspect.signature(factory).parameters.values())
         self.assertEqual(
             [param.name for param in parameters],
-            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm"],
+            ["module", "mesh", "tp_mesh", "cp_mesh", "ep_mesh", "use_grouped_gemm",
+             "fix_router"],
         )
         for param in parameters:
             self.assertIs(param.kind, inspect.Parameter.KEYWORD_ONLY)
-        for param in parameters[:-1]:
+        for param in parameters[:-2]:
             self.assertIs(param.default, inspect.Parameter.empty)
+        # Both switches are opt-in: an existing recipe keeps the real router and the
+        # eager per-expert loop unless it asks otherwise.
+        self.assertIs(parameters[-2].default, False)
         self.assertIs(parameters[-1].default, False)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -507,6 +525,7 @@ class TestFlashAttentionMaskBranches(unittest.TestCase):
     """Mask/cache branches of ``run_qwen3_moe_flash_attention`` (Ascend kernel)."""
 
     def _run(self, query, key, value, attention_mask, module=None):
+        """Run the attention helper with a recording ``torch_npu`` stub."""
         stub = _AttentionNpuStub()
         with unittest.mock.patch.dict(sys.modules, {"torch_npu": stub}):
             output, weights = run_qwen3_moe_flash_attention(

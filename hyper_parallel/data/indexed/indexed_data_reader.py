@@ -12,33 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Read token sequences from paired ``.idx/.bin`` files."""
+"""Read indexed token files and prepared Arrow records."""
 
 from __future__ import annotations
 
 import os
 import struct
 import time
+from collections.abc import Mapping
 from functools import lru_cache
-from typing import ClassVar
+from pathlib import Path
+from typing import Any, ClassVar
 
 import numpy as np
 
+from hyper_parallel.data.constants import INDEX_DTYPE_CODES, INDEX_HEADER, INDEX_VERSION
 from hyper_parallel.data.dataset_logging import get_dataset_logger
-logger = get_dataset_logger(__name__)
 
-_INDEX_HEADER = b"MMIDIDX\x00\x00"
-_INDEX_VERSION = 1
-_DTYPES = {
-    1: np.uint8,
-    2: np.int8,
-    3: np.int16,
-    4: np.int32,
-    5: np.int64,
-    6: np.float64,
-    7: np.float32,
-    8: np.uint16,
-}
+logger = get_dataset_logger(__name__)
 
 
 class _IndexReader:
@@ -48,16 +39,16 @@ class _IndexReader:
         """Parse and memory-map one index metadata file."""
         # Read the fixed-size header, which describes how the following index arrays are decoded.
         with open(idx_path, "rb") as stream:
-            header = stream.read(len(_INDEX_HEADER))
-            if header != _INDEX_HEADER:
+            header = stream.read(len(INDEX_HEADER))
+            if header != INDEX_HEADER:
                 raise ValueError(f"Invalid indexed Dataset header in {idx_path!r}")
 
             version = struct.unpack("<Q", stream.read(8))[0]
-            if version != _INDEX_VERSION:
-                raise ValueError(f"Unsupported indexed Dataset version {version}; expected {_INDEX_VERSION}")
+            if version != INDEX_VERSION:
+                raise ValueError(f"Unsupported indexed Dataset version {version}; expected {INDEX_VERSION}")
 
             dtype_code = struct.unpack("<B", stream.read(1))[0]
-            self.dtype = np.dtype(_DTYPES[dtype_code])
+            self.dtype = np.dtype(INDEX_DTYPE_CODES[dtype_code])
             self.dtype_size = self.dtype.itemsize
 
             self.sequence_count = struct.unpack("<Q", stream.read(8))[0]
@@ -285,3 +276,25 @@ class IndexedDataReader:
         if self.index is None:
             raise ValueError("Indexed Dataset metadata is not initialized")
         return self.index
+
+
+class ArrowDataReader:
+    """Memory-map one Arrow file, the low-level source of one SFT Dataset."""
+
+    def __init__(self, dataset_path: str) -> None:
+        """Open one HF Arrow IPC stream; directory discovery belongs to the builder."""
+        path = Path(dataset_path)
+        if path.suffix != ".arrow" or not path.is_file():
+            raise ValueError("ArrowDataReader requires one .arrow file, not a directory")
+        # Keep the HF dependency out of Trainer and bin/idx import paths.
+        from datasets import Dataset  # pylint: disable=C0415
+
+        self.dataset = Dataset.from_file(str(path))
+
+    def __len__(self) -> int:
+        """Return the number of complete prepared records in this file."""
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Mapping[str, Any]:
+        """Return source columns for one record, including labels and boundaries."""
+        return self.dataset[int(index)]

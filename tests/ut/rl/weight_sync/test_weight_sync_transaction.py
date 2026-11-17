@@ -16,39 +16,37 @@
 # pylint: disable=forbidden-backend-import,missing-public-docstring,missing-public-type-hints,protected-access
 
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
+import weakref
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles.weight_sync import vllm_worker
-from rl.roles.weight_sync.layout import pack_direct_bucket
-from rl.roles.weight_sync.packed_weight import PackedWeightAck
-from rl.roles.weight_sync.sync import (
+from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
+from rl.weight_sync import transfer as transfer_module
+from rl.weight_sync import vllm_worker
+from rl.weight_sync.packed_weight import PackedWeightAck
+from rl.weight_sync.sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
     coordinator_call,
     synchronized_call,
 )
-from rl.roles.weight_sync.transfer import (
-    DirectReshardStrategy,
-    FullGatherStrategy,
-    WeightPublisher,
-    WeightSource,
-)
-from rl.roles.weight_sync.vllm_client import VLLMWeightSyncClientMixin
+from rl.weight_sync.transfer import WeightPublisher, WeightSource
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 
 
 def _model():
     return resolve_vllm_model(ModelRegistration(
         "qwen", "qwen3", "/model", "/tokenizer",
         "Qwen3ForCausalLM", "qwen3", "qwen3", False,
-    ), "hyper")
+    ), "native")
 
 
 @pytest.fixture(autouse=True)
-def cpu_runtime(monkeypatch):
+def cpu_runtime(monkeypatch: Any) -> Any:
     """Provide a single-rank CPU runtime for real weight publication tests."""
     handle = SimpleNamespace(
         current_device=lambda: 0,
@@ -90,8 +88,10 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
         self.resume_failure = False
         self.workers = []
 
-        def make_loader(parameter_map, worker_rank):
-            def load_weights(weights, require_all=True):
+        def make_loader(parameter_map: Any, worker_rank: Any) -> Any:
+            """Construct the scripted weight loader."""
+            def load_weights(weights: Any, require_all: Any=True) -> Any:
+                """Apply the fixture weight payload."""
                 del require_all
                 loaded = set()
                 for name, value in weights:
@@ -121,60 +121,75 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
                 model_runner=SimpleNamespace(get_model=lambda value=model: value),
                 model_config=SimpleNamespace(
                     hf_config=SimpleNamespace(
-                        architectures=["HyperQwen3ForCausalLM"]
+                        architectures=["Qwen3ForCausalLM"]
                     )
                 ),
                 _check_weight_transfer_engine=lambda: None,
                 _weight_update_active=False,
-                _hyper_loaded_policy_version=0,
-                _hyper_pending_policy_version=None,
+                _rl_loaded_policy_version=0,
+                _rl_pending_policy_version=None,
                 tp_rank=rank,
             ))
 
-    def get_world_size(self, base_url=None):
+    def get_world_size(self, base_url: Any=None) -> Any:
+        """Represent the scripted get world size boundary."""
+        del base_url
         return 2
 
-    def pause(self):
+    def pause(self) -> Any:
+        """Represent the scripted pause boundary."""
         self.events.append("pause")
         self.paused = True
 
-    def is_paused(self):
+    def is_paused(self) -> Any:
+        """Represent the scripted is paused boundary."""
         return self.paused
 
-    def sleep(self, level=1, mode="wait"):
-        del level, mode
+    def sleep(self, level: Any=1, mode: Any='wait') -> Any:
+        """Represent the scripted sleep boundary."""
+        del mode
         self.events.append("sleep")
         self.sleeping = True
         self.paused = True
+        if level == 2:
+            for worker in self.workers:
+                for parameter in worker.parameters.values():
+                    parameter.fill_(float("nan"))
 
-    def is_sleeping(self):
+    def is_sleeping(self) -> Any:
+        """Represent the scripted is sleeping boundary."""
         return self.sleeping
 
-    def wake_up(self, tags):
+    def wake_up(self, tags: Any) -> Any:
+        """Represent the scripted wake up boundary."""
         self.events.append("wake:" + ",".join(tags))
         self.sleeping = False
 
-    def resume(self):
+    def resume(self) -> Any:
+        """Represent the scripted resume boundary."""
         self.events.append("resume")
         self.paused = False
         if self.resume_failure:
             raise RuntimeError("resume failed")
 
-    def start_weight_update(self):
+    def start_weight_update(self) -> Any:
+        """Represent the scripted start weight update boundary."""
         self.events.append("start")
         for worker in self.workers:
             worker._weight_update_active = True
-            worker._hyper_pending_policy_version = None
+            worker._rl_pending_policy_version = None
 
-    def finish_weight_update(self):
+    def finish_weight_update(self) -> Any:
+        """Represent the scripted finish weight update boundary."""
         self.events.append("finish")
         for worker in self.workers:
             vllm_worker._finish_custom_weight_update(worker)
 
-    def collective_rpc(self, method, kwargs=None, base_url=None):
+    def collective_rpc(self, method: Any, kwargs: Any=None, base_url: Any=None) -> Any:
+        """Represent the scripted collective rpc boundary."""
         del kwargs, base_url
         self.rpc_methods.append(method)
-        if method == "get_direct_reshard_layout":
+        if method == "_native_weight_layout":
             return [self._layout(worker) for worker in self.workers]
         if method == "get_policy_version":
             return [vllm_worker.get_policy_version(worker) for worker in self.workers]
@@ -201,16 +216,6 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
             ],
         }
 
-    def apply(self, rank, metadata, packed, version):
-        worker = self.workers[rank]
-        vllm_worker._validate_update(worker, version, transport="CPU test")
-        vllm_worker._apply_direct_bucket(
-            worker.parameters,
-            packed,
-            metadata,
-            transport="CPU test",
-        )
-        worker._hyper_pending_policy_version = version
 
 
 class TensorTransport:
@@ -221,26 +226,28 @@ class TensorTransport:
         self.fail = False
         self.closed = False
 
-    def prepare(self, unused_client, destination_tp_size):
+    def prepare(self, unused_client: Any, destination_tp_size: Any) -> Any:
+        """Prepare the fixture state for the operation."""
         del unused_client
         if destination_tp_size != 2:
             raise ValueError("unexpected destination size")
 
-    def prepare_packed(self, unused_client):
+    def prepare_packed(self, unused_client: Any) -> Any:
+        """Prepare the packed transport fixture."""
         del unused_client
         return "packed"
 
-    def transfer_direct(self, client, state, plan, version):
-        for (unused_source, target), buckets in plan.buckets.items():
-            for bucket in buckets:
-                packed = pack_direct_bucket(state, bucket, torch.device("cpu"))
-                client.apply(target, bucket.worker_metadata(), packed, version)
-                if self.fail:
-                    raise RuntimeError("direct transfer failed")
 
     def send_packed_bucket(
-        self, client, unused_context, index, metadata, total_bytes, packed, version,
-    ):
+        self,
+        client: Any,
+        unused_context: Any,
+        index: Any,
+        metadata: Any,
+        total_bytes: Any,
+        packed: Any,
+        version: Any,
+    ) -> Any:
         """Load a complete packed bucket into each in-process worker."""
         del unused_context
         assert packed is not None and packed.numel() == total_bytes
@@ -251,31 +258,23 @@ class TensorTransport:
                 transport="CPU packed test",
             )
             vllm_worker._load_packed_weights(worker, packed, metadata)
-            worker._hyper_pending_policy_version = version
+            worker._rl_pending_policy_version = version
         if self.fail:
             raise RuntimeError("full-gather transfer failed")
         return PackedWeightAck(index, total_bytes, len(client.workers))
 
-    def close(self):
+    def close(self) -> Any:
+        """Release the fixture-owned service."""
         self.closed = True
 
 
-def _publication(deployment, strategy):
+def _publication(deployment, strategy, *, sleep_level=1):
     """Assemble an in-process publisher, transport and versioned worker client."""
     source = WeightSource(_model(), 16)
-    selected = (
-        DirectReshardStrategy(
-            source,
-            data_parallel_size=1,
-            tensor_parallel_size=2,
-        )
-        if strategy == "direct_reshard"
-        else FullGatherStrategy(source)
-    )
     wire = TensorTransport("ipc" if deployment == "colocated" else "hccl")
-    publisher = WeightPublisher(selected, wire)
+    publisher = WeightPublisher(source, wire)
     client = LocalWorkers()
-    controller = ActorRolloutWeightSync("qwen", deployment, lambda: client, publisher)
+    controller = ActorRolloutWeightSync("qwen", deployment, lambda: client, publisher, sleep_level=sleep_level)
     state = {
         "model.norm.weight": torch.arange(4, dtype=torch.float32) + 1,
         "model.layers.0.mlp.down_proj.weight": (
@@ -300,7 +299,7 @@ def _assert_parameters(client, state):
 
 
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
-@pytest.mark.parametrize("strategy", ["direct_reshard", "full_gather"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_publication_writes_parameters_and_commits_version(deployment, strategy):
     """Verify parameter contents and policy commit across deployment and strategy combinations."""
     publisher, wire, client, controller, state = _publication(deployment, strategy)
@@ -312,7 +311,7 @@ def test_publication_writes_parameters_and_commits_version(deployment, strategy)
     _assert_parameters(client, state)
     assert controller.policy_version == 1
     assert publisher.last_strategy == strategy
-    assert ("get_direct_reshard_layout" in client.rpc_methods) is (
+    assert ("_native_weight_layout" in client.rpc_methods) is (
         strategy == "direct_reshard"
     )
     assert client.events.index("start") < client.events.index("finish")
@@ -322,7 +321,7 @@ def test_publication_writes_parameters_and_commits_version(deployment, strategy)
 
 
 @pytest.mark.parametrize("deployment", ["colocated", "disjoint"])
-@pytest.mark.parametrize("strategy", ["direct_reshard", "full_gather"])
+@pytest.mark.parametrize("strategy", ["full_gather"])
 def test_transfer_failure_propagates_without_recovery(deployment, strategy):
     """Verify transfer errors propagate without committing or attempting compensation."""
     publisher, wire, client, controller, state = _publication(deployment, strategy)
@@ -352,27 +351,91 @@ def test_resume_failure_propagates_without_compensation(deployment):
     assert client.events[-1] == "resume"
 
 
+@pytest.mark.parametrize("failure", ["request", "residency"])
+def test_failed_sleep_prevents_publication_and_resume(failure: str) -> None:
+    """A failed sleep request or false residency check stops the switching sequence."""
+    publisher, _, client, controller, state = _publication("colocated", "full_gather")
+    client.sleep = Mock(side_effect=RuntimeError("sleep failed") if failure == "request" else None)
+    with pytest.raises(RuntimeError, match="sleep"):
+        controller.prepare_for_training()
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+        controller.prepare_for_rollout()
+    assert not client.events, f"Unexpected operations after sleep failure: actual={client.events}, expected=[]"
+    assert controller.policy_version == 0, f"Published version: actual={controller.policy_version}, expected=0"
+    assert publisher.last_strategy is None, f"Publication succeeded: actual={publisher.last_strategy}, expected=None"
+
+
+@pytest.mark.parametrize("failure", ["finish", "wrong_version", "disagreeing_workers"])
+def test_failed_commit_or_version_check_prevents_resume(failure: str) -> None:
+    """Transferred weights stay inaccessible when commit or worker agreement fails."""
+    publisher, _, client, controller, state = _publication("colocated", "full_gather")
+    finish = client.finish_weight_update
+
+    def finish_update() -> None:
+        """Inject failure at the commit boundary after real CPU weight transfer."""
+        if failure == "finish":
+            raise RuntimeError("finish failed")
+        finish()
+        for worker in client.workers:
+            worker._rl_loaded_policy_version = 0
+        if failure == "disagreeing_workers":
+            client.workers[0]._rl_loaded_policy_version = 1
+
+    client.finish_weight_update = finish_update
+    controller.prepare_for_training()
+    with pytest.raises(RuntimeError):
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+        controller.prepare_for_rollout()
+    _assert_parameters(client, state)
+    assert client.paused, f"Admission state: actual={client.paused}, expected=True"
+    assert "resume" not in client.events, f"Unexpected resume after {failure}: actual={client.events}"
+    assert controller.policy_version == 0, f"Published version: actual={controller.policy_version}, expected=0"
+    assert publisher.last_strategy is None, f"Publication succeeded: actual={publisher.last_strategy}, expected=None"
+
+
+def test_graph_refresh_failure_during_kv_wake_cannot_expose_transferred_policy():
+    """Worker recapture failure leaves admission closed and the controller version unchanged."""
+    unused_publisher, unused_wire, client, controller, state = _publication("colocated", "full_gather")
+    controller.prepare_for_training()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    original_wake = client.wake_up
+
+    def fail_capture(tags: Any) -> Any:
+        """Raise the injected graph-capture failure."""
+        original_wake(tags)
+        if "kv_cache" in tags:
+            raise RuntimeError("worker graph recapture failed")
+
+    client.wake_up = fail_capture
+    with pytest.raises(RuntimeError, match="graph recapture failed"):
+        controller.prepare_for_rollout()
+    assert controller.policy_version == 0, (
+        f"Unexpected published version: actual={controller.policy_version}, expected=0")
+    assert client.paused, f"Admission reopened after graph failure: actual={client.paused}, expected=True"
+    assert "resume" not in client.events, f"Unexpected resume after graph failure: actual={client.events}"
+
+
 def test_strategies_cache_plans_and_reject_missing_sources():
     """Verify plan reuse and rejection of a missing source model."""
-    for strategy_name in ("direct_reshard", "full_gather"):
+    for strategy_name in ("full_gather",):
         publisher, wire, client, unused_controller, state = _publication(
             "disjoint", strategy_name
         )
-        publisher.strategy.prepare(client, state, wire)
+        publisher.prepare(client, state, wire)
         plan = (
-            publisher.strategy._plan
+            publisher._plan
             if strategy_name == "direct_reshard"
-            else publisher.strategy._buckets
+            else publisher._buckets
         )
-        publisher.strategy.prepare(client, state, wire)
+        publisher.prepare(client, state, wire)
         cached = (
-            publisher.strategy._plan
+            publisher._plan
             if strategy_name == "direct_reshard"
-            else publisher.strategy._buckets
+            else publisher._buckets
         )
         assert cached is plan
         with pytest.raises(ValueError, match="missing"):
-            publisher.strategy.prepare(
+            publisher.prepare(
                 client,
                 {"model.norm.weight": state["model.norm.weight"]},
                 wire,
@@ -380,9 +443,107 @@ def test_strategies_cache_plans_and_reject_missing_sources():
 
 
 def test_coordinator_and_synchronized_failures_are_not_swallowed():
-    def fail():
+    def fail() -> Any:
+        """Raise the injected operation failure."""
         raise ValueError("local operation failed")
 
     for call in (coordinator_call, synchronized_call):
         with pytest.raises(ValueError, match="local operation failed"):
             call("test", fail)
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+def test_coordinator_broadcasts_only_one_payload(monkeypatch: pytest.MonkeyPatch, rank: int) -> None:
+    """Share coordinator data without padding a full payload for every rank."""
+    payload = {"group": b"complete serialized episode"}
+    callbacks, broadcasts = [], []
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 8)
+
+    def gather_errors(results: list[Any], error: Any) -> None:
+        """Only error metadata participates in the all-rank gather."""
+        assert error is None
+        results[:] = [None] * 8
+
+    def broadcast(values: list[Any], src: int) -> None:
+        """Represent one source object delivered to either training rank."""
+        assert src == 0 and len(values) == 1
+        assert values[0] == (payload if rank == 0 else None)
+        broadcasts.append(src)
+        values[0] = payload
+
+    def produce() -> dict:
+        """Execute solely on the coordinator."""
+        callbacks.append(rank)
+        return payload
+
+    monkeypatch.setattr(dist, "all_gather_object", gather_errors)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    assert coordinator_call("share group", produce) == payload
+    assert broadcasts == [0]
+    assert callbacks == ([0] if rank == 0 else [])
+
+
+def test_full_gather_releases_acknowledged_payload_before_next_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An acknowledged bucket must not remain captured by the send closure."""
+    publisher, unused_wire, unused_client, controller, state = _publication("colocated", "full_gather")
+    original = transfer_module.materialize_packed_weight_bucket
+    buffers = []
+
+    def observe_materialization(*args: Any, **kwargs: Any) -> torch.Tensor:
+        """Check release before materializing the next bucket."""
+        if buffers:
+            assert buffers[-1]() is None, "Previous packed buffer survived into the next gather"
+        packed = original(*args, **kwargs)
+        buffers.append(weakref.ref(packed))
+        return packed
+
+    monkeypatch.setattr(transfer_module, "materialize_packed_weight_bucket", observe_materialization)
+    controller.prepare_for_training()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    controller.prepare_for_rollout()
+    assert publisher.last_streaming_stats["bucket_count"] == len(buffers) > 1
+    assert all(buffer() is None for buffer in buffers)
+    assert controller.policy_version == 1
+    controller.close()
+
+
+def test_level_two_requires_full_publication_before_restoring_generation() -> None:
+    """Discarded worker weights stay unavailable until a complete publication and resume."""
+    unused_publisher, unused_wire, client, controller, state = _publication(
+        "colocated", "full_gather", sleep_level=2,
+    )
+    controller.prepare_for_training()
+    assert all(parameter.isnan().all() for worker in client.workers for parameter in worker.parameters.values())
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    with pytest.raises(RuntimeError, match="successful full publication"):
+        controller.prepare_for_rollout()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    controller.prepare_for_rollout()
+    _assert_parameters(client, state)
+    assert controller.generation_version(client) == 1
+    assert not client.paused
+    controller.close()
+
+
+def test_level_two_failed_publication_cannot_resume_or_sample() -> None:
+    """A failed transfer leaves the discarded version closed to restoration and sampling."""
+    unused_publisher, wire, client, controller, state = _publication("colocated", "full_gather", sleep_level=2)
+    wire.fail = True
+    controller.prepare_for_training()
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        controller.update_weights(PolicySnapshot(1, "qwen", state))
+    with pytest.raises(RuntimeError, match="unpublished"):
+        controller.generation_version(client)
+    with pytest.raises(RuntimeError, match="without a pending policy version"):
+        controller.prepare_for_rollout()
+    assert controller.policy_version == 0
+    assert client.paused
+    assert "resume" not in client.events
+    assert all(worker._rl_loaded_policy_version == 0 for worker in client.workers)
+    controller.close()

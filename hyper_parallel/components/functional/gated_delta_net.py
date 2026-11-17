@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 # Keep the validated kernel adapter close to its upstream implementation.
@@ -20,19 +19,20 @@
 # pylint: disable=non-google-docstring,disallowed-name,unused-argument,invalid-name
 # pylint: disable=missing-module-docstring,missing-function-docstring
 # pylint: disable=abstract-method,arguments-differ
+# pylint: disable=forbidden-backend-import
 
 import warnings
 from typing import Optional
 
 import torch
 
-from ._gdn_triton.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from ._gdn_triton.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
-from ._gdn_triton.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from ._gdn_triton.cumsum import chunk_local_cumsum
-from ._gdn_triton.solve_tril import solve_tril
-from ._gdn_triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from ._gdn_triton.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from ._triton.gated_delta_net.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
+from ._triton.gated_delta_net.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
+from ._triton.gated_delta_net.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from ._triton.gated_delta_net.cumsum import chunk_local_cumsum
+from ._triton.gated_delta_net.solve_tril import solve_tril
+from ._triton.gated_delta_net.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from ._triton.gated_delta_net.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
@@ -50,7 +50,7 @@ def chunk_gated_delta_rule_fwd_prepare(
 ):
     """Compute forward intermediates that do not depend on the initial state."""
     g = chunk_local_cumsum(g, chunk_size=chunk_size, cu_seqlens=cu_seqlens, head_first=False)
-    A = chunk_scaled_dot_kkt_fwd(
+    matrix_a = chunk_scaled_dot_kkt_fwd(
         k=k,
         g=g,
         beta=beta,
@@ -58,16 +58,16 @@ def chunk_gated_delta_rule_fwd_prepare(
         chunk_size=chunk_size,
         output_dtype=torch.float32,
     )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+    matrix_a = solve_tril(A=matrix_a, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
         beta=beta,
-        A=A,
+        A=matrix_a,
         g=g,
         cu_seqlens=cu_seqlens,
     )
-    return g, A, w, u
+    return g, matrix_a, w, u
 
 
 def chunk_gated_delta_rule_fwd_apply_state(
@@ -128,7 +128,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens: Optional[torch.LongTensor] = None,
         chunk_size: int = 64,
 ):
-    g, A, w, u = chunk_gated_delta_rule_fwd_prepare(
+    g, matrix_a, w, u = chunk_gated_delta_rule_fwd_prepare(
         k=k,
         v=v,
         g=g,
@@ -146,7 +146,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
     )
-    o = chunk_gated_delta_rule_fwd_output(
+    output = chunk_gated_delta_rule_fwd_output(
         q=q,
         k=k,
         v_new=v_new,
@@ -156,7 +156,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
     )
-    return g, o, A, final_state
+    return g, output, matrix_a, final_state
 
 
 def chunk_gated_delta_rule_bwd_prepare(
@@ -360,6 +360,7 @@ def chunk_gated_delta_rule_fwd_prepare_saved(
         scale: float = None,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Prepare fused GDN forward tensors without consuming the initial state."""
     if scale is None:
@@ -371,12 +372,13 @@ def chunk_gated_delta_rule_fwd_prepare_saved(
         q_norm, q_inv_norm = _l2norm(q)
         k_norm, k_inv_norm = _l2norm(k)
 
-    g_cumsum, A, w, u = chunk_gated_delta_rule_fwd_prepare(
+    g_cumsum, matrix_a, w, u = chunk_gated_delta_rule_fwd_prepare(
         k=k_norm,
         v=v,
         g=g,
         beta=beta,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     return (
         q_norm,
@@ -384,7 +386,7 @@ def chunk_gated_delta_rule_fwd_prepare_saved(
         q_inv_norm,
         k_inv_norm,
         g_cumsum,
-        A,
+        matrix_a,
         w,
         u,
         scale,
@@ -401,6 +403,7 @@ def chunk_gated_delta_rule_fwd_apply_state_saved(
         initial_state: torch.Tensor = None,
         output_final_state: bool = True,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Apply an initial state to fused prepared forward tensors."""
     return chunk_gated_delta_rule_fwd_apply_state(
@@ -411,6 +414,7 @@ def chunk_gated_delta_rule_fwd_apply_state_saved(
         initial_state=initial_state,
         output_final_state=output_final_state,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -424,6 +428,7 @@ def chunk_gated_delta_rule_fwd_output_saved(
         v_new: torch.Tensor,
         scale: float,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Compute fused GDN output from prepared, state-applied tensors."""
     return chunk_gated_delta_rule_fwd_output(
@@ -434,6 +439,7 @@ def chunk_gated_delta_rule_fwd_output_saved(
         g=g_cumsum,
         scale=scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -449,6 +455,7 @@ def chunk_gated_delta_rule_fwd_saved(
         initial_state: torch.Tensor = None,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Run fused GDN forward and return the tensors required by its backward."""
     (
@@ -457,7 +464,7 @@ def chunk_gated_delta_rule_fwd_saved(
         q_inv_norm,
         k_inv_norm,
         g_cumsum,
-        A,
+        matrix_a,
         w,
         u,
         scale,
@@ -470,6 +477,7 @@ def chunk_gated_delta_rule_fwd_saved(
         scale=scale,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_apply_state_saved(
         k_norm,
@@ -479,6 +487,7 @@ def chunk_gated_delta_rule_fwd_saved(
         initial_state=initial_state,
         output_final_state=True,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     output = chunk_gated_delta_rule_fwd_output_saved(
         q_norm,
@@ -488,6 +497,7 @@ def chunk_gated_delta_rule_fwd_saved(
         v_new,
         scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     return (
         output.to(q.dtype),
@@ -497,7 +507,7 @@ def chunk_gated_delta_rule_fwd_saved(
         q_inv_norm,
         k_inv_norm,
         g_cumsum,
-        A,
+        matrix_a,
         scale,
     )
 
@@ -515,6 +525,7 @@ def chunk_gated_delta_rule_bwd_prepare_saved(
         grad_output: torch.Tensor,
         scale: float,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Prepare fused backward tensors before the final-state grad arrives."""
     return chunk_gated_delta_rule_bwd_prepare(
@@ -528,6 +539,7 @@ def chunk_gated_delta_rule_bwd_prepare_saved(
         initial_state=initial_state,
         do=grad_output,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -544,6 +556,7 @@ def chunk_gated_delta_rule_bwd_state_saved(
         dv_local: torch.Tensor,
         scale: float,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Consume the final-state grad and produce the initial-state grad."""
     return chunk_gated_delta_rule_bwd_state(
@@ -557,6 +570,7 @@ def chunk_gated_delta_rule_bwd_state_saved(
         dv=dv_local,
         scale=scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -582,6 +596,7 @@ def chunk_gated_delta_rule_bwd_finish_saved(
         scale: float,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Finish local fused gradients after the P2P state-gradient handoff."""
     dq, dk, dv, dbeta, dg = chunk_gated_delta_rule_bwd_finish(
@@ -599,6 +614,7 @@ def chunk_gated_delta_rule_bwd_finish_saved(
         dh=dh,
         scale=scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     if use_qk_l2norm_in_kernel:
         with torch.enable_grad():
@@ -634,6 +650,7 @@ def chunk_gated_delta_rule_bwd_saved(
         scale: float,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 64,
+        cu_seqlens: torch.Tensor = None,
 ):
     """Run fused GDN backward from a context saved by the forward helper."""
     w, h, v_new, dv = chunk_gated_delta_rule_bwd_prepare_saved(
@@ -647,6 +664,7 @@ def chunk_gated_delta_rule_bwd_saved(
         grad_output,
         scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     dh, dh0, dv = chunk_gated_delta_rule_bwd_state_saved(
         q_norm,
@@ -659,6 +677,7 @@ def chunk_gated_delta_rule_bwd_saved(
         dv,
         scale,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     dq, dk, dv, dg, dbeta = chunk_gated_delta_rule_bwd_finish_saved(
         q,
@@ -680,6 +699,7 @@ def chunk_gated_delta_rule_bwd_saved(
         scale,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
     )
     return dq, dk, dv, dg, dbeta, dh0
 
@@ -704,7 +724,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             use_qk_l2norm_in_kernel: bool = False,
             chunk_size: int = 64,
     ):
-        g, o, A, final_state = chunk_gated_delta_rule_fwd(
+        g, output, matrix_a, final_state = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
             v=v,
@@ -719,12 +739,12 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
         saved_initial_state = initial_state if initial_state is not None else q.new_empty(0)
         saved_cu_seqlens = cu_seqlens if cu_seqlens is not None else q.new_empty(0, dtype=torch.long)
-        ctx.save_for_backward(q, k, v, g, beta, A, saved_initial_state, saved_cu_seqlens)
+        ctx.save_for_backward(q, k, v, g, beta, matrix_a, saved_initial_state, saved_cu_seqlens)
         ctx.has_initial_state = initial_state is not None
         ctx.has_cu_seqlens = cu_seqlens is not None
         ctx.scale = scale
         ctx.chunk_size = chunk_size
-        return o.to(q.dtype), final_state
+        return output.to(q.dtype), final_state
 
     @staticmethod
     @input_guard
@@ -734,7 +754,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             do: torch.Tensor,
             dht: torch.Tensor
     ):
-        q, k, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+        q, k, v, g, beta, matrix_a, initial_state, cu_seqlens = ctx.saved_tensors
         if not ctx.has_initial_state:
             initial_state = None
         if not ctx.has_cu_seqlens:
@@ -745,7 +765,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             v=v,
             g=g,
             beta=beta,
-            A=A,
+            A=matrix_a,
             scale=ctx.scale,
             initial_state=initial_state,
             do=do,
@@ -879,7 +899,7 @@ def chunk_gated_delta_rule(
         q, _ = _l2norm(q)
         k, _ = _l2norm(k)
 
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    output, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
         v,
@@ -892,4 +912,4 @@ def chunk_gated_delta_rule(
         False,
         chunk_size,
     )
-    return o, final_state
+    return output, final_state

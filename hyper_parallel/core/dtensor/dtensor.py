@@ -23,6 +23,8 @@ from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 import numpy as np
 import torch
 from torch import Tensor
+from torch.optim.optimizer import _foreach_supported_types as _optimizer_foreach_supported_types
+from torch.utils._foreach_utils import _foreach_supported_types as _torch_foreach_supported_types
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
@@ -429,9 +431,14 @@ class DTensor(DTensorBase):
             return self._layout.alias_placements
         return self._placements
 
-    def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
-        """Rebuild converted DTensor data without preserving Parameter identity."""
-        cls = DTensor if isinstance(self, torch.nn.Parameter) else self.__class__
+    def _new_with_same_layout(self, local_tensor: Tensor) -> 'DTensor':
+        """Create a DTensor from a local shard while retaining the logical layout.
+
+        The shard must retain its logical shape. Layout metadata is copied so
+        updating its dtype cannot mutate the source. Parameter inputs produce
+        plain DTensors. This method does not copy tensor data or communicate.
+        """
+        tensor_type = DTensor if isinstance(self, torch.nn.Parameter) else self.__class__
         if not isinstance(self._layout, Layout):
             constructor_kwargs = {
                 "device_mesh": self._device_mesh,
@@ -439,7 +446,7 @@ class DTensor(DTensorBase):
             }
             if hasattr(self, "_global_shape"):
                 constructor_kwargs["shape"] = self._global_shape
-            return cls(local_tensor, **constructor_kwargs)
+            return tensor_type(local_tensor, **constructor_kwargs)
         layout = cp.deepcopy(self._layout)
         if layout.tensor_shape is not None:
             layout.set_tensor_meta(
@@ -447,13 +454,24 @@ class DTensor(DTensorBase):
                 layout.tensor_stride,
                 local_tensor.dtype,
             )
-        return cls(
+        return tensor_type(
             local_tensor,
             device_mesh=self._device_mesh,
             placements=layout.placements,
             layout=layout,
-            shape=getattr(self, "_global_shape", None),
+            shape=self._global_shape,
         )
+
+    def detach(self) -> "DTensor":
+        """Detach autograd while retaining the complete logical layout.
+
+        The result shares local storage and owns its layout metadata so dtype
+        conversions cannot change the source. Uneven shards need this metadata
+        when optimizer moments are initialized with ``zeros_like`` during resume.
+        """
+        if self.layout is None:
+            return super().detach()
+        return self._new_with_same_layout(self._local_tensor.detach())
 
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.
@@ -471,7 +489,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with the converted local tensor.
         """
         new_local = self._local_tensor.to(*args, **kwargs)
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def float(self):
         """Convert the DTensor to float dtype.
@@ -480,7 +498,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with float32 local tensor.
         """
         new_local = self._local_tensor.float()
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def type_as(self, other: Tensor) -> "DTensor":
         """Cast this DTensor to the dtype of ``other``.
@@ -547,7 +565,7 @@ class DTensor(DTensorBase):
         if self.dtype == target_dtype:
             return self
         new_local = self._local_tensor.to(dtype=target_dtype)
-        return self._from_converted_local(new_local)
+        return self._new_with_same_layout(new_local)
 
     def _validate_factory_device(self, device: Any) -> None:
         """Raise :class:`ValueError` if ``device`` does not match the DTensor's device."""
@@ -969,6 +987,16 @@ class DTensor(DTensorBase):
         return out.to_local()
 
 
+def _register_optimizer_tensor_type() -> None:
+    """Enable PyTorch optimizer and foreach selection for DTensor."""
+    for supported_types in (_optimizer_foreach_supported_types, _torch_foreach_supported_types):
+        if DTensor not in supported_types:
+            supported_types.append(DTensor)
+
+
+_register_optimizer_tensor_type()
+
+
 def _normalize_shard_dim(dim: int, ndim: int) -> int:
     return dim + ndim if dim < 0 else dim
 
@@ -1119,25 +1147,21 @@ def _distribute_module_iter_buffers(module: Any) -> list:
 
 
 def _distribute_module_named_modules(module: Any):
-    """``nn.Module.named_modules`` or MindSpore ``Cell.cells_and_names`` (submodule FQNs)."""
+    """``nn.Module.named_modules`` (submodule FQNs)."""
     if hasattr(module, "named_modules"):
         return module.named_modules()
-    if hasattr(module, "cells_and_names"):
-        return module.cells_and_names()
     raise TypeError(
-        f"distribute_module expects module-like objects with named_modules or cells_and_names; "
+        f"distribute_module expects a module-like object with named_modules; "
         f"got {type(module)}."
     )
 
 
 def _distribute_module_named_parameters(module: Any):
-    """``nn.Module.named_parameters(recurse=False)`` or MindSpore ``Cell.parameters_and_names(expand=False)``."""
+    """``nn.Module.named_parameters(recurse=False)``."""
     if hasattr(module, "named_parameters"):
         return module.named_parameters(recurse=False)
-    if hasattr(module, "parameters_and_names"):
-        return module.parameters_and_names(expand=False)
     raise TypeError(
-        f"distribute_module expects module-like objects with named_parameters or parameters_and_names; "
+        f"distribute_module expects a module-like object with named_parameters; "
         f"got {type(module)}."
     )
 
@@ -1247,7 +1271,7 @@ def distribute_module(
     ``partition_fn``. ``input_fn`` / ``output_fn`` attach only to the root *module*.
 
     Args:
-        module: Root ``nn.Module`` or MindSpore ``Cell`` with compatible APIs.
+        module: Root ``nn.Module``.
         device_mesh: Placement mesh; if ``None``, uses ``_mesh_resources.get_current_mesh()``.
         partition_fn: Per ``named_modules`` callback before replicate pass; ``None`` replicates all.
         input_fn: ``(module, inputs, mesh)`` or deprecated ``(inputs, mesh)`` pre-hook.

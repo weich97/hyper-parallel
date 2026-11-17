@@ -17,15 +17,28 @@
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
+import importlib
 import os
 from pathlib import Path
 import sys
+from types import ModuleType
 
 _VENDOR_NAME = "hyper_parallel_multicore_nn"
 
 
 class NativeComponentUnavailableError(RuntimeError):
     """Report an unavailable or incorrectly activated multicore component."""
+
+
+@lru_cache(maxsize=1)
+def load_torch_npu() -> ModuleType:
+    """Register the optional NPU backend only when an operation needs it.
+
+    Import errors propagate so an unusable backend cannot masquerade as successful
+    native initialization. Failed imports are not cached and may be retried.
+    """
+    return importlib.import_module("torch_npu")
 
 
 def require_multicore_environment() -> Path:
@@ -63,10 +76,17 @@ def require_multicore_environment() -> Path:
     return vendor_root.resolve()
 
 
-def get_multicore_paths() -> tuple[Path, Path]:
-    """Return the unified vendor root and Torch adapter."""
+def get_multicore_adapter_path(adapter_name: str) -> tuple[Path, Path]:
+    """Return the unified vendor root and one named Torch adapter.
+
+    Args:
+        adapter_name: Component-owned adapter basename without ``lib`` or ``.so``.
+
+    Returns:
+        Unified vendor root and resolved adapter path.
+    """
     vendor_root = require_multicore_environment()
-    adapter = _component_root() / "framework" / "torch" / "libhyper_parallel_mega_moe_torch.so"
+    adapter = _component_root() / "framework" / "torch" / f"lib{adapter_name}.so"
     vendor_library = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     if not vendor_library.is_file() or not adapter.is_file():
         raise NativeComponentUnavailableError(
@@ -77,11 +97,19 @@ def get_multicore_paths() -> tuple[Path, Path]:
     return vendor_root, adapter.resolve()
 
 
+def get_multicore_paths() -> tuple[Path, Path]:
+    """Return the unified vendor root and legacy MegaMoe Torch adapter."""
+    return get_multicore_adapter_path("hyper_parallel_mega_moe_torch")
+
+
 def preload_vendor_library(vendor_root: Path) -> None:
-    """Load the exact component-owned ACLNN library without global SONAME search."""
+    """Load the exact ACLNN library without exposing its dependency symbols globally."""
     library_path = vendor_root / "op_api" / "lib" / "libcust_opapi.so"
     try:
-        ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+        # CANN libraries can export identically named globals. Global promotion
+        # can bind their independent destructors to the same object at exit.
+        # ACLNN entry points are resolved through the vendor library handle.
+        ctypes.CDLL(str(library_path), mode=ctypes.RTLD_LOCAL)
     except OSError as error:
         raise NativeComponentUnavailableError(
             f"[HP-NATIVE-VENDOR-LOAD-FAILED] library={library_path} error={error}."

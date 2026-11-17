@@ -14,16 +14,25 @@
 # ============================================================================
 """Public cross-module contracts for the Hyper-RL runtime."""
 
+# Public names are resolved lazily by __getattr__, not bound at import time.
+__all__ = list((
+    "ExperienceBatch",
+    "Message",
+    "PromptRecord",
+    "Trajectory",
+    "Turn",
+))
+
 from importlib import import_module
 from typing import Any
 
 
 _EXPORTS = {
-    "ExperienceBatch": ("rl.dataset.contracts", "ExperienceBatch"),
-    "Message": ("rl.dataset.contracts", "Message"),
-    "PromptRecord": ("rl.dataset.contracts", "PromptRecord"),
-    "Trajectory": ("rl.dataset.contracts", "Trajectory"),
-    "Turn": ("rl.dataset.contracts", "Turn"),
+    "ExperienceBatch": ("rl.data.contracts", "ExperienceBatch"),
+    "Message": ("rl.data.contracts", "Message"),
+    "PromptRecord": ("rl.data.contracts", "PromptRecord"),
+    "Trajectory": ("rl.data.contracts", "Trajectory"),
+    "Turn": ("rl.data.contracts", "Turn"),
 }
 
 
@@ -42,6 +51,3 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
 def __dir__() -> list[str]:  # pylint: disable=invalid-name
     """Expose lazy public contracts to interactive callers."""
     return sorted((*globals(), *_EXPORTS))
-
-
-__all__ = list(_EXPORTS)

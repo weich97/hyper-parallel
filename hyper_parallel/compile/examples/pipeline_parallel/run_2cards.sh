@@ -14,13 +14,16 @@
 # limitations under the License.
 # ============================================================================
 
-# Pipeline Parallel Training - Single Node 2 Cards (2 PP stages)
+# VPP (Interleaved 1F1B) Training - Single Node 2 Cards
 #
-# v1 contract: world_size == pp_degree (one stage per rank, pure PP).
+# Pure PP contract: world_size == pp_degree. VPP adds pp_chunks virtual
+# stages per physical rank, so this launcher runs 2 ranks x 2 chunks == 4
+# virtual pipeline stages.
 #
 # Configuration:
-#   - Total cards: 2
-#   - Pipeline parallel (stages): 2
+#   - Total cards: 2 (physical PP ranks)
+#   - Virtual stages: 4 (pp_chunks=2)
+#   - Schedule: VPP / Interleaved 1F1B
 #   - FSDP: disabled (v1 pure-PP; hybrid requires a mesh with a pp dim)
 #
 # Usage:
@@ -32,8 +35,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=========================================="
-echo "Starting 2-stage pipeline-parallel training"
-echo "Configuration: PP stages=2, FSDP=off"
+echo "Starting VPP training"
+echo "Configuration: ranks=2, virtual stages=4, schedule=vpp, FSDP=off"
 echo "=========================================="
 
 torchrun \

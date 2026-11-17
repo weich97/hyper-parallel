@@ -32,13 +32,16 @@ MAX_OUTPUTS_PER_TASK = 4
 MIN_EVENT_CAPACITY  = 1024
 NUM_WORKERS_VECTOR   = 48
 NUM_WORKERS_CUBE     = 24
-MAX_GROUP_LIST       = 512
-MAX_EXPERT_NUM_PER_RANK = 16
+MIN_GROUP_LIST_CAPACITY = 512
+GROUP_LIST_CACHE_LINE_BYTES = 128
 ATOMIC_ADD_VALUE_LEN = 8
 READY_CACHE_LINE_BYTES = 64
 INVALID_PROFILE_DESC_ID  = 0xFFFFFFFF
 INVALID_PROFILE_OWNER_ID = 0xFFFFFFFF
+DEFAULT_DEPENDENCY_POLL_INTERVAL_US = 0
+FAST_DEPENDENCY_POLL_INTERVAL_US = 5
 EVENT_INVALID_ID         = 0xFFFFFFFF
+RUNTIME_PROTOCOL_VERSION = 1
 
 
 def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
@@ -53,8 +56,8 @@ def mega_moe_event_capacity(num_experts: int, ep_size: int) -> int:
     """
     if ep_size <= 0 or num_experts <= 0 or num_experts % ep_size:
         raise ValueError("num_experts must be positive and divisible by ep_size")
-    # Ready follows termination; both triggers write a complete atomic vector.
-    final_event = num_experts + 3 * (num_experts // ep_size) + (4 if ep_size > 1 else 2)
+    # Ready and worker completion follow termination with separate atomic lanes.
+    final_event = num_experts + 3 * (num_experts // ep_size) + 4 + ATOMIC_ADD_VALUE_LEN
     required = final_event + ATOMIC_ADD_VALUE_LEN
     return max(MIN_EVENT_CAPACITY, (required + 15) // 16 * 16)
 
@@ -80,6 +83,41 @@ class TaskType(IntEnum):
     TASK_GROUPED_MATMUL       = 104
     TASK_SHMEM_PUT_MEM_SIGNAL = 105
     TASK_SWI_GLU_GRAD         = 106
+    TASK_MHC_POST             = 107
+    TASK_MHC_NORM_CAST        = 108
+    TASK_MHC_PROJECTION       = 109
+    TASK_MHC_MAPPING          = 110
+    TASK_RMS_NORM             = 111
+    TASK_MHC_INPUT_MIX        = 112
+    TASK_RMS_NORM_GRAD        = 113
+    TASK_MHC_GRAD_PREV_A              = 114
+    TASK_MHC_GRAD_MAPPING             = 115
+    TASK_MHC_GRAD_PHI_RMS             = 116
+    TASK_MHC_GRAD_PREV_X_AND_POST     = 117
+    TASK_MHC_POST_GRAD                = 118
+    TASK_MHC_GRAD_PREV_A_AND_MAPPING  = 119
+    TASK_GATE_SOFTPLUS                    = 120
+    TASK_GATE_SQRT                        = 121
+    TASK_GATE_ADD_BIAS                    = 122
+    TASK_GATE_TOPK                        = 123
+    TASK_GATE_GATHER                      = 124
+    TASK_GATE_REDUCE_SUM                  = 125
+    TASK_GATE_ADD_EPSILON                 = 126
+    TASK_GATE_DIV                         = 127
+    TASK_GATE_MUL_SCALE                   = 128
+    TASK_GATE_CAST_INDEX                  = 129
+    TASK_GATE_GRAD_MULS_SCALE             = 130
+    TASK_GATE_GRAD_BROADCAST_DENOMINATOR  = 131
+    TASK_GATE_GRAD_NEG                    = 132
+    TASK_GATE_GRAD_DIV_SELECTED           = 133
+    TASK_GATE_GRAD_DIV_SELECTED_RATIO     = 134
+    TASK_GATE_GRAD_MUL_CROSS              = 135
+    TASK_GATE_GRAD_DIV_DIRECT             = 136
+    TASK_GATE_GRAD_REDUCE_SUM             = 137
+    TASK_GATE_GRAD_BROADCAST_ROW_SUM      = 138
+    TASK_GATE_GRAD_ADD_SELECTED           = 139
+    TASK_GATE_GRAD_ZEROS                  = 140
+    TASK_SHMEM_GET_MEM              = 141
 
 
 class EventType(IntEnum):
@@ -185,10 +223,12 @@ class RuntimeConfigC(ctypes.Structure):
         ("task_capacity", ctypes.c_uint32),
         ("event_capacity", ctypes.c_uint32),
         ("ready_event", ctypes.c_uint32),
-        ("cycle_profiling_enabled", ctypes.c_uint32),
+        ("diagnostic_mode", ctypes.c_uint32),
         ("aic_profile_record_capacity", ctypes.c_uint32),
         ("aiv_profile_record_capacity", ctypes.c_uint32),
-        ("_padding", ctypes.c_uint32 * 8),
+        ("completion_event", ctypes.c_uint32),
+        ("protocol_version", ctypes.c_uint32),
+        ("_padding", ctypes.c_uint32 * 6),
     ]
 
 
@@ -244,9 +284,12 @@ class TaskSplitValue:
     seq_size:       int = 8192
     all_expert_num: int = 32
     top_k:          int = 8
+    dispatch_mode: str = "push"
 
     def __post_init__(self) -> None:
         """Reject topology values that would invalidate runtime arithmetic."""
+        if self.dispatch_mode not in ("push", "pull"):
+            raise ValueError("dispatch_mode must be push or pull")
         values = {
             "tp": self.tp,
             "ep": self.ep,
@@ -265,11 +308,6 @@ class TaskSplitValue:
             raise ValueError(
                 f"all_expert_num ({self.all_expert_num}) must be divisible by ep ({self.ep})."
             )
-        if self.single_rank_expert_num > MAX_EXPERT_NUM_PER_RANK:
-            raise ValueError(
-                "single_rank_expert_num cannot exceed the device scratch capacity "
-                f"({MAX_EXPERT_NUM_PER_RANK}), got {self.single_rank_expert_num}."
-            )
 
     # ── Derived properties ────────────────────────────────────────────────────
     @property
@@ -284,8 +322,8 @@ class TaskSplitValue:
 
     @property
     def per_expert_seq(self) -> int:
-        """Sequence length per expert (across all EP ranks)."""
-        return self.seq_all // self.top_k
+        """Cover the tokens a single expert receives across EP ranks."""
+        return self.destination_expert_rows or self.seq_all // self.top_k
 
     @property
     def per_rank_seq(self) -> int:
@@ -294,8 +332,8 @@ class TaskSplitValue:
 
     @property
     def per_expert_seq_to_other(self) -> int:
-        """Sequence length per expert when sending to other ranks."""
-        return self.seq_all // (self.ep * self.top_k)
+        """Cover the tokens one source sends to one expert."""
+        return self.source_expert_rows or self.seq_all // (self.ep * self.top_k)
 
     @property
     def all_event_num(self) -> int:
@@ -311,10 +349,16 @@ class TaskSplitValue:
     pre_cube_task_num:    int = 0
     pre_vector_task_num:  int = 0
     pre_mix_task_num:     int = 0
+    source_expert_rows: int | None = None
+    destination_expert_rows: int | None = None
 
 
 def init_task_split_value(tsv: TaskSplitValue) -> None:
-    """Reset per-rank runtime counters to zero."""
+    """Reset per-rank runtime counters to zero.
+
+    Args:
+        tsv: Task split values whose runtime counters are reset.
+    """
     tsv.pre_pre_event_num   = 0
     tsv.pre_event_num       = 0
     tsv.pre_task_num        = 0
@@ -371,6 +415,27 @@ def _validate_shmem_task(task: TaskDescC, descriptor_index: int, tsv: TaskSplitV
         )
 
 
+def _validate_runtime_task_queues(cfg: RuntimeConfigC, event_capacity: int) -> None:
+    """Validate scheduled task IDs and their event ranges."""
+    queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
+    for indices, count in zip(queues, cfg.task_index_num[:3]):
+        if count < 0 or count > len(indices):
+            raise ValueError(f"invalid runtime task-index count {count}")
+        for task_id in indices[:count]:
+            if task_id < 0 or task_id >= len(cfg.all_tasks):
+                raise ValueError(f"invalid runtime task id {task_id}")
+            task = cfg.all_tasks[task_id]
+            dependency_out_of_range = (
+                task.dependent_event != 0xFFFFFFFF
+                and task.dependent_event >= event_capacity
+            )
+            trigger_out_of_range = task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
+            if dependency_out_of_range or trigger_out_of_range:
+                raise ValueError(
+                    f"task {task_id} references an event outside allocated capacity {event_capacity}"
+                )
+
+
 def validate_runtime_config(
     cfg: RuntimeConfigC,
     tsv: TaskSplitValue,
@@ -399,18 +464,7 @@ def validate_runtime_config(
     if cfg.task_num > len(cfg.all_tasks):
         raise ValueError(f"task_num ({cfg.task_num}) exceeds allocated task capacity ({len(cfg.all_tasks)}).")
     event_capacity = len(cfg.all_event_num_triggers)
-    queues = (cfg.cube_task_indices, cfg.vector_task_indices, cfg.mix_task_indices)
-    for indices, count in zip(queues, cfg.task_index_num[:3]):
-        if count < 0 or count > len(indices):
-            raise ValueError(f"invalid runtime task-index count {count}")
-        for task_id in indices[:count]:
-            if task_id < 0 or task_id >= len(cfg.all_tasks):
-                raise ValueError(f"invalid runtime task id {task_id}")
-            task = cfg.all_tasks[task_id]
-            if (task.dependent_event != 0xFFFFFFFF and task.dependent_event >= event_capacity) or (
-                task.trigger_event + ATOMIC_ADD_VALUE_LEN > event_capacity
-            ):
-                raise ValueError(f"task {task_id} references an event outside allocated capacity {event_capacity}")
+    _validate_runtime_task_queues(cfg, event_capacity)
 
     local_experts = tsv.single_rank_expert_num
     group_size = cfg.dynamic_data.dynamic_group_size
@@ -427,6 +481,7 @@ def validate_runtime_config(
             TaskType.TASK_SWI_GLU_GRAD,
             TaskType.TASK_GROUPED_MATMUL,
             TaskType.TASK_SHMEM_PUT_MEM_SIGNAL,
+            TaskType.TASK_SHMEM_GET_MEM,
         ):
             continue
         _validate_task_bounds(task, descriptor_index)
@@ -440,23 +495,25 @@ def validate_runtime_config(
 
 
 def configure_ready_handshake(cfg: RuntimeConfigC, tsv: TaskSplitValue) -> None:
-    """Reserve a local ready event after the graph's ordinary dependencies.
+    """Reserve entry readiness and completion of all participating workers.
 
     Args:
         cfg: Allocated graph configuration whose counters include ready padding.
         tsv: Topology that determines whether peer readiness is needed.
     """
-    if tsv.ep == 1:
-        return
     ready_event = tsv.all_event_num + 3
-    if ready_event + ATOMIC_ADD_VALUE_LEN > cfg.event_capacity:
+    completion_event = ready_event + ATOMIC_ADD_VALUE_LEN
+    if completion_event + ATOMIC_ADD_VALUE_LEN > cfg.event_capacity:
         raise ValueError("ready handshake event exceeds event_capacity.")
-    cfg.ready_event = ready_event
+    cfg.ready_event = ready_event if tsv.ep > 1 else 0
+    cfg.protocol_version = RUNTIME_PROTOCOL_VERSION if tsv.dispatch_mode == "pull" else 0
+    cfg.completion_event = completion_event if tsv.dispatch_mode == "pull" else 0
     cfg.all_event_num_triggers[ready_event] = 1
+    cfg.all_event_num_triggers[completion_event] = cfg.num_workers
 
 
 def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
-    """Return graph counters plus persistent per-rank ready generations.
+    """Return graph counters plus separate ready and completion generations.
 
     Args:
         ep_size: Number of expert-parallel ranks sharing the symmetric arena.
@@ -468,4 +525,4 @@ def event_workspace_bytes(ep_size: int, num_experts: int) -> int:
     counter_bytes = mega_moe_event_capacity(num_experts, ep_size) * ctypes.sizeof(ctypes.c_int32)
     if ep_size <= 1:
         return counter_bytes
-    return counter_bytes + (ep_size + 1) * READY_CACHE_LINE_BYTES
+    return counter_bytes + 2 * (ep_size + 1) * READY_CACHE_LINE_BYTES

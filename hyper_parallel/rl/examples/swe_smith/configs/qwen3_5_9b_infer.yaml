@@ -1,0 +1,109 @@
+# Agent Lightning d3819953: effective Job/query inference budgets; Codex tool protocol.
+model:
+  registry_name: qwen3_5_9b
+  name: qwen3_5
+  weights_path: /models/Qwen3.5-9B
+  tokenizer_path: /models/Qwen3.5-9B
+  config_overrides: null
+  attention_implementation: transformers_builtin
+  trust_remote_code: false
+  tokenizer_trust_remote_code: false
+rollout:
+  engine: vllm
+  num_return_sequences: 1
+  max_new_tokens: 12288
+  ignore_eos: false
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  seed: 20261009
+  vllm:
+    sleep_level: 1  # Use 2 to discard old weights; fully republish before resuming sampling.
+    deployment: colocated
+    data_parallel_size: 1
+    port: 18970
+    model_implementation: native
+    tensor_parallel_size: 2
+    server_hccl_if_base_port: 63400
+    server_hccl_npu_socket_port_range: 63400-63499
+    weight_sync:
+      strategy: full_gather
+      bucket_size_mb: 128
+    dtype: bfloat16
+    trust_remote_code: false
+    enforce_eager: false
+    batch_invariant: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    enable_auto_tool_choice: true
+    tool_call_parser: qwen3_coder
+    gpu_memory_utilization: 0.8
+    max_model_len: 81920
+    block_size: 128
+    max_num_seqs: 4
+    max_num_batched_tokens: 8192
+    logprobs_mode: raw_logprobs
+    startup_timeout: 600
+    request_timeout: 1800
+    reasoning_parser: qwen3
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes:
+      - 1
+      - 2
+      - 4
+      max_cudagraph_capture_size: 4
+agentic:
+  runner: codex
+  interaction_mode: multi_turn
+  protocol: json_function_call
+  apply_chat_template: true
+  max_turns: 100
+  max_observation_tokens: 0
+  max_episode_tokens: 81920
+  codex:
+    executable: codex
+    version: 0.152.1
+    model: qwen3_5_9b
+    model_context_window: 81920
+    model_auto_compact_token_limit: 65536
+    reasoning_effort: medium
+    enable_thinking: false
+    sandbox: danger-full-access
+    gateway_host: 127.0.0.1
+    gateway_public_host: 127.0.0.1
+    gateway_port: 18980
+    max_inflight_requests: 8
+    timeout_seconds: 5400
+    request_timeout: 1800
+    session_root: /results/sessions/reference-budget
+    program_callable: examples.swe_smith.agent:SWESmithProgram
+    reward_callable: examples.swe_smith.reward:score_submission
+    admin_auth: true
+    task:
+      data_dir: /results/swe_smith
+      images_path: /results/swe_smith/images.json
+      images_sha256: REPLACE_WITH_PREPARED_IMAGE_MANIFEST_SHA256
+      f2p_only: true
+      pytest_workers: 1
+      artifact_max_bytes: 134217728
+      artifact_max_files: 65536
+      run_timeout: 600
+      memory: 6g
+      cpus: 1
+      pids_limit: 256
+    workspace:
+      memory: 6g
+      cpus: 1
+      pids_limit: 256
+      max_concurrent: 2
+      output_limit_bytes: 33554432
+    max_request_bytes: 8388608
+    max_response_bytes: 67108864
+    model_instructions: Repair the offline repository in /workspace. Use exec_command
+      with login=false. Inspect source, implement a focused fix, and run existing
+      tests. Preserve tests, configuration, and Git metadata. Finish when the fix
+      is verified.
+    instruction_template: '{prompt}'
+    max_observation_chars: 6000

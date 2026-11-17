@@ -18,6 +18,7 @@
 """enhanced with selective checkpoint support swap"""
 # pylint: disable=W0212, W0613, C0115, C0116, C0103, R1705
 from collections import defaultdict
+from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -184,26 +185,36 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 tree_map(lambda x: _VersionWrapper(_maybe_detach(x, has_alias)), out)
             )
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
-            if not self.add_to_storage:
-                group_name = self._swap_manager.get_current_group_name()
-                self._group_prefix = f"{group_name}::"
-                self._swap_manager.add_storage(group_name, self.swap_storage)
-                self.add_to_storage = True
-            funcname = f"{self._group_prefix}{func}"
-            group_swap = self.group_swap
-            cpu_pool = self.cpu_pool
-            entries = tree_map(
-                lambda x: _make_swap_entry(
-                    x,
-                    has_alias=has_alias,
-                    funcname=funcname,
-                    group_swap=group_swap,
-                    cpu_pool=cpu_pool,
-                ),
-                out,
-            )
-            self.storage[func].append(tree_map(lambda x: x.save, entries))
-            self.swap_storage[func].append(tree_map(lambda x: x.swap, entries))
+            group_name = self._swap_manager.get_current_group_name()
+            if not group_name:
+                # No swap group is active for this region, which is the normal
+                # case for pipeline chunks the schedule did not mark swappable
+                # (forward/backward distance below MIN_SWAP_GAP). Degrade to
+                # MUST_SAVE: cache the activation on device and register it
+                # nowhere, so the empty-named global group never accumulates
+                # storage that is neither offloaded nor released.
+                self._swap_manager.warn_missing_group_once()
+                self.storage[func].append(
+                    tree_map(lambda x: _VersionWrapper(_maybe_detach(x, has_alias)), out)
+                )
+            else:
+                if not self.add_to_storage:
+                    self._group_prefix = f"{group_name}::"
+                    self._swap_manager.add_storage(group_name, self.swap_storage)
+                    self.add_to_storage = True
+                funcname = f"{self._group_prefix}{func}"
+                entries = tree_map(
+                    partial(
+                        _make_swap_entry,
+                        has_alias=has_alias,
+                        funcname=funcname,
+                        group_swap=self.group_swap,
+                        cpu_pool=self.cpu_pool,
+                    ),
+                    out,
+                )
+                self.storage[func].append(tree_map(lambda x: x.save, entries))
+                self.swap_storage[func].append(tree_map(lambda x: x.swap, entries))
         elif policy != CheckpointPolicy.MUST_RECOMPUTE:
             raise RuntimeError(f"Checkpoint Activation: {func} encountered an invalid policy {policy}")
         return out

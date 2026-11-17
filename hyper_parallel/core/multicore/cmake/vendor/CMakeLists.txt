@@ -25,8 +25,10 @@ set(HP_SHMEM_SDK_ROOT "" CACHE PATH "Installed SHMEM SDK root")
 set(HP_VENDOR_STAGE_ROOT "${CMAKE_BINARY_DIR}/stage" CACHE PATH "CANN vendor stage root")
 
 if(NOT HP_MULTICORE_SOURCE_ROOT
-        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp")
-    message(FATAL_ERROR "HP_MULTICORE_SOURCE_ROOT must identify an assembled HyperMegaMoe source tree")
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_moe/op_host/hyper_mega_moe_def.cpp"
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate/op_host/hyper_mega_gate_route_def.cpp"
+        OR NOT EXISTS "${HP_MULTICORE_SOURCE_ROOT}/hyper_mega_gate_grad/op_host/hyper_mega_gate_route_grad_def.cpp")
+    message(FATAL_ERROR "HP_MULTICORE_SOURCE_ROOT must identify an assembled Multicore source tree")
 endif()
 if(NOT HP_SHMEM_SDK_ROOT OR NOT EXISTS "${HP_SHMEM_SDK_ROOT}/include/shmem.h")
     message(FATAL_ERROR "HP_SHMEM_SDK_ROOT must identify an installed SHMEM SDK")
@@ -47,3 +49,15 @@ npu_op_package(${package_name}
 
 add_subdirectory(op_host)
 add_subdirectory(op_kernel)
+
+# Conda compiler drivers may inject the active environment into every linked
+# library's RPATH.  CANN's packaging targets install outside CMAKE_INSTALL_PREFIX,
+# so target-level install-RPATH properties cannot remove it.  Sanitize the
+# staged vendor payload after those generated install rules have run.
+install(CODE "
+    file(GLOB_RECURSE hp_vendor_shared_libraries
+        \"${HP_VENDOR_STAGE_ROOT}/packages/vendors/hyper_parallel_multicore_nn/*.so\")
+    foreach(hp_vendor_library IN LISTS hp_vendor_shared_libraries)
+        file(RPATH_REMOVE FILE \"\${hp_vendor_library}\")
+    endforeach()
+")

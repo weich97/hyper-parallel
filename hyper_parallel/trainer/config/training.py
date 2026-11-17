@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Training-loop, debug, wandb and profiling configuration sections.
-
-Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5);
-class names, fields and defaults are unchanged.
-"""
+"""Training-loop, debug, profiler, and remote-logging configuration sections."""
 
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -30,6 +26,7 @@ class TrainingConfig:
 
     train_iters: Optional[int] = None
     train_samples: Optional[int] = None
+    lr_scheduler_iters: Optional[int] = None
     eval_iters: int = 0
 
     global_batch_size: int = 8
@@ -47,6 +44,15 @@ class TrainingConfig:
     eval_steps: int = 0
     eval_epochs: int = 0
     logging_steps: int = 1
+    log_tflops: bool = False
+    """Publish analytical per-device model FLOPs throughput.
+
+    When enabled, the environment meter adds
+    ``performance/tflops_per_device`` (TFLOP/s, cluster average per device)
+    to each step's metrics. The estimate charges every model-input token,
+    including prompt tokens masked out of the loss, and accumulates causal
+    attention over the real sequence boundaries.
+    """
     low_precision: LowPrecisionConfig = field(default_factory=LowPrecisionConfig)
 
 
@@ -55,7 +61,53 @@ class DebugConfig:
     """Debug parameters exposed by the initial YAML schema."""
 
     check_dataset: Optional[Literal["debug", "info", "warn"]] = None
+    log_first_rendered_template: bool = False
     check_nan_inf: bool = False
+    check_fsdp_runtime: bool = False
+
+
+@dataclass
+class ModelIntegrationConfig:
+    """Enable model-integration checks at one well-defined lifecycle scope.
+
+    ``build`` validates the final module tree, sharding ownership, data
+    contract, optimizer layout, and checkpoint coverage. ``runtime_scalars``
+    also records input identity, shared-state and layout checks, loss, and
+    gradient norms. ``runtime`` additionally records per-parameter probes.
+    Output location and probe selection are framework policy.
+    """
+
+    mode: Literal["off", "build", "runtime", "runtime_scalars"] = "off"
+
+    def __post_init__(self) -> None:
+        """Reject ambiguous validation scopes at the configuration boundary."""
+        if self.mode not in ("off", "build", "runtime", "runtime_scalars"):
+            raise ValueError(
+                "model_integration.mode must be one of: off, build, runtime, runtime_scalars"
+            )
+
+
+@dataclass
+class MemoryConfig:
+    """Configure allocator memory-history snapshots during training.
+
+    Args:
+        enable: Whether allocator history recording is enabled.
+        start_step: First session-relative step included in the snapshot; zero includes model construction.
+        end_step: Last session-relative step included in the snapshot.
+        save_path: Directory used for snapshot files.
+        dump_ranks: Global ranks that write snapshot files.
+        stacks: Stack information recorded by the allocator.
+        mem_info: Whether peak allocator statistics are logged before each step.
+    """
+
+    enable: bool = False
+    start_step: int = 1
+    end_step: int = 2
+    save_path: str = "./memory_snapshot"
+    dump_ranks: list[int] = field(default_factory=lambda: [0])
+    stacks: Literal["python", "all"] = "all"
+    mem_info: bool = False
 
 
 @dataclass
@@ -68,15 +120,48 @@ class WandbConfig:
 
 
 @dataclass
-class ProfilingConfig:
-    """Lightweight per-step profiler settings."""
+class ProfilingAnalysisConfig:
+    """Configure Ascend NPU trace analysis after collection.
 
-    enabled: bool = False
-    start_step: int = 3
-    end_step: int = 4
-    trace_dir: str = "./outputs/profiling"
-    record_shapes: bool = False
-    profile_memory: bool = False
+    Args:
+        enable: Whether collected data is automatically analyzed.
+        async_mode: Whether automatic analysis runs asynchronously; ignored when disabled.
+    """
+
+    enable: bool = True
+    async_mode: bool = False
+
+
+@dataclass
+class ProfilingConfig:
+    """Configure bounded PyTorch profiler collection during training.
+
+    HyperParallel groups these options under ``TrainerConfig.profiler``, so
+    their names describe only the option itself rather than repeating a
+    ``profile_`` prefix.
+
+    Args:
+        enable: Whether profiler collection is enabled.
+        start_step: First training step included in the profile.
+        stop_step: Last training step included in the profile.
+        warmup_steps: Number of warmup steps immediately before ``start_step``; must be smaller than it.
+        memory: Whether tensor memory events are collected.
+        rank_ids: Explicit ranks that collect a profile. ``None`` or an empty list selects all ranks.
+        output_path: Output root. Each rank writes under ``profile/rank_<rank>``.
+        level: Ascend collection level, from 0 through 2. ``None`` selects level 0.
+        with_stack: Whether Python stack traces are collected.
+        data_simplification: Whether torch-npu removes selected auxiliary CANN data after export.
+        analysis: Ascend NPU automatic trace analysis options; ignored on CPU/CUDA.
+    """
+
+    enable: bool = False
+    start_step: int = 1
+    stop_step: int = 10
+    warmup_steps: int = 0
+    memory: bool = True
+    rank_ids: Optional[list[int]] = None
+    output_path: Optional[str] = None
+    level: Optional[int] = 1
     with_stack: bool = False
-    with_modules: bool = False
-    rank: int = 0
+    data_simplification: bool = False
+    analysis: ProfilingAnalysisConfig = field(default_factory=ProfilingAnalysisConfig)

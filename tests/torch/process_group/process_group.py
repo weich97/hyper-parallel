@@ -19,7 +19,7 @@ import torch.distributed as dist
 from hyper_parallel import (init_process_group, destroy_process_group, get_process_group_ranks,
                             get_backend, split_group)
 from hyper_parallel.core.dtensor._utils import create_group
-from hyper_parallel.core.shard.utils import get_group_local_rank
+from hyper_parallel.core.utils.communication import get_group_local_rank
 
 
 def test_process_group():
@@ -28,8 +28,8 @@ def test_process_group():
     process group. After that, create a sub process group and get rank list and backend in sub process group.
     Finally, destroy the sub process group and process group.
     """
-    # init process group
-    init_process_group()
+    # Select HCCL explicitly so the backend-name assertions have a deterministic contract.
+    init_process_group(backend="hccl")
     world_size = dist.get_world_size()
     # pylint: disable=C0415
     rank_list = get_process_group_ranks()

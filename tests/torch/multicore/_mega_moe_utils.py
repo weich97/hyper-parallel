@@ -20,14 +20,15 @@ import importlib.util
 import json
 import os
 import platform
-import subprocess
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch_npu
 
+from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore._loader import get_multicore_paths
+from tests.torch.multicore._evidence_helpers import source_revision
 from tests.common.port_utils import allocate_port
 
 
@@ -48,7 +49,7 @@ def memory_sample() -> dict[str, int]:
         "reserved_bytes": torch.npu.memory_reserved(),
         "device_used_bytes": total_bytes - free_bytes,
         # The external SHMEM heap is absent from Torch allocator statistics.
-        "shmem_heap_bytes": int(os.environ.get("HYPER_PARALLEL_SHMEM_HEAP_SIZE", "0")),
+        "shmem_heap_bytes": (shmem.debug_state().get("config") or {}).get("heap_size_bytes", 0),
     }
 
 
@@ -84,9 +85,7 @@ def environment_identity() -> dict:
         raise RuntimeError("hyper_parallel_shmem_torch native module is not importable.")
     native_files.extend(Path(binding_spec.origin).parents[2].rglob("*.so"))
     return {
-        "source_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True
-        ).strip(),
+        **source_revision(root),
         "worker_sha256": {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in Path(__file__).parent.glob("*mega_moe*.py")

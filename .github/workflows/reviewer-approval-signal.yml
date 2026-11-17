@@ -1,0 +1,16 @@
+name: Reviewer approval signal
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      # Fork review events have a read-only token. The trusted workflow_run
+      # consumer queries GitHub again; it never consumes artifacts or PR code.
+      - run: echo 'Review changed; request a fresh reviewer approval check.'

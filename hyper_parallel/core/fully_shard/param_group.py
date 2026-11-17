@@ -609,7 +609,7 @@ class HSDPParamGroup:
         grads_by_bucket = {}
         bucket_groups = {}
         for hsdp_param in self.hsdp_params:
-            if not hsdp_param.sharded_param.requires_grad:
+            if not hasattr(hsdp_param, "_unsharded_param") or not hsdp_param.sharded_param.requires_grad:
                 continue
             if hsdp_param.unsharded_accumulated_grad is not None:
                 unsharded_grad = hsdp_param.unsharded_accumulated_grad_data
@@ -663,7 +663,8 @@ class HSDPParamGroup:
             )
         return reduce_scatter_buckets
 
-    def _build_gradient_bucket_layout_from(self, hsdp_params):
+    @staticmethod
+    def _build_gradient_bucket_layout_from(hsdp_params):
         param_offsets = []
         param_numels = []
         flat_offset = 0

@@ -15,30 +15,35 @@
 """Architecture identity and adapter providers for Qwen3 dense models."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.qwen3.adapter.policies.sharding import (
+    build_parameter_sharding_rules,
+)
 from hyper_parallel.models.registry import register_model_adapter
 
 
 def _load_replacements():
     """Return the Qwen3 structure-replacement module through a lazy provider."""
-    from hyper_parallel.models.qwen3.adapter import replacements  # pylint: disable=C0415
-    return replacements
+    from hyper_parallel.models.qwen3.adapter.conversion import (  # pylint: disable=C0415
+        module_replacement,
+    )
+
+    return module_replacement
 
 
 def _load_attention():
     """Return the Qwen3 attention-contract module through a lazy provider."""
-    from hyper_parallel.models.qwen3.adapter import attention  # pylint: disable=C0415
+    from hyper_parallel.models.qwen3.adapter.runtime import (  # pylint: disable=C0415
+        attention,
+    )
+
     return attention
 
 
-def _load_sharding_rules():
-    """Return TP roles for parameters introduced by the fused SwiGLU replacement."""
-    from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
-        ParamRole,
-    )
-    return [
-        ("linear_fc1.weight", ParamRole.FUSED_GATE_UP),
-        ("linear_fc2.weight", ParamRole.ROWWISE),
-    ]
+def _load_codegen():
+    """Return Qwen3 source renderers only when Codegen requests them."""
+    from hyper_parallel.models.qwen3.adapter import codegen  # pylint: disable=C0415
+
+    return codegen
 
 
 QWEN3_ADAPTER_SPEC = ModelAdapterSpec(
@@ -46,7 +51,8 @@ QWEN3_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="qwen3",
     replacements=_load_replacements,
     attention=_load_attention,
-    sharding_rules=_load_sharding_rules,
+    sharding_rules=build_parameter_sharding_rules,
+    codegen=_load_codegen,
 )
 
 register_model_adapter(QWEN3_ADAPTER_SPEC)

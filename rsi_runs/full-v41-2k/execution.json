@@ -1,0 +1,5 @@
+{
+  "use_fused_ops": true,
+  "use_fused_attention": false,
+  "use_fused_indexer_kl": false
+}

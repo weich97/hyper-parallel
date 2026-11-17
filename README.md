@@ -1,106 +1,98 @@
+<!-- markdownlint-disable MD033 MD041 -->
+<!-- The branded README header and QR images use HTML for layout and sizing. -->
+
 <div align="center">
   <img src="docs/images/hyperparallel-logo.png" alt="HyperParallel Logo" title="HyperParallel logo" width="50%">
 
-[![WeChat 微信交流群](https://img.shields.io/badge/WeChat-64A519?style=flat&logo=wechat&logoColor=07C160)](#parallel-training-system-sig)
-[![小红书 HyperParallel（小红书号：hyperparallel）](https://img.shields.io/badge/%E5%B0%8F%E7%BA%A2%E4%B9%A6-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
-[![Document 文档中心](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
+[![WeChat community](https://img.shields.io/badge/WeChat-64A519?style=flat&logo=wechat&logoColor=07C160)](#parallel-training-system-sig)
+[![HyperParallel on REDnote](https://img.shields.io/badge/REDnote-FF2442?style=flat&logo=xiaohongshu&logoColor=white)](#xiaohongshu-qrcode)
+[![Documentation](https://img.shields.io/badge/Document-0088CC?style=flat&logo=readthedocs&logoColor=white)](docs/index.md)
+[![Papers](https://img.shields.io/badge/Papers-red?style=flat&logo=arxiv&logoColor=white)](#technical-reports)
+  <h3>Simplify SuperPoD Programming &nbsp;·&nbsp; Unleash Parallel Computing Power</h3>
 
-  <h3>简化超节点编程 &nbsp;·&nbsp; 释放并行算力</h3>
-  <p><sub>昇腾超节点亲和的分布式并行加速库</sub></p>
+  <p><strong>English</strong> | <a href="README.zh.md">简体中文</a></p>
 
   <p>
-    <a href="#-快速开始">快速开始</a>
+    <a href="#-quick-start">Quick Start</a>
     &emsp;·&emsp;
-    <a href="docs/index.md">文档中心</a>
+    <a href="#supported-models">Supported Models</a>
     &emsp;·&emsp;
-    <a href="docs/api/api_reference.md">API 参考</a>
+    <a href="docs/index.md">Documentation</a>
+    &emsp;·&emsp;
+    <a href="docs/api/api_reference.md">API Reference</a>
+    &emsp;·&emsp;
+    <a href="#technical-reports">Technical Reports</a>
   </p>
 </div>
 
 ---
 
-## 简介
+## Introduction
 
-HyperParallel 面向昇腾超节点提供分布式并行加速能力。针对资源池化、对等架构、分层网络拓扑和 FP8 低精度格式等特点，框架覆盖从集群分布式并行到芯片内多核并行，并支持 CPU DRAM 与 NPU HBM 池化管理、拓扑感知调度、通信路径规划和 FP8 混合精度训练。
-
----
-
-## 核心设计
-
-- **模型与系统优化解耦**：HyperParallel 将并行、重计算和 Offload 等系统优化从模型代码中分离，并通过声明式接口注入模型；并行范式覆盖集群 SPMD、集群 MPMD 和芯片内多核 MPMD，面向大语言模型和多模态模型训练。
-
-- **兼容 Hugging Face 生态**：AutoModels 直接读取 Hugging Face 模型配置和预训练权重，并复用 Transformers 中已有的模型实现；模型创建后，由 HyperParallel 以声明式方式将并行、重计算和算子替换等分布式逻辑注入模型。
-
-- **全流程确定性**：HyperParallel 支持计算、通信、数据预处理和随机数等环节的确定性，并对已支持模型进行 bitwise 对齐验证。确定性模式可能带来性能开销，但有助于复现训练结果、发现 SDC 和定位问题。
-
-- **动静混合**：静态图有利于通算并发、内存分析和执行序编排，但完整动转静对模型语法和编译能力要求较高。HyperParallel 在动态图基础上支持受约束的局部动转静。
+HyperParallel provides distributed parallel acceleration for Ascend SuperPoDs. Designed for resource pooling, peer-to-peer architectures, hierarchical network topologies, and FP8 low-precision formats, it spans cluster-level distributed parallelism and on-chip multicore parallelism. It supports pooled management of CPU DRAM and NPU HBM, topology-aware scheduling, communication path planning, and FP8 mixed-precision training.
 
 ---
 
-## 📣 最新消息
+## Core Design
 
-- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B 模型支持](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
+- **Decoupling model code from system optimization**: HyperParallel separates parallelism, recomputation, and offload from model code and injects them through declarative interfaces. Its parallel paradigms cover cluster SPMD, cluster MPMD, and on-chip multicore MPMD for large language and multimodal model training.
 
----
+- **Hugging Face ecosystem compatibility**: HyperParallel reads Hugging Face model configurations and pretrained weights directly and reuses existing Transformers model implementations. After model creation, HyperParallel declaratively injects distributed logic such as parallelism, recomputation, and operator replacement.
 
-## 使用入口
+- **End-to-end determinism**: HyperParallel supports determinism across computation, communication, data preprocessing, and random number generation, with bitwise alignment validation for supported models. Deterministic mode may incur a performance cost, but helps reproduce training results, detect silent data corruption (SDC), and diagnose issues.
 
-### AutoModels
-
-> [AutoModels](hyper_parallel/models/README.md) 面向训练用户，通过 YAML 配置 Hugging Face 模型、数据、优化器、并行策略和保存与恢复方式。
->
-> **支持模型**
->
-> - [Qwen3-30B-A3B](hyper_parallel/models/qwen3_moe/recipes/train.yaml)
-
-### HyperParallel Core
-
-> [HyperParallel Core](docs/api/api_reference.md) 面向模型作者和框架开发者，提供从分布式模型构建到训练执行与状态管理的底层能力。
->
-> **核心能力**
->
-> - **模型切分与并行组合**：以 DeviceMesh、DTensor 和 Shard 描述设备拓扑与 Tensor 布局，并组合 FSDP/HSDP、TP、CP、EP、PP 等并行策略。
-> - **MoE 与异构执行**：覆盖专家切分、路由和 token dispatch，以及流水线调度、集群 MPMD 和芯片内多核 MPMD。
-> - **内存与性能优化**：提供 Activation Checkpoint、Activation Swap、通信与计算重叠、通信融合和自动并行能力。
-> - **训练与状态管理**：提供优化器、分布式检查点、异步保存、离线格式转换和确定性训练能力。
->
-> <details>
-> <summary><strong>相关文档</strong></summary>
->
-> - **模型切分**：[DTensor](docs/api/api_reference.md#dtensor-分布式张量) · [FSDP/HSDP](docs/guide/fsdp.md) · [TP](docs/guide/tensor_parallel.md)
-> - **并行执行**：[CP](docs/guide/context_parallel.md) · [EP / MoE](docs/guide/expert_parallel.md) · [PP / 集群 MPMD](docs/guide/pipeline_parallel.md) · [多核 MPMD](hyper_parallel/core/multicore/README.md)
-> - **内存与性能**：[Activation Checkpoint / Swap](docs/guide/activation_checkpoint.md) · [通信与计算重叠](docs/guide/pipeline_parallel_overlap_b_f.md) · [通信融合](docs/guide/fsdp.md#通信融合) · [自动并行](docs/guide/auto_parallel.md)
-> - **训练与状态**：[Optimizer](docs/guide/optimizer.md) · [DCP](docs/guide/distributed_checkpoint.md) · [确定性调试](docs/faq.md#3-确定性模式调试)
->
-> </details>
->
-> <br>
->
-> <details>
-> <summary><strong>未来计划</strong></summary>
->
-> </details>
+- **Hybrid dynamic and static execution**: Static graphs facilitate compute-communication overlap, memory analysis, and execution scheduling, but full dynamic-to-static conversion places substantial demands on model syntax and compiler capabilities. HyperParallel supports constrained, local dynamic-to-static conversion on top of eager execution.
 
 ---
 
-## 安装
+## 📣 Latest News
 
-完整安装方式、源码构建参数和环境要求见 [安装指南](docs/installation.md)。
+- [Oct. 15, 2026]: [DeepSeek-V4.1-Flash model support](docs/deepseek_v41_article/README.md)
+- [Oct. 9, 2026]: [moonshotai/Kimi-K2.6 model support](hyper_parallel/models/kimi_k26/README.md)
+- [Aug. 25, 2026]: [Qwen/Qwen3-30B-A3B model support](examples/training_demo/README.md#full-pretrained-model)
 
 ---
 
-## 🚀 快速开始
+<a id="supported-models"></a>
 
-### 使用 AutoModels 启动训练
+## 🤖 Supported Models
 
-运行仓库提供的单机 8 卡训练示例 [`hyper_parallel/models/qwen3_moe/recipes/train.yaml`](hyper_parallel/models/qwen3_moe/recipes/train.yaml)：
+See the [model roadmap](https://github.com/mindspore-ai/hyper-parallel/issues/1305) for detailed capabilities and ongoing work.
+
+| Model | Example configuration / documentation |
+|---|---|
+| Qwen3 | [Model entry](hyper_parallel/models/qwen3) |
+| Qwen3-MoE | [Recipes](hyper_parallel/models/qwen3_moe/recipes) |
+| Qwen3-VL-MoE | [Model adapter](hyper_parallel/models/qwen3_vl_moe) |
+| Qwen3.5 Dense | [Model entry](hyper_parallel/models/qwen3_5) |
+| DeepSeek-V3 | [Recipes](hyper_parallel/models/deepseek_v3/recipes) |
+| DeepSeek-V3.2 | [Recipes](hyper_parallel/models/deepseek_v32/recipes) |
+| DeepSeek-V4.1 | [Text configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_online.yaml) · [Multimodal configuration](examples/training_demo/deepseek_v41/train_deepseek_v41_vlm_online.yaml) |
+| Kimi-K2.6 | [Recipes](hyper_parallel/models/kimi_k26/recipes) |
+| openPangu-2.0 | [Repository](https://gitcode.com/ascend-tribe/openPangu-2.0-Training) |
+
+---
+
+<a id="installation"></a>
+
+## 🛠️ Installation
+
+See the [Installation Guide](docs/installation.md) for installation methods, source build options, and environment requirements.
+
+---
+
+## 🚀 Quick Start
+
+### Launch Model Training with HyperParallel
+
+Run the single-node, eight-device training example provided in [`hyper_parallel/models/qwen3_moe/recipes/train.yaml`](hyper_parallel/models/qwen3_moe/recipes/train.yaml):
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
   scripts/train_lm.py hyper_parallel/models/qwen3_moe/recipes/train.yaml
 ```
 
-附加命令行参数可按 YAML 字段路径覆盖配置值，无需修改配置文件：
+Additional command-line arguments override configuration values by YAML field path, without modifying the configuration file:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 \
@@ -109,11 +101,11 @@ torchrun --standalone --nproc_per_node=8 \
   --training.train_iters=10
 ```
 
-配置结构、字段解析和更多训练示例见 [AutoModels](hyper_parallel/models/README.md)。
+See [Training Configuration and Components](hyper_parallel/models/README.md) for field definitions and parsing rules.
 
-### 使用 HyperParallel Core API
+### Use the HyperParallel Core API
 
-以下示例在数据并行 DeviceMesh 上应用 `fully_shard`，实现模型参数分片：
+The following example applies `fully_shard` on a data-parallel DeviceMesh to shard model parameters:
 
 ```python
 from hyper_parallel import fully_shard, init_device_mesh
@@ -122,81 +114,66 @@ dp_mesh = init_device_mesh("npu", (dp_size,), mesh_dim_names=("dp",))
 model = fully_shard(model, mesh=dp_mesh)
 ```
 
-TP、CP、EP、PP 等组合方式见 [特性使用指南](docs/guide/)，公开接口见 [API 参考](docs/api/api_reference.md)。
+See the [Feature Guides](docs/index.md#feature-guides) for TP, CP, EP, and PP combinations, and the [API Reference](docs/api/api_reference.md) for public interfaces.
 
 ---
 
-## 📖 文档
+## 📖 Documentation
 
-- [文档中心](./docs/index.md) — 文档索引与导航
-- [AutoModels](hyper_parallel/models/README.md) — YAML Trainer、训练组件与专题指南入口
-- [安装指南](docs/installation.md) — 源码构建、依赖安装
-- [特性使用指南](./docs/guide/) — 并行与训练能力指南
-- [API 参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
-- [FAQ 与故障排查](./docs/faq.md) — 常见问题与解决方案
-- [AI 辅助开发](./AGENTS.md) — AI 辅助开发说明
-- [社区贡献](./docs/contributing/) — 开发环境、测试规范和发布流程
-- [版本说明](./hyper_parallel_v1.0.0_release_notes.md) — 版本变更记录
-
----
-
-## 🗂️ 项目结构
-
-```text
-HyperParallel/
-├── hyper_parallel/
-│   ├── models/                         # 模型族适配层与 recipes/train.yaml，对外入口 api.py
-│   │   └── _transformers/              # Transformers 模型构建与预训练权重加载
-│   ├── trainer/                        # TrainerConfig、TextTrainer/VLMTrainer 和训练生命周期
-│   ├── components/                     # 高性能 modules/functional、优化器、loss 和 checkpoint
-│   ├── data/                           # 数据集读取、样本转换与 dataloader
-│   ├── distributed/                    # 分布式模型构建、并行计划应用与激活管理
-│   ├── core/
-│   │   ├── dtensor/                    # DeviceMesh、Layout、placement 和 DTensor
-│   │   ├── shard/                      # sharding plan、自定义 shard 和 DFunction
-│   │   ├── fully_shard/                # FSDP/HSDP 参数与执行调度
-│   │   ├── tensor_parallel/            # TP styles 与 loss parallel
-│   │   ├── context_parallel/           # Context Parallel
-│   │   ├── expert_parallel/            # Expert Parallel
-│   │   ├── pipeline_parallel/          # Pipeline stage 与调度
-│   │   └── distributed_checkpoint/     # 分布式保存、加载与 reshard
-│   ├── collectives/                    # 集合通信接口与实现
-│   └── platform/                       # PyTorch、MindSpore 与设备后端适配
-├── examples/
-│   ├── training_demo/                  # AutoModels 训练示例（数据准备、离线/在线 YAML）
-│   ├── data/                           # 数据准备脚本
-│   ├── generate/                       # 生成与精度对齐校验脚本
-│   ├── mindspore/                      # MindSpore 后端示例
-│   └── torch/                          # PyTorch 后端 Core API 组合示例
-├── docs/
-│   ├── guide/                          # 使用指南
-│   └── api/                            # API 参考
-└── tests/                              # models、Core 和后端测试
-```
+- [Documentation Center](./docs/index.md) — Documentation index and navigation
+- [Training Configuration and Components](hyper_parallel/models/README.md) — TrainerConfig fields, module structure, and component documentation
+- [Installation Guide](docs/installation.md) — Source builds and dependencies
+- [Feature Guides](./docs/index.md#feature-guides) — Parallelism and training capabilities
+- [API Reference](./docs/api/api_reference.md) — Interfaces organized by feature
+- [FAQ and Troubleshooting](./docs/faq.md) — Common issues and solutions
+- [AI-Assisted Development](./AGENTS.md) — Instructions for AI-assisted development
+- [Contributing](CONTRIBUTING.md) — Contribution workflow, testing, review, and releases
+- [Release Notes](./hyper_parallel_v1.0.0_release_notes.md) — Version history
 
 ---
 
-## 🤝 加入我们
+## 🤝 Join Us
 
-欢迎提交 Issue 和 Pull Request。开发环境、测试规范和提交流程见 [社区贡献指南](./docs/contributing/)。
+Issues and pull requests are welcome. Start with the [Contribution Guide](CONTRIBUTING.md) for development setup, testing, review, and the community release workflow.
 
 ### Parallel Training System SIG
 
-如果对 HyperParallel 的技术方向感兴趣，欢迎加入 [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System)。
+If you are interested in HyperParallel's technical direction, join the [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System).
 
-扫描下方二维码加入 Parallel Training System SIG 微信交流群，与社区开发者交流使用经验、技术方案和项目进展。
+Scan the QR code below to join the Parallel Training System SIG WeChat group and discuss usage, technical approaches, and project progress with community developers.
 
-<img src="./docs/images/parallel_training_system_sig_wechat.png" alt="Parallel Training System SIG 微信交流群二维码" width="220" />
+<img src="./docs/images/parallel_training_system_sig_wechat.png" alt="Parallel Training System SIG WeChat group QR code" width="220" />
 
-### HyperParallel 技术博客
+### HyperParallel Technical Blog
 
-扫描下方二维码关注 HyperParallel 小红书账号（小红书号：`hyperparallel`），获取技术博客与实践分享。
+Scan the QR code below to follow HyperParallel on REDnote (account: `hyperparallel`) for technical articles and practical experience.
 
 <a id="xiaohongshu-qrcode"></a>
-<img src="./docs/images/hyperparallel_xiaohongshu.png" alt="HyperParallel 小红书技术博客二维码" width="220" />
+<img src="./docs/images/hyperparallel_xiaohongshu.png" alt="HyperParallel REDnote technical blog QR code" width="220" />
 
 ---
 
-## 📄 许可证
+<a id="technical-reports"></a>
 
-[Apache 2.0许可证](LICENSE)
+## 📄 Technical Reports
+
+- HyperParallel-FSDP: Topology-Aware Fully Sharded Training with Layout-Driven Muon on Ascend SuperPods [[paper](https://arxiv.org/abs/2609.21594)]
+- HyperParallel-Mpipe: A Composable Algebra System for Optimizing MLLM Training over Supernode Clusters [[paper](https://arxiv.org/abs/2607.03229)]
+- HyperParallel-MoE: Multi-Core Interleaved Scheduling for Fast MoE Training on Ascend NPUs [[paper](https://arxiv.org/abs/2605.23764)]
+- HyperParallel: A Supernode-Affinity AI Framework [[paper](https://arxiv.org/abs/2603.03731)]
+- HyperOffload: Graph-Driven Hierarchical Memory Management for Large Language Models on SuperNode Architectures [[paper](https://arxiv.org/abs/2602.00748)]
+
+---
+
+## Acknowledgments
+
+We thank the following partners and projects for their work and support:
+
+- [Pengcheng Laboratory](https://www.pcl.ac.cn/)
+- [LlamaFactory](https://github.com/hiyouga/LlamaFactory)
+
+---
+
+## ⚖️ License
+
+[Apache 2.0 License](LICENSE)

@@ -1,0 +1,398 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Two-stage inline modeling source pipeline."""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import replace
+import importlib
+import textwrap
+from typing import Any
+
+from hyper_parallel.codegen.inline.ir import (
+    ImportPatch,
+    InlinePatchSet,
+    ModuleSnippetPatch,
+)
+from hyper_parallel.codegen.inline.meta_plan import normalize_inline_meta
+from hyper_parallel.codegen.inline.definition_edits import drop_shadowed_definitions
+from hyper_parallel.codegen.inline.patch_engine import apply_patch_set
+from hyper_parallel.codegen.inline.framework_spec import (
+    replacement_spec_for as replacement_spec,
+    strategy_spec_for as strategy_spec,
+)
+from hyper_parallel.codegen.inline.strategy_pass import build_strategy_patches
+from hyper_parallel.codegen.inline.observations import collect_source_observations
+from hyper_parallel.codegen.inline.source_plan import build_source_patch_plan
+
+
+def render_inline_modeling(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
+    """Render the inline-patched modeling file for a frozen plan.
+
+    This is the only artifact route. A YAML target with no adapter declaration
+    is a hard error rather than a silent fallback, so an inline coverage gap
+    surfaces at generation time instead of degrading the artifact. A plan with
+    no inline rules needs no patch and the source is returned unchanged.
+
+    Args:
+        source_text: Modeling source the inline patches are applied to.
+        meta: Frozen plan metadata recorded by the generator.
+        model_type: Model family key used to resolve framework declarations.
+
+    Returns:
+        The rendered modeling source.
+    """
+
+    rendered, _ = render_inline_modeling_with_plan(
+        source_text,
+        meta,
+        model_type,
+        patch_plan=patch_plan,
+    )
+    return rendered
+
+
+def render_inline_modeling_with_plan(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> tuple[str, Any]:
+    """Render source and return the independently normalized emission plan."""
+    rules = collect_source_observations(meta)
+    if not rules:
+        return source_text, meta
+    patches = patch_plan
+    recorded_local_compute = bool(
+        getattr(patches, "local_computes", ()) if patches is not None else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
+    patch_set = build_source_patch_plan(
+        rules,
+        strategy_rules,
+        model_type,
+        _observed_boundary_classes(meta, patch_plan),
+        getattr(meta, "external_state_classes", None),
+    )
+    _add_recorded_forward_host_imports(source_text, patch_set, patch_plan)
+    _materialize_imported_forward_hosts(source_text, patch_set)
+    rendered = apply_patch_set(source_text, patch_set)
+    # The copied modeling source brings its own decorated helpers that share
+    # names with the library functions the artifact imports, and a local
+    # definition wins over the import: the native path calls the library
+    # implementation (whose kernel binding is resolved in its own module), so a
+    # redefined copy makes the generated model run something else.  Only names
+    # the base source defines with a decorator are candidates, so the classes and
+    # snippets the inline passes render (which share names with library imports
+    # on purpose) keep their definitions.
+    rendered = drop_shadowed_definitions(
+        rendered, _library_import_names(rendered) & _decorated_names(source_text)
+    )
+    normalized_meta = normalize_inline_meta(meta, strategy_rules, model_type)
+    return rendered, normalized_meta
+
+
+def _add_recorded_forward_host_imports(
+    source_text: str,
+    patch_set: InlinePatchSet,
+    patch_plan: Any,
+) -> None:
+    """Expose observed replacement hosts needed by a forward rewrite.
+
+    A replacement application can be observed after the root model has built,
+    while its constructor belongs to an imported decoder rather than the copied
+    top-level source.  In that case the frozen replacement record is the source
+    of truth for the concrete host type.  Add its real import so the generic
+    imported-host materializer can emit the CP dispatch class.
+    """
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    imported_names = {
+        name
+        for item in patch_set.imports
+        if not item.raw
+        for name in item.names
+    }
+    replacements = (
+        getattr(patch_plan, "module_replacements", ())
+        if patch_plan is not None
+        else ()
+    )
+    replacement_types = {
+        record.replacement_type.__name__: record.replacement_type
+        for record in replacements
+    }
+    for patch in patch_set.forward_extracts:
+        if patch.class_name in source_classes or patch.class_name in imported_names:
+            continue
+        replacement_type = replacement_types.get(patch.class_name)
+        if replacement_type is None:
+            continue
+        patch_set.imports.append(
+            ImportPatch(replacement_type.__module__, (replacement_type.__name__,))
+        )
+        imported_names.add(patch.class_name)
+
+
+def _observed_boundary_classes(meta: Any, patch_plan: Any) -> dict[str, str]:
+    """Return boundary owners after native inner-wrapper target resolution."""
+    classes = dict(getattr(meta, "boundary_classes", None) or {})
+    wrappers = (
+        getattr(patch_plan, "inner_wrappers", ())
+        if patch_plan is not None
+        else ()
+    )
+    for record in wrappers:
+        target_type = getattr(record, "target_type", None)
+        if target_type is None:
+            continue
+        target_fqn = (
+            record.module_fqn
+            if record.target_fqn == "self"
+            else f"{record.module_fqn}.{record.target_fqn}"
+        )
+        classes[target_fqn] = target_type.__name__
+    return classes
+
+
+def _materialize_imported_forward_hosts(
+    source_text: str, patch_set: InlinePatchSet
+) -> None:
+    """Render same-name subclasses when a strategy host is an imported component."""
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    remaining = []
+    rendered: set[str] = set()
+    for patch in patch_set.forward_extracts:
+        if patch.class_name in source_classes:
+            remaining.append(patch)
+            continue
+        import_index = next(
+            (
+                index
+                for index, item in enumerate(patch_set.imports)
+                if not item.raw and patch.class_name in item.names
+            ),
+            None,
+        )
+        if import_index is None:
+            remaining.append(patch)
+            continue
+        if patch.class_name in rendered:
+            continue
+        rendered.add(patch.class_name)
+        imported = patch_set.imports[import_index]
+        other_names = tuple(name for name in imported.names if name != patch.class_name)
+        alias = f"_{patch.class_name}Base"
+        replacement_imports = []
+        if other_names:
+            replacement_imports.append(ImportPatch(imported.module, other_names))
+        replacement_imports.append(ImportPatch(
+            module="",
+            names=(),
+            raw=f"from {imported.module} import {patch.class_name} as {alias}",
+        ))
+        patch_set.imports[import_index:import_index + 1] = replacement_imports
+        body = patch.body.replace(
+            "return self._forward_impl(__hp_forward_args__)",
+            "return super().forward(__hp_forward_args__)",
+        ).replace("__hp_forward_args__", "*args, **kwargs")
+        snippet = (
+            f"class {patch.class_name}({alias}):\n"
+            "    \"\"\"Generated source-visible parallel form.\"\"\"\n\n"
+            "    cp_enable = False\n\n"
+            "    def forward(self, *args, **kwargs):\n"
+            f"{textwrap.indent(body.strip(), '        ')}\n"
+        )
+        patch_set.module_snippets.append(ModuleSnippetPatch(snippet))
+    patch_set.forward_extracts = remaining
+
+
+def render_inline_strategies_for_source_unit(
+    source_text: str,
+    meta: Any,
+    model_type: str | None = None,
+    *,
+    patch_plan: Any = None,
+) -> str:
+    """Render only strategy forwards owned by one sibling source unit."""
+    rules = collect_source_observations(meta)
+    if not rules:
+        return source_text
+    recorded_local_compute = bool(
+        getattr(patch_plan, "local_computes", ())
+        if patch_plan is not None
+        else ()
+    )
+    strategy_rules = (
+        tuple(replace(rule, local_compute_target=None) for rule in rules)
+        if recorded_local_compute
+        else rules
+    )
+    _require_inline_coverage(strategy_rules, model_type)
+    patches = build_strategy_patches(
+        strategy_rules,
+        model_type,
+        _observed_boundary_classes(meta, patch_plan),
+        getattr(meta, "external_state_classes", None),
+    )
+    source_classes = {
+        node.name
+        for node in ast.parse(source_text).body
+        if isinstance(node, ast.ClassDef)
+    }
+    patches.forward_extracts = [
+        patch for patch in patches.forward_extracts
+        if patch.class_name in source_classes
+    ]
+    if not patches.forward_extracts:
+        return source_text
+    patches.module_snippets.clear()
+    patches.constructor_replaces.clear()
+    patches.class_removals.clear()
+    return apply_patch_set(source_text, patches)
+
+
+def _library_import_names(text: str) -> set[str]:
+    """Names the artifact imports from the library, i.e. the winning bindings.
+
+    Args:
+        text: Rendered modeling source.
+
+    Returns:
+        The set of names bound by its ``hyper_parallel`` imports.
+    """
+
+    names: set[str] = set()
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return names
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("hyper_parallel"):
+            names.update(alias.asname or alias.name for alias in node.names)
+    return names
+
+
+def _decorated_names(text: str) -> set[str]:
+    """Names of the module-level definitions the base source decorates.
+
+    A decorator is what makes a copied helper behave differently from the library
+    function of the same name (a per-module kernel binding, for instance), so
+    only those definitions may be dropped.
+
+    Args:
+        text: Base modeling source before the inline patches are applied.
+
+    Returns:
+        The set of decorated top-level definition names.
+    """
+
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.decorator_list
+    }
+
+
+def _is_local_compute_factory(target: str) -> bool:
+    """Whether a local_compute target is a ``@local_compute`` factory.
+
+    Structural injection discipline: the decorator stamps the factory with
+    ``_injection_meta`` (kind ``LOCAL_COMPUTE``), so a decorated factory is
+    recognizable without a table.  Such a target carries no inline strategy
+    body -- its region is bound at install time (the emitted region template
+    for an in-source class, the runtime local-region skeleton for an imported
+    class), which resolves the factory exactly as the native applier does.
+    """
+    from hyper_parallel.distributed.recipe_spec import LOCAL_COMPUTE  # pylint: disable=C0415
+
+    module_name, _, attr = target.rpartition(".")
+    if not module_name or not attr:
+        return False
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return False
+    factory = getattr(module, attr, None)
+    if not callable(factory):
+        return False
+    meta = getattr(factory, "_injection_meta", None)
+    return getattr(meta, "kind", None) == LOCAL_COMPUTE
+
+
+def _require_inline_coverage(rules: tuple[Any, ...], model_type: str | None = None) -> None:
+    """Fail when a YAML rule has no structural resolution behind it.
+
+    Covers both rule kinds: a replacement target needs a ``ReplacementSpec``,
+    and every strategy target needs a ``StrategySpec``.  One exception: a
+    ``local_compute_fn`` target that is itself a ``@local_compute`` factory
+    needs no inline strategy -- its region is runtime-bound (see
+    :func:`_is_local_compute_factory`), so the factory's injection discipline
+    is the coverage proof.  Reporting all gaps at once keeps one fix cycle
+    from hiding the next gap.
+    """
+
+    uncovered: list[str] = []
+    for rule in rules:
+        if (
+            rule.replace_target is not None
+            and replacement_spec(rule.replace_target, model_type, module_type=rule.module_type) is None
+        ):
+            uncovered.append(rule.replace_target)
+        for target in (rule.local_compute_target, rule.inner_wrapper_target):
+            if target is None:
+                continue
+            if strategy_spec(
+                target, model_type, inner_wrapper=target == rule.inner_wrapper_target
+            ) is not None:
+                continue
+            # An inner_wrapper target has no runtime channel and stays
+            # fail-closed; a local_compute target passes through the
+            # @local_compute decoration check.
+            if target == rule.local_compute_target and _is_local_compute_factory(target):
+                continue
+            uncovered.append(target)
+    if uncovered:
+        raise RuntimeError(
+            f"codegen: no inline declaration for {sorted(set(uncovered))} "
+            f"(model_type={model_type!r}); the target names no known generic "
+            "component or framework strategy, and a local_compute target "
+            "names no @local_compute factory"
+        )

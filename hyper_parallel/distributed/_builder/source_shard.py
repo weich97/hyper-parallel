@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """source_shard: build_source_shard_info (05 §6.7.1).
 
 source_shard_info is read from the ShardingPlan (rather than from DTensors — under
@@ -25,18 +26,23 @@ on every source (non-FSDP) mesh axis, together with the source sub-mesh.
 final sharded parameter carries the full distributed layout (FSDP dims +
 source dims) for downstream consumers such as distributed checkpointing.
 """
+# pylint: disable=forbidden-backend-import
+
+from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
 from torch.nn import Module as ModuleClass
 from torch.nn import Parameter as ParameterClass
+from torch.utils.weak import WeakIdKeyDictionary
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, DTensor, Replicate
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shard
+from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed.plan import ShardingPlan
-from hyper_parallel.distributed.recipe_spec import resolve_placements
+from hyper_parallel.distributed.recipe_spec import EP, resolve_placements
 
 # Mesh dimensions whose sharding semantics belong to FSDP (or to other
 # parallelism concerns), never to the source layout recorded here:
@@ -93,6 +99,23 @@ def _check_fsdp_owned_axes(full_fqn, named_placement):
             )
 
 
+def _normalize_tied_pair_placements(info, tied_pairs):
+    """Normalize tied parameters to the finer source placement."""
+    if not tied_pairs:
+        return
+    for a, b in tied_pairs:
+        if a in info and b in info:
+            pa, _ = info[a]
+            pb, _ = info[b]
+            if pa != pb and len(pa) == len(pb):
+                norm = tuple(
+                    x if isinstance(x, Shard) else y
+                    for x, y in zip(pa, pb)
+                )
+                info[a] = (norm, info[a][1])
+                info[b] = (norm, info[b][1])
+
+
 def build_source_shard_info(
     plan: ShardingPlan,
     dense_source_mesh: Any,
@@ -130,10 +153,11 @@ def build_source_shard_info(
         for param_name, named_placement in spec.params.items():
             full_fqn = f"{fqn}.{param_name}"
             _check_fsdp_owned_axes(full_fqn, named_placement)
-            if spec._ep_size > 0 and param_name.startswith("experts."):  # pylint: disable=protected-access
+            if (spec._ep_size > 0  # pylint: disable=protected-access
+                    and isinstance((named_placement or {}).get(EP), Shard)):
                 if expert_source_mesh is None:
                     raise ValueError(
-                        "Routed expert metadata requires an expert EP source mesh"
+                        "Virtual-EP parameter metadata requires an EP source mesh"
                     )
                 placements = tuple(resolve_placements(named_placement, expert_source_dims))
                 info[full_fqn] = (placements, expert_mesh)
@@ -141,19 +165,10 @@ def build_source_shard_info(
                 placements = tuple(resolve_placements(named_placement, dense_source_dims))
                 info[full_fqn] = (placements, dense_mesh)
 
-    pairs = tied_pairs if tied_pairs is not None else plan.tied_pairs
-    if pairs:
-        for a, b in pairs:
-            if a in info and b in info:
-                pa, _ = info[a]
-                pb, _ = info[b]
-                if pa != pb and len(pa) == len(pb):
-                    norm = tuple(
-                        x if isinstance(x, Shard) else y
-                        for x, y in zip(pa, pb)
-                    )
-                    info[a] = (norm, info[a][1])
-                    info[b] = (norm, info[b][1])
+    _normalize_tied_pair_placements(
+        info,
+        tied_pairs if tied_pairs is not None else plan.tied_pairs,
+    )
     return info
 
 
@@ -327,10 +342,17 @@ def _get_default_source_shard_info(manager) -> fully_shard_utils.SourceShardMeta
 def _build_managed_source_shard_info(
     manager,
     owner: ModuleClass,
-    owner_by_parameter: Mapping[ParameterClass, ModuleClass],
     metadata_by_parameter: SourceShardInfoByParam | None,
+    ignored_params: set[ParameterClass] | None = None,
 ) -> SourceShardInfoByParam | None:
-    """Select and complete metadata for parameters managed by one wrap call."""
+    """Select and complete metadata for parameters managed by one wrap call.
+
+    Metadata must use the same parameter selection as ``fully_shard``. In
+    particular, nested FSDP units mark their parameters initialized before the
+    parent is wrapped, so ownership assigned from the pre-wrap module tree can
+    over-approximate the actual parameter set. Deriving this set through the
+    shared helper keeps source-layout metadata complete and exact.
+    """
     if metadata_by_parameter is None:
         return None
 
@@ -339,11 +361,9 @@ def _build_managed_source_shard_info(
         manager.mesh_context.fsdp_non_moe_mesh is not None
         or manager.mesh_context.device_mesh is not None
     ):
-        default_source_shard_info = _get_default_source_shard_info(manager, )
+        default_source_shard_info = _get_default_source_shard_info(manager)
     managed_source_shard_info = {}
-    for parameter, parameter_owner in owner_by_parameter.items():
-        if parameter_owner is not owner:
-            continue
+    for parameter in get_managed_modules_parameters((owner,), ignored_params):
         source_shard_info = metadata_by_parameter.get(parameter)
         if source_shard_info is None:
             if default_source_shard_info is None:
@@ -357,16 +377,22 @@ def _build_managed_source_shard_info(
 
 def _source_infos_for_fully_shard(
     managed_source_shard_info: SourceShardInfoByParam | None,
-) -> SourceShardInfoByParam | None:
-    """Return explicit metadata only for plain source-layout parameters.
+) -> Mapping[ParameterClass, fully_shard_utils.SourceShardMetaInfo] | None:
+    """Return non-owning metadata only for plain source-layout parameters.
 
     Validate-mode parameters remain native DTensors. The FSDP
     state derives their source layouts from each parameter directly and
     rejects duplicate explicit metadata.
+
+    The adapter keeps its construction-local mapping for post-wrap gradient
+    configuration. FSDP receives weak identity keys so its scheduler and state
+    cannot keep the replaced original parameters and their storage alive.
     """
+    if managed_source_shard_info is None:
+        return None
     if managed_source_shard_info and all(
         source_shard_info.origin_is_dtensor
         for source_shard_info in managed_source_shard_info.values()
     ):
         return None
-    return managed_source_shard_info
+    return WeakIdKeyDictionary(managed_source_shard_info)

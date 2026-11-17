@@ -14,6 +14,45 @@
 # ============================================================================
 """Business-neutral Agentic RL contracts and runtime orchestration."""
 
+# Public names are resolved lazily by __getattr__, not bound at import time.
+__all__ = list((
+    "Action",
+    "AgentAction",
+    "AgentProgram",
+    "AgentRunner",
+    "AgentSession",
+    "ENVIRONMENTS",
+    "Environment",
+    "EpisodeContext",
+    "EpisodeResult",
+    "INTERACTION_PROTOCOLS",
+    "InteractionMode",
+    "InteractionProtocol",
+    "JsonFunctionCallProtocol",
+    "Observation",
+    "OpenAIToolCallProtocol",
+    "ParsedAction",
+    "ProgramAgentRunner",
+    "ResponseParser",
+    "RewardFunction",
+    "RewardResult",
+    "TerminationReason",
+    "Tool",
+    "ToolCall",
+    "ToolEnvironment",
+    "ToolExecutor",
+    "ToolExecutorProtocol",
+    "ToolHandler",
+    "ToolRegistry",
+    "ToolResult",
+    "Transition",
+    "TurnContext",
+    "TurnResult",
+    "compute_rule_reward",
+    "extract_answer",
+    "load_agentic_module",
+))
+
 from importlib import import_module
 from typing import Any
 
@@ -22,7 +61,7 @@ _EXPORTS = {
     "Action": ("rl.agentic.core.types", "Action"),
     "AgentAction": ("rl.agentic.core.types", "AgentAction"),
     "AgentProgram": ("rl.agentic.core.program_runner", "AgentProgram"),
-    "AgentRunner": ("rl.agentic.core.runner", "AgentRunner"),
+    "AgentRunner": ("rl.agentic.core.trajectory_runner", "AgentRunner"),
     "AgentSession": ("rl.agentic.core.session", "AgentSession"),
     "ENVIRONMENTS": ("rl.agentic.envs.environment", "ENVIRONMENTS"),
     "Environment": ("rl.agentic.envs.environment", "Environment"),
@@ -72,6 +111,3 @@ def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
 def __dir__() -> list[str]:  # pylint: disable=invalid-name
     """Expose lazy public symbols to interactive callers."""
     return sorted((*globals(), *_EXPORTS))
-
-
-__all__ = sorted(_EXPORTS)

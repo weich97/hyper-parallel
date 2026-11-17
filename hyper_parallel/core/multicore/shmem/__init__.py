@@ -29,7 +29,8 @@ from ._api import (
     wait_signal,
 )
 from ._debug import debug_state
-from ._lifecycle import acquire, release
+from ._lifecycle import _restart
+from ._lifecycle import acquire, release, root_members
 
 __all__ = [
     "acquire",
@@ -42,6 +43,7 @@ __all__ = [
     "host_barrier",
     "put",
     "release",
+    "root_members",
     "signal",
     "wait_signal",
 ]

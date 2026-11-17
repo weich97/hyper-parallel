@@ -1,43 +1,87 @@
+# Simple Model Training - config-driven graph-mode TextTrainer example.
+#
+# The whole run is driven by this TrainerConfig: the toy model, its synthetic
+# data and the graph-mode FSDP pass are all selected here. FSDP is enabled by
+# compiling the joint graph (compile.enabled + use_joint_graph) and sharding
+# the data-parallel axis (fsdp_config.dp_shard_size), exactly like a real
+# HyperParallel graph run — only the model/data are toy stand-ins.
+
 model:
+  _target_: hyper_parallel.compile.examples.simple_model.model.build_model
   vocab_size: 128256
-  dim: 4096
-  max_seq_len: 8192
+  dim: 256
+  hidden_dim: 512
+  num_layers: 4
+  max_seq_len: 128
 
-# ============================================================================
-# Training Configuration
-# ============================================================================
-train:
-  max_steps: 1000
-  optimizer:
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  adamw_config:
     lr: 3.0e-4
-  grad_clip: 1.0
+    adamw_weight_decay: 0.0
 
-# ============================================================================
-# Parallel Configuration (Core)
-# ============================================================================
-parallel:
-  # Optimization options
-  enable_overlap: true
-  # Pipeline parallelism (graph-pass stage split)
-  # pp_enabled: false       # opt-in; PpPass slices the joint graph per stage
-  # pp_degree: null         # null -> world_size (one stage per rank)
-  # pp_microbatch_size: 1   # samples per microbatch for the GPipe schedule
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: constant
+  lr_config:
+    lr: 1.0e-2
+    lr_warmup_steps: 0
 
-# ============================================================================
-# Sharding Configuration
-# ============================================================================
-sharding:
-  # FSDP configuration
-  fsdp:
-    enabled: true  # REQUIRED: Enable FSDP
-    # Wrap modules by pattern (supports wildcards)
-    patterns:
-      - pattern: "*"  # FSDP all modules
-        reshard_after_forward: true
-        use_cpu_offload: false
+training:
+  train_iters: 20
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  logging_steps: 1
+  seed: 42
 
-# ============================================================================
-# Logging Configuration
-# ============================================================================
-logging:
-  log_interval: 10
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+fsdp_config:
+  dp_shard_size: 8
+
+compile:
+  enabled: true
+  use_joint_graph: true
+
+# Graph-mode activation checkpointing (recompute). The pass runs on the joint
+# fwd+bwd graph before FSDPPass; the model's repeated `layers` blocks (with the
+# `gradient_checkpointing` marker) define the recompute scope.
+activation_checkpoint:
+  # off       - save every activation (no recompute pass)
+  # full      - recompute every op in the discovered blocks
+  # selective - save matmul/attention/communication ops, recompute the rest
+  mode: full
+  selection:
+    # Omit both selectors to recompute every block. Real HF models may set
+    # source: model_adapter_safe_regions with layer_count / layer_indices.
+    source: default
+
+dataset:
+  _target_: hyper_parallel.compile.examples.simple_model.data.build_dataset
+  vocab_size: 128256
+  seq_length: 128
+  num_samples: 512
+  seed: 42
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  sampler_type: single
+  data_sharding: false
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+  collate_fn:
+    _target_: hyper_parallel.compile.examples.simple_model.data.build_collate_fn
+  get_batch:
+    _target_: hyper_parallel.compile.examples.simple_model.data.build_get_batch
+
+checkpoint:
+  save_ckpt: false

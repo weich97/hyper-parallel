@@ -19,30 +19,23 @@
 import contextlib
 import gc
 import importlib
-import os
 import unittest
 import warnings
 import weakref
 from typing import Any, Callable, cast
-from unittest.mock import MagicMock, call, patch, sentinel
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
-from torch.utils.checkpoint import DefaultDeviceType
 
 
 from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
-    clear_recompute_session,
-    recompute_handle,
-    recompute_handle_collector_ctx,
-    recompute_session_ctx,
 )
 from hyper_parallel.core.activation_memory import wrapper as wrapper_module
 from hyper_parallel.core.activation_memory.wrapper import (
     ActivationWrapper,
     AsyncSaveOnCpu,
     CheckpointExcludeWrapper,
-    CheckpointWrapper,
     FuncModule,
     SwapWrapper,
     base_check_fn,
@@ -82,7 +75,7 @@ class _CallableObject:
 class _PassthroughWrapper(ActivationWrapper):
     """Concrete activation wrapper used to exercise base-class behavior."""
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Forward directly to the wrapped module."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
         return wrapped_module(*args, **kwargs)
@@ -132,7 +125,7 @@ class TestWrapperHelpers(unittest.TestCase):
         callable_obj = _CallableObject()
 
         wrapper_module._mark_wrapped(callable_obj)
-        self.assertTrue(callable_obj._is_wrapped)
+        self.assertTrue(getattr(callable_obj, "_is_wrapped", False))
         self.assertIsNone(wrapper_module._mark_wrapped(object()))
 
     def test_get_wrapped_callable_unwraps_function_modules(self):
@@ -153,7 +146,7 @@ class TestWrapperHelpers(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "already wrapped"):
             wrapper_module._check_and_mark_callable(callable_obj)
 
-        self.assertTrue(callable_obj._is_wrapped)
+        self.assertTrue(getattr(callable_obj, "_is_wrapped", False))
 
     def test_wrapping_parent_warns_for_wrapped_parameterized_child(self):
         """A wrapped parameterized child should be detected when wrapping its parent."""
@@ -331,6 +324,7 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         original_ref = weakref.ref(original)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             saved_tensors = AsyncSaveOnCpu(group_swap=True)
@@ -361,12 +355,231 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
         x = torch.randn(2, requires_grad=True)
         fake_manager = MagicMock()
         fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
 
         with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
             with AsyncSaveOnCpu(policy_fn=lambda tensor: CheckpointPolicy.MUST_SWAP, group_swap=True):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_skips_storage_registration_for_last_group(self):
+        """Last groups should keep saved tensors on device without registering swap storage."""
+        tensor = torch.randn(2, requires_grad=True)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = True
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager):
+            saved_tensors = AsyncSaveOnCpu(group_swap=True)
+            packed = saved_tensors.pack_hook(tensor)
+
+        self.assertIsNot(packed, tensor)
+        self.assertFalse(packed.requires_grad)
+        self.assertTrue(torch.equal(packed, tensor))
+        fake_manager.is_last_group.assert_called_once_with("group0")
+        fake_manager.add_storage.assert_not_called()
+
+
+class TestCheckpointWrapperSwapState(unittest.TestCase):
+    """Keep wired swap groups reusable after custom checkpoint backward."""
+
+    def test_new_forward_resets_stale_backward_state(self):
+        """A real forward must rearm offload when the full backward hook did not fire."""
+        for use_reentrant in (False, True):
+            with self.subTest(use_reentrant=use_reentrant):
+                wrapper = ckpt_wrapper(torch.nn.Identity(), use_reentrant=use_reentrant)
+                wrapper._swap_group_name = "group0"
+                wrapper._swap_state = "pre_backward"
+                manager = MagicMock()
+                expected = torch.tensor(2.0)
+                with patch.object(wrapper_module, "SwapManager", return_value=manager), \
+                     patch.object(_api_module, "checkpoint", return_value=expected):
+                    result = wrapper(expected)
+
+                self.assertIs(result, expected)
+                self.assertEqual(wrapper._swap_state, "backward")
+                manager.set_current_group_name.assert_called_once_with("group0")
+
+
+class TestCheckpointExcludeWrapper(unittest.TestCase):
+    """Unit tests for checkpoint exclusion swap configuration and output registration."""
+
+    def test_constructor_validates_and_stores_swap_options(self):
+        """The wrapper should reject invalid options and retain valid configuration."""
+        pool = wrapper_module.PinnedMemoryPool(max_host_bytes=1024)
+        wrapped = checkpoint_exclude_wrapper(
+            torch.nn.Identity(),
+            swap=True,
+            group_swap=True,
+            cpu_pool=pool,
+        )
+
+        self.assertIsInstance(wrapped, CheckpointExcludeWrapper)
+        self.assertTrue(wrapped.swap)
+        self.assertTrue(wrapped.group_swap)
+        self.assertIs(wrapped.cpu_pool, pool)
+        with self.assertRaisesRegex(ValueError, "swap must be a bool"):
+            checkpoint_exclude_wrapper(torch.nn.Identity(), swap=1)
+        with self.assertRaisesRegex(ValueError, "group_swap must be a bool"):
+            checkpoint_exclude_wrapper(torch.nn.Identity(), group_swap=1)
+        with self.assertRaisesRegex(ValueError, "cpu_pool must be a PinnedMemoryPool or None"):
+            checkpoint_exclude_wrapper(torch.nn.Identity(), cpu_pool=object())
+
+    def test_swap_disabled_warns_for_ignored_swap_options(self):
+        """Ignored group-swap and CPU-pool options should emit a user-visible warning."""
+        pool = wrapper_module.PinnedMemoryPool(max_host_bytes=1024)
+        test_cases = [
+            ({"group_swap": True}, "group_swap"),
+            ({"cpu_pool": pool}, "cpu_pool"),
+            ({"group_swap": True, "cpu_pool": pool}, "group_swap, cpu_pool"),
+        ]
+
+        for options, expected_options in test_cases:
+            with self.subTest(options=options):
+                with self.assertWarnsRegex(
+                    UserWarning,
+                    rf"ignores {expected_options} when swap=False",
+                ):
+                    checkpoint_exclude_wrapper(torch.nn.Identity(), swap=False, **options)
+
+    def test_outside_checkpoint_swap_is_transparent(self):
+        """Swap configuration should not allocate resources without recompute state."""
+        wrapped = checkpoint_exclude_wrapper(lambda tensor: tensor + 1, swap=True, group_swap=True)
+        tensor = torch.tensor([2.0])
+
+        with patch.object(wrapper_module, "get_recompute_state", return_value=None), \
+             patch.object(wrapper_module, "AsyncSaveOnCpu") as mock_hooks, \
+             patch.object(wrapper_module, "_register_checkpoint_exclude_outputs") as mock_register:
+            result = wrapped(tensor)
+
+        torch.testing.assert_close(result, torch.tensor([3.0]))
+        mock_hooks.assert_not_called()
+        mock_register.assert_not_called()
+
+    def test_active_checkpoint_forward_and_replay_share_cached_output(self):
+        """Forward should register swap once while replay reuses the cached output."""
+        wrapped = checkpoint_exclude_wrapper(lambda tensor: tensor + 1, swap=True, group_swap=True)
+        cache = _checkpoint_exclude._ExcludeCache()
+        forward_state = MagicMock(is_recomputing=False, preserve_rng_state=False)
+        forward_state.get_resource.return_value = cache
+        replay_state = MagicMock(is_recomputing=True, preserve_rng_state=False)
+        replay_state.get_resource.return_value = cache
+        swap_hooks = MagicMock()
+        tensor = torch.tensor([2.0], requires_grad=True)
+
+        with patch.object(
+            wrapper_module,
+            "get_recompute_state",
+            side_effect=[forward_state, replay_state],
+        ), patch.object(
+            wrapper_module,
+            "AsyncSaveOnCpu",
+            return_value=swap_hooks,
+        ) as mock_hooks, patch.object(
+            wrapper_module,
+            "_register_checkpoint_exclude_outputs",
+            side_effect=lambda output, **_: output,
+        ) as mock_register:
+            forward_output = wrapped(tensor)
+            replay_output = wrapped(tensor.detach())
+
+        mock_hooks.assert_called_once_with(group_swap=True, cpu_pool=None)
+        swap_hooks.__enter__.assert_not_called()
+        mock_register.assert_called_once_with(
+            forward_output,
+            group_swap=True,
+            cpu_pool=None,
+        )
+        self.assertIs(replay_output, forward_output)
+
+    def test_active_checkpoint_requires_exposed_async_hooks(self):
+        """A PyTorch runtime without hook attributes should fail explicitly."""
+        wrapped = checkpoint_exclude_wrapper(torch.nn.Identity(), swap=True)
+        state = MagicMock(is_recomputing=False, preserve_rng_state=False)
+        state.get_resource.return_value = _checkpoint_exclude._ExcludeCache()
+
+        with patch.object(wrapper_module, "get_recompute_state", return_value=state), \
+             patch.object(wrapper_module, "AsyncSaveOnCpu", return_value=object()):
+            with self.assertRaisesRegex(RuntimeError, "no callable pack_hook and unpack_hook"):
+                wrapped(torch.ones(1))
+
+    def test_register_outputs_preserves_identity_and_forwards_swap_options(self):
+        """Eligible output leaves should register original tensors in one storage."""
+        first = torch.ones(2)
+        second = torch.ones(1)
+        output = {"first": first, "nested": [second]}
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
+        pool = sentinel.cpu_pool
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager), \
+             patch.object(wrapper_module, "SwapTensor") as mock_swap_tensor:
+            result = wrapper_module._register_checkpoint_exclude_outputs(
+                output,
+                group_swap=True,
+                cpu_pool=pool,
+            )
+
+        self.assertIs(result, output)
+        self.assertIs(result["first"], first)
+        self.assertIs(result["nested"][0], second)
+        self.assertEqual(mock_swap_tensor.call_count, 2)
+        first_call, second_call = mock_swap_tensor.call_args_list
+        self.assertIs(first_call.args[0], first)
+        self.assertEqual(first_call.args[1], "group0::torch.Size([2])")
+        self.assertEqual(first_call.kwargs, {"group_swap": True, "cpu_pool": pool})
+        self.assertIs(second_call.args[0], second)
+        self.assertEqual(second_call.args[1], "group0::torch.Size([1])")
+        self.assertEqual(second_call.kwargs, {"group_swap": True, "cpu_pool": pool})
+        fake_manager.add_storage.assert_called_once()
+
+    def test_register_outputs_falls_back_per_tensor(self):
+        """Ineligible leaves should remain saved without blocking eligible siblings."""
+        eligible = torch.ones(2)
+        parameter = torch.nn.Parameter(torch.ones(2))
+        empty = torch.empty(0)
+        output = (eligible, parameter, empty)
+        fake_manager = MagicMock()
+        fake_manager.get_current_group_name.return_value = "group0"
+        fake_manager.is_last_group.return_value = False
+
+        with patch.object(wrapper_module, "SwapManager", return_value=fake_manager), \
+             patch.object(wrapper_module, "SwapTensor") as mock_swap_tensor:
+            result = wrapper_module._register_checkpoint_exclude_outputs(
+                output,
+                group_swap=False,
+                cpu_pool=None,
+            )
+
+        self.assertIs(result, output)
+        mock_swap_tensor.assert_called_once()
+        fake_manager.add_storage.assert_called_once()
+
+    def test_register_outputs_missing_or_last_group_does_not_add_storage(self):
+        """Missing and terminal groups should keep output leaves on device."""
+        output = torch.ones(2)
+        missing_manager = MagicMock()
+        missing_manager.get_current_group_name.return_value = ""
+        last_manager = MagicMock()
+        last_manager.get_current_group_name.return_value = "group0"
+        last_manager.is_last_group.return_value = True
+
+        with patch.object(wrapper_module, "SwapManager", return_value=missing_manager):
+            result_missing = wrapper_module._register_checkpoint_exclude_outputs(
+                output, group_swap=False, cpu_pool=None
+            )
+        with patch.object(wrapper_module, "SwapManager", return_value=last_manager):
+            result_last = wrapper_module._register_checkpoint_exclude_outputs(
+                output, group_swap=False, cpu_pool=None
+            )
+
+        self.assertIs(result_missing, output)
+        self.assertIs(result_last, output)
+        missing_manager.warn_missing_group_once.assert_called_once_with()
+        missing_manager.add_storage.assert_not_called()
+        last_manager.add_storage.assert_not_called()
 
 
 class TestSwapTensorWrapper(unittest.TestCase):

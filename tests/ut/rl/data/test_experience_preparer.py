@@ -22,10 +22,10 @@ import pytest
 import torch
 
 from rl.algorithm import build_algorithm
-from rl.dataset import ExperiencePreparer
-from rl.dataset.batch_builder import build_experience_batch
-from rl.dataset.contracts import Trajectory, Turn
-from rl.roles.rollout.base import GenerationSettings
+from rl.data.experience import ExperiencePreparer
+from rl.data.experience import build_experience_batch
+from rl.data.contracts import Trajectory, Turn
+from rl.rollout.base import GenerationSettings
 
 
 def _settings() -> GenerationSettings:
@@ -55,7 +55,7 @@ def _trajectory(
         token_ids=torch.tensor(tokens),
         attention_mask=torch.ones(len(tokens), dtype=torch.bool),
         action_mask=torch.tensor(actions),
-        rollout_log_probs=torch.arange(len(tokens) - 1, dtype=torch.float32) + index,
+        rollout_log_probs=-(torch.arange(len(tokens) - 1, dtype=torch.float32) + index),
         reward=reward,
         reward_components={"task": reward},
         done=True,
@@ -82,7 +82,7 @@ def test_trajectories_build_padded_experience_contract() -> None:
     assert batch.action_mask.tolist() == [[False, True, True, False], [False, True, True, True]]
     torch.testing.assert_close(
         batch.old_log_probs,
-        torch.tensor([[0.0, 1.0, 0.0], [1.0, 2.0, 3.0]]),
+        torch.tensor([[0.0, -1.0, 0.0], [-1.0, -2.0, -3.0]]),
     )
     assert batch.responses == ("answer-0", "answer-1")
     assert batch.worker_policy_version == 2

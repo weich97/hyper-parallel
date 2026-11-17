@@ -23,20 +23,21 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from rl.dataset.contracts import ExperienceBatch
+    from rl.data.contracts import ExperienceBatch
 
 _GIB = 1024 ** 3
 
 
 @dataclass(frozen=True)
 class ActorMicroBatchMetrics:
-    """Detached token sums produced by one Actor forward/backward call."""
+    """Detached loss numerators and token diagnostics from one micro-batch."""
     total_loss_sum: Any
     policy_loss_sum: Any
     kl_loss_sum: Any
     old_policy_kl_sum: Any
     log_ratio_abs_sum: Any
     clipped_token_count: Any
+    clipped_sequence_count: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,11 @@ class ActorUpdateMetrics:
     learning_rate: float
     valid_tokens: int
     optimizer_steps: int
+    valid_sequences: Optional[int] = None
+    sequence_clip_fraction: Optional[float] = None
+    micro_batches: Optional[int] = None
+    input_tokens: Optional[int] = None
+    padded_input_tokens: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -67,12 +73,16 @@ class CriticUpdateMetrics:
 class ActorMetricAccumulator:
     """Accumulate detached Actor statistics without controlling optimization."""
 
-    def __init__(self, totals: Any, dp_group_info: Any, dp_size: int) -> None:
+    def __init__(
+        self, totals: Any, dp_group_info: Any, dp_size: int, loss_aggregation: str = "token-mean",
+    ) -> None:
         """Initialize detached metric totals and data-parallel reduction metadata."""
         self._totals = totals
         self._dp_group_info = dp_group_info
         self._dp_size = dp_size
         self._global_tokens = 0
+        self._global_sequences = 0
+        self._loss_aggregation = loss_aggregation
         self._gradient_norm_sum = 0.0
         self._optimizer_steps = 0
 
@@ -83,12 +93,16 @@ class ActorMetricAccumulator:
         *,
         dp_group_info: Any,
         dp_size: int,
+        loss_aggregation: str = "token-mean",
     ) -> "ActorMetricAccumulator":
-        """Create six scalar accumulators on the supplied tensor device."""
+        """Create loss and diagnostic accumulators for the algorithm's units."""
         if dp_size <= 0:
             raise ValueError(f"dp_size must be positive, got {dp_size}")
-        totals = zero.new_zeros((6,), dtype=torch.float32)
-        return cls(totals, dp_group_info, dp_size)
+        if loss_aggregation not in ("token-mean", "seq-mean-token-mean"):
+            raise ValueError(f"Unsupported loss aggregation: {loss_aggregation}")
+        size = 7 if loss_aggregation == "seq-mean-token-mean" else 6
+        totals = zero.new_zeros((size,), dtype=torch.float32)
+        return cls(totals, dp_group_info, dp_size, loss_aggregation)
 
     def add_micro_batch(self, metrics: ActorMicroBatchMetrics) -> None:
         """Add detached loss and diagnostic sums from one micro-batch."""
@@ -100,26 +114,42 @@ class ActorMetricAccumulator:
             metrics.log_ratio_abs_sum,
             metrics.clipped_token_count,
         )
+        if self._loss_aggregation == "seq-mean-token-mean":
+            if metrics.clipped_sequence_count is None:
+                raise ValueError("Sequence loss metrics require clipped_sequence_count")
+            values += (metrics.clipped_sequence_count,)
         self._totals.add_(
             torch.cat(tuple(value.detach().reshape(1) for value in values), dim=0)
         )
 
-    def add_optimizer_step(self, *, global_tokens: int, gradient_norm: float) -> None:
-        """Record one optimizer step and its global token denominator."""
+    def add_optimizer_step(
+        self, *, global_tokens: int, gradient_norm: float, global_sequences: Optional[int] = None,
+    ) -> None:
+        """Record already-global denominators once for each optimizer step."""
         if global_tokens <= 0:
             raise ValueError(f"global_tokens must be positive, got {global_tokens}")
+        if self._loss_aggregation == "seq-mean-token-mean" and global_sequences is None:
+            raise ValueError("Sequence loss metrics require global_sequences")
+        if global_sequences is not None:
+            if global_sequences <= 0 or global_sequences > global_tokens:
+                raise ValueError("global_sequences must be positive and cannot exceed global_tokens")
+            self._global_sequences += global_sequences
         self._global_tokens += global_tokens
         self._gradient_norm_sum += gradient_norm
         self._optimizer_steps += 1
 
     def finalize(self, *, learning_rate: float) -> ActorUpdateMetrics:
-        """Reduce token sums and return public Actor update metrics."""
+        """Normalize losses and diagnostics using their respective global units."""
         if self._optimizer_steps <= 0 or self._global_tokens <= 0:
             raise RuntimeError("Actor metrics require at least one optimizer step")
         totals = self._totals.clone()
         if self._dp_size > 1:
             dist.all_reduce(totals, group=self._dp_group_info.group)
         means = totals / float(self._global_tokens)
+        sequence_clip_fraction = None
+        if self._loss_aggregation == "seq-mean-token-mean":
+            means[:3] = totals[:3] / float(self._global_sequences)
+            sequence_clip_fraction = float((totals[6] / self._global_sequences).item())
         return ActorUpdateMetrics(
             total_loss=float(means[0].item()),
             policy_loss=float(means[1].item()),
@@ -131,6 +161,8 @@ class ActorMetricAccumulator:
             learning_rate=learning_rate,
             valid_tokens=self._global_tokens,
             optimizer_steps=self._optimizer_steps,
+            valid_sequences=self._global_sequences or None,
+            sequence_clip_fraction=sequence_clip_fraction,
         )
 
 
@@ -172,6 +204,15 @@ def build_training_metrics(
         "train/optimizer_steps": float(actor_update.optimizer_steps),
     }
     metrics.update(rollout_metrics)
+    if actor_update.micro_batches is not None:
+        metrics["train/micro_batches_per_rank"] = float(actor_update.micro_batches)
+        metrics["train/input_tokens"] = float(actor_update.input_tokens)
+        metrics["train/padded_input_tokens"] = float(actor_update.padded_input_tokens)
+        metrics["train/padding_fraction"] = 1.0 - actor_update.input_tokens / actor_update.padded_input_tokens
+    if actor_update.valid_sequences is not None:
+        metrics["train/valid_sequences"] = float(actor_update.valid_sequences)
+    if actor_update.sequence_clip_fraction is not None:
+        metrics["train/sequence_clip_fraction"] = actor_update.sequence_clip_fraction
     if critic_update is not None:
         metrics.update(
             {
@@ -189,7 +230,7 @@ def build_training_metrics(
         metrics["policy/version"] = float(policy.policy_version)
         configured_strategy = getattr(policy, "weight_sync_configured_strategy", None)
         last_strategy = getattr(policy, "weight_sync_last_strategy", None)
-        for strategy in ("direct_reshard", "full_gather"):
+        for strategy in ("full_gather",):
             metrics[f"weight_sync/configured_{strategy}"] = float(
                 configured_strategy == strategy
             )
@@ -280,7 +321,28 @@ def _local_training_diagnostics(
     actor_log_probs: Any,
 ) -> dict[str, Any]:
     """Build mergeable pre-update probability and target statistics."""
-    rollout_log_probs = experience.old_log_probs
+    mask = experience.loss_action_mask.bool()
+    return_errors = (
+        None
+        if experience.returns is None or experience.values is None
+        else experience.returns - experience.values
+    )
+    record = {
+        "advantages": _masked_statistics(experience.advantages, mask),
+        "returns": _masked_statistics(experience.returns, mask),
+        "values": _masked_statistics(experience.values, mask),
+        "return_errors": _masked_statistics(return_errors, mask),
+        "action_tokens": int(mask.flatten().sum(dim=0).item()),
+        "total_tokens": int(experience.attention_mask[
+            [index for index, row in enumerate(experience.trajectories) if not row.metadata.get("dp_padding", False)]
+            if experience.trajectories else slice(None)
+        ].flatten().sum(dim=0).item()),
+    }
+    if actor_log_probs is None:
+        return record
+    rollout_log_probs = getattr(experience, "rollout_log_probs", None)
+    if rollout_log_probs is None:
+        rollout_log_probs = experience.old_log_probs
     if rollout_log_probs is None:
         raise ValueError("Log-probability diagnostics require rollout log-probabilities")
     expected_shape = tuple(rollout_log_probs.shape)
@@ -289,7 +351,6 @@ def _local_training_diagnostics(
             "Actor and rollout log-probabilities must align: "
             f"actor={tuple(actor_log_probs.shape)}, rollout={expected_shape}"
         )
-    mask = experience.loss_action_mask.bool()
     if tuple(mask.shape) != expected_shape:
         raise ValueError(
             f"Action mask must align with log-probabilities: mask={tuple(mask.shape)}, "
@@ -299,12 +360,7 @@ def _local_training_diagnostics(
     rollout = rollout_log_probs.detach().float().masked_select(mask)
     actor_probabilities = actor.exp()
     rollout_probabilities = rollout.exp()
-    return_errors = (
-        None
-        if experience.returns is None or experience.values is None
-        else experience.returns - experience.values
-    )
-    return {
+    record.update({
         "actor_log": _local_statistics(actor),
         "rollout_log": _local_statistics(rollout),
         "absolute_log_diff": _local_statistics((actor - rollout).abs()),
@@ -317,13 +373,8 @@ def _local_training_diagnostics(
         "probability_cross_sum": float(
             (actor_probabilities * rollout_probabilities).sum(dim=0).item()
         ),
-        "advantages": _masked_statistics(experience.advantages, mask),
-        "returns": _masked_statistics(experience.returns, mask),
-        "values": _masked_statistics(experience.values, mask),
-        "return_errors": _masked_statistics(return_errors, mask),
-        "action_tokens": int(mask.flatten().sum(dim=0).item()),
-        "total_tokens": int(experience.attention_mask.flatten().sum(dim=0).item()),
-    }
+    })
+    return record
 
 
 def _gather_diagnostic_records(local: dict[str, Any]) -> list[dict[str, Any]]:
@@ -365,7 +416,6 @@ def _probability_diagnostic_metrics(
         float(record["probability_cross_sum"]) for record in records
     )
     action_tokens = sum(int(record["action_tokens"]) for record in records)
-    total_tokens = sum(int(record["total_tokens"]) for record in records)
     return {
         "training/rollout_probs_diff_valid": 1.0,
         "training/rollout_probs_diff_max": probability_diff["max"],
@@ -384,8 +434,6 @@ def _probability_diagnostic_metrics(
         "training/actor_log_probs_mean": actor_log["mean"],
         "training/rollout_actor_kl": rollout_log["mean"] - actor_log["mean"],
         "training/log_probs_valid_tokens": float(action_tokens),
-        "training/total_tokens": float(total_tokens),
-        "training/action_token_fraction": action_tokens / max(total_tokens, 1),
     }
 
 
@@ -424,11 +472,12 @@ def _add_target_diagnostics(
 
 def summarize_training_diagnostics(
     experience: ExperienceBatch,
-    actor_log_probs: Any,
+    actor_log_probs: Any = None,
 ) -> dict[str, float]:
-    """Compare rollout and pre-update Actor probabilities across DP ranks.
+    """Summarize targets and tokens, optionally comparing pre-update probabilities.
 
     The supplied Actor log-probabilities must be computed before optimization.
+    Pass None when no independent probability comparison is available.
     This function only reads detached tensors and never changes training inputs.
     """
     records = _gather_diagnostic_records(
@@ -436,9 +485,15 @@ def summarize_training_diagnostics(
     )
     if dist.get_rank() != 0:
         return {}
-    metrics = _probability_diagnostic_metrics(records)
-    if metrics is None:
-        return {"training/rollout_probs_diff_valid": 0.0}
+    total_tokens = sum(int(record["total_tokens"]) for record in records)
+    action_tokens = sum(int(record["action_tokens"]) for record in records)
+    metrics = {
+        "training/total_tokens": float(total_tokens),
+        "training/action_token_fraction": action_tokens / max(total_tokens, 1),
+        "training/rollout_probs_diff_valid": 0.0,
+    }
+    if actor_log_probs is not None:
+        metrics.update(_probability_diagnostic_metrics(records) or {})
     _add_target_diagnostics(metrics, records)
     return metrics
 
@@ -465,6 +520,63 @@ def select_round_robin_samples(
     return selected
 
 
+def _rollout_samples(
+    rollout: ExperienceBatch,
+    batch: Mapping[str, Any],
+    episodes: list[list[int]],
+    rewards: list[float],
+    *,
+    step: int,
+    sample_limit: int,
+) -> list[dict[str, Any]]:
+    """Render bounded episode samples without counting each model call as a candidate."""
+    # The dataset package eagerly imports Actor, which itself imports these metrics.
+    from rl.data.episodes import generation_finish_reason  # pylint: disable=C0415
+
+    batch_rows = {
+        str(prompt_id): row
+        for row, prompt_id in enumerate(batch.get("prompt_ids", batch["sample_indices"]))
+    }
+    samples = []
+    for index, rows in enumerate(episodes[:sample_limit]):
+        trajectory = rollout.trajectories[rows[0]]
+        response = "\n".join(rollout.responses[row] for row in rows)
+        batch_row = batch_rows[trajectory.prompt_id]
+        samples.append(
+            {
+                "step": step,
+                "rank": dist.get_rank(),
+                "prompt": batch["prompts"][batch_row],
+                "response": response,
+                **({"ground_truth": batch["ground_truths"][batch_row]}
+                   if isinstance(batch["ground_truths"][batch_row], str) else {}),
+                "extracted_answer": trajectory.metadata.get("extracted_answer"),
+                "reward": float(rewards[index]),
+                "reward_components": dict(trajectory.reward_components),
+                "terminal_reason": rollout.trajectories[rows[-1]].terminal_reason,
+                "status": trajectory.metadata.get("status"),
+                "finish_reason": generation_finish_reason(rollout.trajectories[rows[-1]]),
+            }
+        )
+    return samples
+
+
+def _episode_reward_details(trajectories, rewards):
+    """Aggregate reward components, statuses, and group rewards."""
+    component_sums: dict[str, float] = {}
+    status_counts: dict[str, int] = {}
+    group_rewards: dict[str, list[float]] = {}
+    for trajectory, reward in zip(trajectories, rewards):
+        for name, value in trajectory.reward_components.items():
+            component_sums[name] = component_sums.get(name, 0.0) + float(value)
+        status = trajectory.metadata.get("status")
+        if isinstance(status, str):
+            status_counts[status] = status_counts.get(status, 0) + 1
+        group_id = trajectory.group_id or trajectory.prompt_id
+        group_rewards.setdefault(group_id, []).append(float(reward))
+    return component_sums, status_counts, group_rewards
+
+
 def _local_rollout_record(
     rollout: ExperienceBatch,
     batch: Mapping[str, Any],
@@ -473,38 +585,41 @@ def _local_rollout_record(
     sample_limit: int,
 ) -> dict[str, Any]:
     """Build mergeable rollout statistics and bounded local samples."""
-    response_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
-    rewards = rollout.rewards.detach().cpu().tolist()
-    rank = dist.get_rank()
-    batch_rows = {
-        str(int(sample_index)): row
-        for row, sample_index in enumerate(batch["sample_indices"])
-    }
-    samples = []
-    for index, response in enumerate(rollout.responses[:sample_limit]):
-        trajectory = rollout.trajectories[index]
-        batch_row = batch_rows[trajectory.prompt_id]
-        samples.append(
-            {
-                "step": step,
-                "rank": rank,
-                "prompt": batch["prompts"][batch_row],
-                "response": response,
-                "ground_truth": batch["ground_truths"][batch_row],
-                "extracted_answer": trajectory.metadata.get("extracted_answer"),
-                "reward": float(rewards[index]),
-            }
-        )
-    group_rewards: dict[str, list[float]] = {}
-    for trajectory, reward in zip(rollout.trajectories, rewards):
-        group_id = trajectory.group_id or trajectory.prompt_id
-        group_rewards.setdefault(group_id, []).append(float(reward))
+    # Defer the dataset package cycle until Actor and its metrics are initialized.
+    from rl.data.episodes import episode_rows  # pylint: disable=C0415
+
+    metadata = getattr(rollout, "metadata", {})
+    if metadata.get("reward_status") == "pending":
+        raise ValueError("Pending model rewards cannot be reported as rollout metrics")
+    episodes = episode_rows(rollout.trajectories)
+    call_lengths = rollout.action_mask.sum(dim=-1).detach().cpu().tolist()
+    response_lengths = [sum(call_lengths[row] for row in rows) for rows in episodes]
+    all_rewards = rollout.rewards.detach().cpu().tolist()
+    rewards = [all_rewards[rows[0]] for rows in episodes]
+    trajectories = [rollout.trajectories[rows[0]] for rows in episodes]
+    component_sums, status_counts, group_rewards = _episode_reward_details(trajectories, rewards)
     return {
+        "component_sums": component_sums,
+        "status_counts": status_counts,
+        "success_sum": sum(
+            float(trajectory.reward_components.get("success", trajectory.reward_components.get(
+                "correctness", reward if metadata.get("reward_status") != "scored" else 0.0,
+            ))) for trajectory, reward in zip(trajectories, rewards)
+        ),
+        "success_count": sum(
+            int(metadata.get("reward_status") != "scored"
+                or "success" in trajectory.reward_components
+                or "correctness" in trajectory.reward_components)
+            for trajectory in trajectories
+        ),
+        "model_scored": metadata.get("reward_status") == "scored",
+        "reward_request_count": int(metadata.get("reward_request_count", 0)),
+        "reward_retry_count": int(metadata.get("reward_retry_count", 0)),
         "reward_sum": float(sum(rewards)),
         "reward_square_sum": float(sum(reward * reward for reward in rewards)),
         "reward_count": len(rewards),
-        "reward_min": float(min(rewards)),
-        "reward_max": float(max(rewards)),
+        "reward_min": float(min(rewards, default=math.inf)),
+        "reward_max": float(max(rewards, default=-math.inf)),
         "zero_std_groups": sum(
             int(max(group) == min(group)) for group in group_rewards.values()
         ),
@@ -513,12 +628,42 @@ def _local_rollout_record(
         "length_min": int(min(response_lengths, default=0)),
         "length_max": int(max(response_lengths, default=0)),
         "truncated_count": sum(
-            int(trajectory.truncated) for trajectory in rollout.trajectories
+            int(any(rollout.trajectories[row].truncated for row in rows)) for rows in episodes
         ),
-        "generated_tokens": int(rollout.action_mask.flatten().sum(dim=0).item()),
+        "generated_tokens": int(sum(response_lengths)),
         "generation_seconds": float(rollout.generation_seconds),
-        "samples": samples,
+        "samples": _rollout_samples(rollout, batch, episodes, rewards, step=step, sample_limit=sample_limit),
     }
+
+
+def _reward_component_metrics(records: list[dict[str, Any]], reward_count: int) -> dict[str, float]:
+    """Average each reward component over all candidates, including missing components."""
+    names = {name for record in records for name in record["component_sums"]}
+    return {
+        f"reward/component/{name}": sum(record["component_sums"].get(name, 0.0) for record in records)
+        / max(reward_count, 1)
+        for name in names
+    }
+
+
+def _status_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
+    """Count environment outcomes across the collected candidates."""
+    counts: dict[str, float] = {}
+    for record in records:
+        for status, count in record["status_counts"].items():
+            key = f"rollout/status/{status}"
+            counts[key] = counts.get(key, 0.0) + count
+    return counts
+
+
+def _add_scoring_metrics(metrics, records, reward_count):
+    """Include accuracy and model scoring counters when available."""
+    if sum(record["success_count"] for record in records) == reward_count:
+        metrics["reward/accuracy"] = sum(record["success_sum"] for record in records) / max(reward_count, 1)
+    if any(record["model_scored"] for record in records):
+        metrics["reward/scored_sequences"] = float(reward_count)
+        metrics["reward/request_count"] = float(sum(record["reward_request_count"] for record in records))
+        metrics["reward/retry_count"] = float(sum(record["reward_retry_count"] for record in records))
 
 
 def _rollout_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
@@ -542,12 +687,13 @@ def _rollout_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
         - length_mean ** 2,
         0.0,
     )
-    return {
+    metrics = {
+        **_reward_component_metrics(records, reward_count),
+        **_status_metrics(records),
         "reward/mean": reward_mean,
         "reward/std": math.sqrt(reward_variance),
         "reward/min": min(record["reward_min"] for record in records),
         "reward/max": max(record["reward_max"] for record in records),
-        "reward/accuracy": reward_mean,
         "reward/zero_std_groups": float(
             sum(record["zero_std_groups"] for record in records)
         ),
@@ -568,6 +714,8 @@ def _rollout_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
         "rollout/generation_seconds": generation_seconds,
         "rollout/tokens_per_second": generated_tokens / max(generation_seconds, 1.0e-9),
     }
+    _add_scoring_metrics(metrics, records, reward_count)
+    return metrics
 
 
 def summarize_rollout(
@@ -576,8 +724,9 @@ def summarize_rollout(
     *,
     step: int,
     sample_limit: int,
+    is_request_owner: bool = True,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
-    """Gather rollout metrics and bounded samples on rank zero."""
+    """Gather logical candidates once per TP group and summarize on rank zero."""
     rank = dist.get_rank()
     local = _local_rollout_record(
         rollout,
@@ -586,7 +735,7 @@ def summarize_rollout(
         sample_limit=sample_limit,
     )
     gathered: list[Optional[dict[str, Any]]] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local)
+    dist.all_gather_object(gathered, local if is_request_owner else None)
     if rank != 0:
         return {}, []
     records = [record for record in gathered if record is not None]

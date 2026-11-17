@@ -23,6 +23,16 @@ from hyper_parallel.core.multicore.scheduler import config as config_module
 class TestSchedulerConfig(unittest.TestCase):
     """Validate defaults that keep TaskDesc profiling metadata optional."""
 
+    def test_task_types_have_distinct_wire_ids(self):
+        """Keep different kernel operations from aliasing in serialized tasks."""
+        task_types = config_module.TaskType.__members__
+        wire_ids = {int(task_type) for task_type in task_types.values()}
+
+        self.assertEqual(
+            len(wire_ids), len(task_types),
+            msg=f"Task IDs must be unique: members={task_types}, distinct_ids={wire_ids}",
+        )
+
     def test_task_desc_defaults_profile_metadata_to_invalid(self):
         """Keep a new task from being assigned a stage or owner before profile resolution."""
         task_desc = config_module.TaskDescC()

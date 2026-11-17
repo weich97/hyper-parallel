@@ -21,8 +21,8 @@ from typing import Any
 
 import pytest
 
-from rl.dataset import data_source
-from rl.dataset.data_source import (
+from rl.data import prompts as data_source
+from rl.data.prompts import (
     PromptDataset,
     build_padded_evaluation_batches,
     build_prompt_records,
@@ -97,12 +97,17 @@ def test_tokenize_padding_collate_and_prompt_record(
     parquet_path.touch()
     frame = data_source.pd.DataFrame(
         [
-            {"prompt": "short prompt", "answer": "1"},
-            {"prompt": "a somewhat longer prompt", "answer": "2"},
+            {"prompt": "short prompt", "answer": "1",
+             "context_json": '{"title":["First"],"sentences":[["A"]]}', "question_id": "q1"},
+            {"prompt": "a somewhat longer prompt", "answer": "2",
+             "context_json": '{"title":["Second"],"sentences":[["B"]]}', "question_id": "q2"},
         ]
     )
     monkeypatch.setattr(data_source.pd, "read_parquet", lambda _path: frame)
-    dataset = PromptDataset(str(parquet_path), _Tokenizer(), max_prompt_length=16)
+    dataset = PromptDataset(
+        str(parquet_path), _Tokenizer(), max_prompt_length=16,
+        metadata_columns=("context_json", "question_id"),
+    )
 
     batch = collate_prompt_samples([dataset[0], dataset[1]], pad_token_id=0)
     records = build_prompt_records(batch, batch["input_ids"], batch["attention_mask"])
@@ -115,6 +120,8 @@ def test_tokenize_padding_collate_and_prompt_record(
     assert [record.ground_truth for record in records] == ["1", "2"]
     assert records[0].metadata["input_ids"].tolist() == [1, 2]
     assert records[1].metadata["input_ids"].tolist() == [1, 2, 3, 4]
+    assert records[0].metadata["question_id"] == "q1"
+    assert records[1].metadata["context_json"] == '{"title":["Second"],"sentences":[["B"]]}'
 
 
 def test_evaluation_partition_pads_only_rows_beyond_the_global_sample_limit() -> None:
@@ -134,6 +141,7 @@ def test_train_dataloader_uses_deterministic_distributed_sampler(
 
     class Loader:
         def __init__(self, dataset: Any, **kwargs: Any) -> None:
+            """Record loader construction without starting workers."""
             calls.append((dataset, kwargs))
 
     torchdata = ModuleType("torchdata")
@@ -179,3 +187,31 @@ def test_train_dataloader_uses_deterministic_distributed_sampler(
             },
         )
     ]
+
+
+def test_prompt_template_options_reach_the_actual_tokenizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Thinking controls must affect generated prompt IDs in both training and evaluation datasets."""
+    path = tmp_path / "prompts.parquet"
+    path.touch()
+    frame = data_source.pd.DataFrame([{"prompt": "Compute two plus two", "answer": "4"}])
+    monkeypatch.setattr(data_source.pd, "read_parquet", lambda unused_path: frame)
+    calls = []
+
+    class Tokenizer:
+        """Return different generation prefixes for thinking and non-thinking templates."""
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> dict[str, list[int]]:
+            """Record template controls and render a distinct assistant generation prefix."""
+            del messages
+            calls.append(kwargs)
+            return {"input_ids": [1, 2] if kwargs.get("enable_thinking", True) else [1, 3]}
+
+    default = PromptDataset(str(path), Tokenizer(), 32)[0]
+    training = PromptDataset(str(path), Tokenizer(), 32, chat_template_kwargs={"enable_thinking": False})[0]
+    evaluation = PromptDataset(str(path), Tokenizer(), 32, chat_template_kwargs={"enable_thinking": False})[0]
+    assert default["input_ids"].tolist() == [1, 2]
+    assert training["input_ids"].tolist() == evaluation["input_ids"].tolist() == [1, 3]
+    assert "enable_thinking" not in calls[0]
+    for options in ({"max_length": 1000000}, {"tokenize": False}, "invalid"):
+        with pytest.raises(ValueError, match="chat_template_kwargs"):
+            PromptDataset(str(path), Tokenizer(), 32, chat_template_kwargs=options)

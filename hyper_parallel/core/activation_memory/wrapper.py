@@ -28,9 +28,11 @@ import torch
 from torch import nn
 from torch.distributed.utils import _replace_by_prefix
 from hyper_parallel.core.activation_memory.policy import CheckpointPolicy
+from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemoryPool
 from hyper_parallel.core.activation_memory.recompute_state import get_recompute_state
 from hyper_parallel.core.activation_memory.swap import SwapManager, SwapTensor, Storage
 from . import checkpoint_exclude as _checkpoint_exclude
+from .reentrant_exclude import current_frame, run_exclude
 
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
@@ -211,6 +213,9 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
+                swap_manager.warn_missing_group_once()
+                return tensor.detach()
+            if swap_manager.is_last_group(group_name):
                 return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
@@ -230,6 +235,37 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             return tensor
 
         super().__init__(pack_to_cpu, unpack_from_cpu)
+
+
+def _register_checkpoint_exclude_outputs(
+    output: Any,
+    *,
+    group_swap: bool,
+    cpu_pool: Optional[PinnedMemoryPool],
+) -> Any:
+    """Register eligible output leaves without changing their identity or structure."""
+    swap_manager = SwapManager()
+    group_name = swap_manager.get_current_group_name()
+    if not group_name:
+        swap_manager.warn_missing_group_once()
+        return output
+    if swap_manager.is_last_group(group_name):
+        return output
+
+    storage = Storage()
+    swappable_outputs = []
+    for tensor in _checkpoint_exclude._iter_tensor_leaves(output):
+        if not base_check_fn(tensor):
+            continue
+        funcname = f"{group_name}::{tensor.shape}"
+        storage[len(swappable_outputs)].append(
+            SwapTensor(tensor, funcname, group_swap=group_swap, cpu_pool=cpu_pool)
+        )
+        swappable_outputs.append(tensor)
+
+    if swappable_outputs:
+        swap_manager.add_storage(group_name, storage)
+    return output
 
 
 class ActivationWrapper(torch.nn.Module, ABC):
@@ -492,10 +528,15 @@ class CheckpointWrapper(ActivationWrapper):
         self.checkpoint_kwargs = checkpoint_kwargs
 
     def _do_checkpoint(self, wrapped_module: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run the wrapped module through the configured checkpoint function."""
         # Checkpoint may save inputs before the wrapped module's pre-hook runs.
         group_name = getattr(self, "_swap_group_name", None)
         if group_name is not None:
             SwapManager().set_current_group_name(group_name)
+            # Reentrant backward can bypass this wrapper's full backward hook.
+            # This method is called for a new forward, never for its replay.
+            if getattr(self, "_swap_state", None) == "pre_backward":
+                self._swap_state = "backward"
 
         from hyper_parallel.core.activation_memory.api import checkpoint  # pylint: disable=C0415
         return checkpoint(
@@ -517,59 +558,108 @@ def ckpt_wrapper(module: Union[nn.Module, Callable], **checkpoint_kwargs: Any) -
 class CheckpointExcludeWrapper(ActivationWrapper):
     """Exclude a callable region from checkpoint recomputation."""
 
-    def __init__(self, module: Callable[..., Any], *, save_output: bool = True) -> None:
+    def __init__(
+        self,
+        module: Callable[..., Any],
+        *,
+        swap: bool = False,
+        group_swap: bool = False,
+        cpu_pool: Optional[PinnedMemoryPool] = None,
+    ) -> None:
         """Initialize a checkpoint exclusion wrapper for a PyTorch module or function."""
         if not callable(module):
             raise ValueError("module must be a PyTorch Module or callable")
-        if not isinstance(save_output, bool):
-            raise ValueError(f"save_output must be a bool, got {type(save_output).__name__}")
+        if not isinstance(swap, bool):
+            raise ValueError(f"swap must be a bool, got {type(swap).__name__}")
+        if not isinstance(group_swap, bool):
+            raise ValueError(f"group_swap must be a bool, got {type(group_swap).__name__}")
+        if cpu_pool is not None and not isinstance(cpu_pool, PinnedMemoryPool):
+            raise ValueError(f"cpu_pool must be a PinnedMemoryPool or None, got {type(cpu_pool).__name__}")
+        ignored_options = []
+        if not swap:
+            if group_swap:
+                ignored_options.append("group_swap")
+            if cpu_pool is not None:
+                ignored_options.append("cpu_pool")
+        if ignored_options:
+            warnings.warn(
+                f"checkpoint_exclude_wrapper ignores {', '.join(ignored_options)} when swap=False; "
+                "set swap=True to enable these options.",
+                UserWarning,
+                stacklevel=3,
+            )
         super().__init__(module, track_overlaps=False)
-        self.save_output = save_output
+        self.swap = swap
+        self.group_swap = group_swap
+        self.cpu_pool = cpu_pool
+
+    def _make_exclude_swap_hooks(self) -> Optional[AsyncSaveOnCpu]:
+        """Create the fallback hooks shared by both exclusion execution modes."""
+        if not self.swap:
+            return None
+        swap_hooks = AsyncSaveOnCpu(group_swap=self.group_swap, cpu_pool=self.cpu_pool)
+        if not callable(getattr(swap_hooks, "pack_hook", None)) or not callable(
+            getattr(swap_hooks, "unpack_hook", None)
+        ):
+            raise RuntimeError(
+                "There is no callable pack_hook and unpack_hook attributes for checkpoint exclusion swap"
+            )
+        return swap_hooks
+
+    def _register_exclude_outputs(self, output: Any) -> None:
+        """Make cached outputs available to the active swap group."""
+        _register_checkpoint_exclude_outputs(output, group_swap=self.group_swap, cpu_pool=self.cpu_pool)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Execute normally outside recompute and return the cached output in recompute."""
         wrapped_module = cast(Callable[..., Any], self._wrapped_module)
+        frame = current_frame()
+        if frame is not None:
+            return run_exclude(self, wrapped_module, args, kwargs, frame)
         state = get_recompute_state()
         if state is None:
             return wrapped_module(*args, **kwargs)
         cache = state.get_resource(_checkpoint_exclude._EXCLUDE_CACHE_KEY, _checkpoint_exclude._ExcludeCache)
         if state.is_recomputing:
             entry = cache.pop(id(self))
+            _checkpoint_exclude._restore_rng_state(entry.rng_state)
             _checkpoint_exclude._materialize_recompute_inputs(entry, args, kwargs)
-            output = (
-                entry.output
-                if self.save_output
-                else _checkpoint_exclude._make_replay_placeholder_output(entry.output_tensor_count)
-            )
             return _checkpoint_exclude._finalize_save_outputs(
-                output,
+                entry.output,
                 _checkpoint_exclude._has_used_input(entry.input_bindings),
-                None,
             )
 
-        input_bindings, previous_handles = _checkpoint_exclude._mark_recompute_inputs(
-            state.invocation_id,
-            args,
-            kwargs,
+        swap_hooks = self._make_exclude_swap_hooks()
+        input_infos = _checkpoint_exclude._capture_recompute_inputs(args, kwargs)
+        input_bindings = []
+        pack_token = _checkpoint_exclude._ACTIVE_PACK_STATE.set(
+            _checkpoint_exclude._PackState(input_infos, input_bindings, swap_hooks=swap_hooks)
         )
         try:
             with _checkpoint_exclude._saved_tensors_context():
                 output = wrapped_module(*args, **kwargs)
         finally:
-            _checkpoint_exclude._restore_recompute_inputs(previous_handles)
+            _checkpoint_exclude._ACTIVE_PACK_STATE.reset(pack_token)
+        if swap_hooks is not None:
+            self._register_exclude_outputs(output)
+        rng_state = _checkpoint_exclude._capture_rng_state(
+            args,
+            kwargs,
+            output,
+            state.preserve_rng_state,
+        )
         needs_recompute_boundary = _checkpoint_exclude._has_used_input(input_bindings)
-        tensor_leaf_count = None if self.save_output else [0]
         finalized_output = _checkpoint_exclude._finalize_save_outputs(
             output,
             needs_recompute_boundary,
-            state.invocation_id,
-            tensor_leaf_count,
         )
-        replay_output = output if self.save_output else None
-        output_tensor_count = 1 if tensor_leaf_count is None else tensor_leaf_count[0]
         cache.save(
             id(self),
-            _checkpoint_exclude._ExcludeCacheEntry(replay_output, input_bindings, output_tensor_count),
+            _checkpoint_exclude._ExcludeCacheEntry(
+                output,
+                input_bindings,
+                rng_state,
+            ),
         )
         return finalized_output
 
@@ -577,24 +667,34 @@ class CheckpointExcludeWrapper(ActivationWrapper):
 def checkpoint_exclude_wrapper(
     module: Callable[..., Any],
     *,
-    save_output: bool = True,
+    swap: bool = False,
+    group_swap: bool = False,
+    cpu_pool: Optional[PinnedMemoryPool] = None,
 ) -> CheckpointExcludeWrapper:
     """Wrap a PyTorch module or function so its region is not recomputed.
 
     Args:
         module: PyTorch Module or callable to execute only during the original
             checkpoint forward pass.
-        save_output: Whether to retain the region output for checkpoint replay.
-            Set this to ``False`` only when the output is passed directly as one
-            argument to another checkpoint exclusion wrapper. Default: ``True``.
+        swap: Whether eligible outputs and non-recomputable saved tensors should
+            use the active activation-swap group. Default: ``False``.
+        group_swap: Whether swapped tensors participate in group copy fusion.
+            Only used when ``swap=True`` inside an active checkpoint.
+        cpu_pool: Optional pinned-memory pool used for swapped tensors. Only used
+            when ``swap=True`` inside an active checkpoint.
 
     Returns:
         A wrapper that saves the callable's autograd tensors and reuses its
-        forward output while replaying a non-reentrant checkpoint.
+        forward output while replaying a checkpoint.
 
     Note:
         This feature requires eager mode and a surrounding HyperParallel
-        checkpoint configured with ``use_reentrant=False``. Nested checkpoint
+        checkpoint. Both modes cache the excluded outputs; nested checkpoint
         exclusion wrappers are not supported.
     """
-    return CheckpointExcludeWrapper(module, save_output=save_output)
+    return CheckpointExcludeWrapper(
+        module,
+        swap=swap,
+        group_swap=group_swap,
+        cpu_pool=cpu_pool,
+    )

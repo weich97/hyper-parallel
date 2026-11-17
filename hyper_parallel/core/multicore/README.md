@@ -1,54 +1,73 @@
-# MoE 多核并行使用指南
+# Multicore Parallelism User Guide
 
-Multicore 是独立的 Torch-only 组件，提供芯片内多核 MPMD 并行能力，结合核级内存语义单边通信，增强 MoE 通算掩盖和 MAC 利用率。
+**English** | [简体中文](README.zh.md)
 
-用户从独立组件 `hyper_parallel.core.multicore` 显式导入 `MegaMoeExperts`。
-SHMEM 由 Multicore 在内部管理，不提供独立用户接口。
+Multicore is HyperParallel's Torch component for on-chip multicore MPMD execution.
+It assigns work to AIC/AIV cores and uses core-level one-sided communication to schedule communication, matrix multiplication, and vector computation by tile, reducing kernel launches and overlapping communication with computation.
+The current business interfaces provide MoE experts, a router, and four-stream shifted mHC; the three components can be used independently.
 
-- [构建与交付](docs/build.md)
-- [架构设计与扩展](docs/architecture.md)
-- [MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)
-- [MegaKernel Profiling 设计与实现](docs/mega_kernel_profiling_design_and_usage.md)
-- [私有 SHMEM 生命周期](docs/shmem.md)
-- [完整 MegaMoE 样例](examples/mega_moe/README.md)
+## Features and Scope
 
-## 核心概念
+| Interface | Execution | Device and precision |
+| --- | --- | --- |
+| `MegaMoeExperts` | TopK dispatch, grouped SwiGLU expert computation, return, and weighted combination | Ascend NPU; BF16 activations and expert weights, FP32 routing weights |
+| `MegaGate` | Linear projection, scoring, and TopK | Nonempty NPU `sqrtsoftplus` inputs use native Route; other supported cases use Torch |
+| `MegaMhc` | Residual mixing, mapping prediction, and input RMSNorm for four-stream shifted mHC | Ascend NPU; BF16 activations/RMSNorm weights, FP32 mapping parameters |
 
-多核并行是 HyperMPMD 的核心能力之一，从集群级 MPMD（Pipeline 并行）扩展到芯片内多核 MPMD：
+MegaMoe does not include shared experts or the router's auxiliary loss; the model still executes these.
+MegaMhc targets existing four-stream mHC structures. The model manages first-layer state initialization, cross-layer propagation, and final-layer merging.
+See the [architecture design](docs/architecture.md) for multicore scheduling and communication-computation overlap.
 
-- **O0**：通过框架层 host CPU 侧的调度，支持 cube、vector、单边通信算子分核执行
-- **O1**：调度下沉到 AICore，支持 cube、vector、单边通信算子分核执行，进一步提升性能
+```mermaid
+flowchart LR
+    subgraph ordinary[Ordinary expert execution]
+        A[Existing router] --> B[Token organization and dispatch] --> C[Expert matrix multiplication and SwiGLU] --> D[Return and weighted combination]
+    end
+    subgraph mega[Mega expert execution]
+        E[Existing router or MegaGate] --> F[MegaMoeExperts coordinates dispatch, expert computation, and return]
+    end
+    G[Existing four-stream mHC boundary in the model] --> H[MegaMhc combines multiple operations within the boundary]
+```
 
-HyperParallel 基于多核并行实现 MoE 通算掩盖（Multicore MoE-FFN）：将 MoE-FFN 的五个算子
-（AllToAll-Dispatch、GMM1、SwiGLU、GMM2、AllToAll-Combine）融合为一个 kernel，由 AIC（AI Cube）和
-AIV（AI Vector）核同时执行，实现通信与计算的细粒度重叠。
+## Installation and Runtime Preparation
 
-## 接口概览
+Follow [Build and Delivery](docs/build.md) to install the current checkout, then build and activate a multicore native payload containing the required SoC.
+Import the interfaces explicitly from `hyper_parallel.core.multicore`; the HyperParallel root package does not export these components.
+Native libraries load on demand, and the component manages SHMEM.
 
-多核并行模块位于 `hyper_parallel/core/multicore/`，包含以下组件：
+Before using MegaMoe, each process must select its local NPU, initialize an HCCL process group, and configure an endpoint reachable by EP ranks:
+`HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT=tcp://<root-rank-ip>:<port>`.
+Pass WORLD or a subgroup explicitly as `ep_group`. EP size is derived from the group, and expert ownership follows rank order within the group.
+MegaGate and MegaMhc support single-device use and do not require SHMEM initialization.
 
-| 组件 | 说明 |
-|------|------|
-| `modules/` | 多核并行模块实现 |
-| `ops/` | 多核并行算子 |
-| `scheduler/` | 多核并行调度器 |
-| `tasks/` | 任务编排 |
-| `torch/` | Torch native binding |
-| `shmem/` | 仅供本组件使用的私有单边通信 |
+See the [MoE example](examples/moe/README.md#运行) and [mHC example](examples/mhc/README.md#运行) for runnable models and launch commands.
+MoE defaults to single-node EP8 and supports other EP sizes; the dense mHC example uses one NPU.
+Parameter migration and replacement code for existing models are collected in the [examples integration guide](examples/README.md).
 
-源码构建生成一个同时包含正反向 kernel 的
-`hyper_parallel_multicore_nn` vendor，并与构建环境对应的框架 adapter 一起进入 wheel 或本地 native payload。
-Torch adapter 是通过 `torch.ops.load_library()` 加载的普通共享库。
+## Public Interfaces
 
----
+Embed the following snippets in an application process with its device, model inputs, and EP communication group already prepared.
 
-## Torch managed API
+### MegaGate
 
-Torch 模型通过 `MegaMoeExperts` 执行 Router 选出的专家，当前支持 Ascend NPU 上的 Torch BF16 训练。
-先按[构建与交付](docs/build.md)选择 `--multicore on`，激活 CANN 和 native payload，
-并为所有 EP rank 配置相同的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`（如 `tcp://<rank-zero-ip>:<port>`）。
+```python
+import torch
+from hyper_parallel.core.multicore import MegaGate
 
-在业务进程中选定当前 NPU、初始化 HCCL 进程组后，以下为两卡 EP 示例：
+gate = MegaGate(
+    hidden_size=512, num_experts=48, top_k=8,
+    scoring_func="sqrtsoftplus", routed_scaling_factor=1.0,
+).to(device="npu", dtype=torch.bfloat16)
+logits, topk_weights, topk_ids = gate(hidden_states)
+```
+
+The input is `[B,S,H]`. The output is an ordinary tuple: `logits: [T,E]`, `topk_weights: [T,K]`, and `topk_ids: [T,K]`, where `T=B*S`.
+Projection follows Torch autocast. Logits retain projection precision, routing weights are FP32, and indices are INT64.
+`sqrtsoftplus`, `softmax`, and `sigmoid` are supported; preserve the original model's scoring definition.
+`bias` / `bias_vl` are FP32 TopK correction biases. Passing an `[B,S]` `image_mask` requires `vision_enabled=True`;
+the native vision path also requires a contiguous BOOL mask on the same NPU as the input. Native Route supports first-order backward only.
+
+### MegaMoeExperts
 
 ```python
 import torch
@@ -56,85 +75,153 @@ import torch.distributed as dist
 from hyper_parallel.core.multicore import MegaMoeExperts
 
 experts = MegaMoeExperts(
-    local_num_tokens=1024,
-    hidden_size=512,
-    intermediate_size=128,
-    num_experts=4,
-    top_k=2,
-    ep_size=dist.get_world_size(),
+    hidden_size=512, intermediate_size=128, num_experts=48, top_k=8,
     ep_group=dist.group.WORLD,
 ).to(device="npu", dtype=torch.bfloat16)
-
-output = experts(hidden_states, topk_ids, topk_weights)
+output = experts(hidden_states, topk_ids=topk_ids, topk_weights=topk_weights)
 ```
 
-### 输入与权重
+`num_experts` is the global expert count and must be divisible by EP; `ep_size` can be omitted, but an explicit value must match the group size.
+Input and output have the same shape. Distributed execution requires an explicit `ep_group`; WORLD is not selected automatically.
 
-- EP 必须覆盖整个默认 world；每 rank 的 token 数 `T` 固定且为 128 的倍数，专家数 `E` 可被 EP 整除。
-  执行计划采用静态 tiling，构造后的 `T/H/I/E/K/EP` 固定；其他 shape、芯片及后端需单独验证。
-- `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
-  ID 使用全局专家编号。
-- 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
-  省略时内部统计；传入时由调用方保证与当前 ID 一致。contiguous INT32 可直接使用，
-  INT64 或非连续输入会转换。
-- 本地参数布局为 `gate_up_weight: [E/EP, H, 2I]`、`down_weight: [E/EP, I, H]`。
-  普通 gate/up/down 权重转换时，gate、up 分别转置后在末维拼接，down 转置最后两维。
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="输入与权重"></a>
 
-Router 已有精确计数时，可直接传入：
+#### Inputs and Weights
+
+- Activations have last dimension `H`, and this rank has `T` tokens after flattening. Indices and weights both have shape `[T,K]` and use global expert IDs;
+  the K IDs for a token must be distinct. Ranks may have different token counts or no tokens.
+- Optional `tokens_per_expert` is an exact rank-local `[E]` histogram on the same device. It is computed internally when omitted;
+  when supplied, the caller must ensure consistency with the current IDs. Contiguous INT32 is used directly; INT64 or noncontiguous inputs are converted.
+- With the default `expert_weight_layout="EIO"`, local weights are `gate_up_weight: [E/EP,H,2I]` and `down_weight: [E/EP,I,H]`;
+  with `"EOI"`, they are `[E/EP,2I,H]` and `[E/EP,H,I]`, and must use contiguous storage.
+  The gate/up order, SwiGLU definition, and optional `swiglu_limit` must match the original model.
+- `create_parameters=False` supports external parameter management. On each forward, use `expert_weights=(gate_up, down)`
+  to provide the currently materialized contiguous local weights. See [examples](examples/README.md#checkpoint与参数归属) for parameter migration and checkpoints.
+
+### MegaMhc
 
 ```python
-output = experts(
-    hidden_states,
-    topk_ids,
-    topk_weights,
-    tokens_per_expert=tokens_per_expert,
+import torch
+from hyper_parallel.core.multicore import MegaMhc
+
+mhc = MegaMhc(hidden_size=512).to(device="npu", dtype=torch.bfloat16)
+residual, pre, post, mix, block_input = mhc(
+    previous_output, residual, previous_pre, previous_post, previous_mix,
 )
 ```
 
-### 容量
+Inputs have shapes `[...,H]`, `[...,4,H]`, `[...,4]`, `[...,4]`, and `[...,4,4]`, respectively;
+the output is an ordinary five-tensor tuple containing updated residual, pre, post, mix, and the current block input.
+`phi`, `alpha`, and `bias` remain FP32 and are not rounded to BF16 by whole-model dtype conversion; `norm_weight` uses BF16.
+Training requires H to be a multiple of 128 and no greater than 5760, with 20 Sinkhorn iterations; the local token count must be at least `max(40, number of AIV cores on the current device)`.
+Inputs after CP/SP partitioning must also meet this lower bound. See the [mHC example](examples/mhc/model.py) for complete state wiring.
 
-`expert_capacity_factor=None` 是默认值，接收容量为 `EP * T * K` 向上对齐到 128，保证 lossless。
-该容量用于各 rank 对称分配的 SHMEM 接收区。计算中间张量和待反向保存的 dispatch、
-up-projection、activation 按本 rank 本次实际接收量分配；无接收时保留一行 ABI 占位。
-源端 permute/combine 输出仍为 `T * K` 行。每次 forward 保存独立的接收数据和容量，支持后续路由变化。
+## Dynamic Tokens and Capacity
 
-分配前将已交换的各 rank 负载一次读取到 Host，同时用于本地定尺寸和全局溢出检查。
-这也适用于默认 lossless 模式，会增加一次 Device-to-Host 等待，以减少计算和保存区的容量余量。
-SHMEM heap 的预留仍由配置接收容量决定，不会随本次实际接收量缩小。
+MegaMoe automatically maintains capacity from actual forward inputs, without a token limit or a dynamic/static mode switch.
+Construction allocates no communication workspace. Initial binding starts with a minimum source-token capacity of 128 rows, grows on demand, and retains the high-water mark.
+Scheduling plans are cached in geometric buckets, and pending backward graphs retain their original plans. Bucket sizes do not change actual token activation shapes.
+Initial binding, entry into a new bucket, and growth have additional costs; stable capacity and cached plans can be reused.
 
-显式设置不小于 1 的有限 factor 时，容量改为 `ceil(T * K * factor)` 再对齐。
-超过容量时，所有 EP rank 在进入 native kernel 前报 `capacity overflow`。
-应根据显存和路由负载选择容量，确保显式容量覆盖实际接收量。
+`dispatch_mode="push"` is the default; `"pull"` is also available. Both use PUT for combine.
+The mode must agree across EP ranks and cannot change on the same workspace. Pull writes source data only after capacity preparation and claim.
 
-### 资源共享与关闭
+| Parameter | Push default | Purpose |
+| --- | --- | --- |
+| `initial_capacity_factor` | `1.25` | Initial receive capacity relative to reserved source routing rows |
+| `capacity_growth_factor` | `1.25` | Receive-capacity growth multiplier; `1.0` satisfies only the current demand |
 
-相同配置的串行层可在首次 forward 前共享 workspace，各层参数、梯度和待反向激活仍独立：
+Both factors must be finite and at least 1; omission or `None` uses the defaults. Pull does not accept explicit capacity factors.
+Hotspots may trigger push receive-area growth even with fixed token counts; routing drops no tokens.
+Source capacity, scheduling rows, and actual owner receive counts are maintained separately: source/return areas use reserved capacity,
+while computation intermediates and saved backward activations use actual received counts. An empty owner retains one ABI placeholder row.
+Pull receive areas are in ordinary HBM, outside SHMEM source/return areas.
+
+Growth may collectively restart the runtime for the same SHMEM root and then restore managed workspaces; external expert parameters do not move.
+`HYPER_PARALLEL_SHMEM_HEAP_SIZE` sets a fixed byte budget. Insufficient budget or an unsafe restart causes an explicit failure.
+See [SHMEM Runtime Restart](docs/shmem.md#4-runtime-restart) for the complete capacity-policy, fixed-budget, and failure-recovery contract.
+
+## Resource Sharing and Lifecycle
+
+Serial layers with the same configuration can share a workspace before their first forward:
 
 ```python
+from hyper_parallel.core.multicore import MegaMoeExperts
+
 MegaMoeExperts.share_execution_resources(layer.mlp.experts for layer in model.layers)
 ```
 
-共享资源只允许串行提交；跨 stream 时调用方须建立输入 tensor 的依赖，不支持并发线程调用。
-checkpoint/recompute 和 `retain_graph=True` 暂未验证。所有 backward 完成后，各 rank 按相同顺序调用
-每层的幂等 `close()`，并在销毁进程组前完成关闭。
+Sharing affects only execution resources; each layer retains independent parameters, gradients, and saved backward activations. Submissions within each root must be serial;
+callers must establish input dependencies when crossing streams. Concurrent thread submissions and graph capture are unsupported.
+Non-reentrant checkpointing, delayed backward, and `retain_graph=True` are supported. Complete all pending backward graphs before closing.
+All SHMEM root ranks must call in the same order and use a consistent gradient-participation policy.
 
-SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次
-内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
-`share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个SHMEM引用。非最后一个
-`release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
-MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
-不在各消费者内重复实现生命周期协调。
-重新开启生命周期时，所有 rank 完成关闭后使用新的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，
-`HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
+The runtime manages workspaces. GC only registers release; during a later initial binding, ranks coordinate reclamation of compatible orphaned resources.
+Standard `dist.destroy_process_group()` performs managed cleanup before destroying the communication group.
+For early release, call `experts.close()` in the same order. The last member releases a shared workspace; ordinary parameters are unaffected.
+Failed close operations can be retried under safe conditions. Partial runtime release or restart failure requires exiting and restarting the process.
+Timely collective cleanup is not guaranteed after abnormal exit or communication failure; see [SHMEM Lifecycle](docs/shmem.md) for limitations.
 
-完整 Qwen 接入及启动方式见 [MegaMoe 示例](examples/mega_moe/README.md)。MegaKernel 内部阶段采集方式见
-[MegaKernel Profiling 使用指南](../../../docs/guide/mega_kernel_profiling.md)。
+## DSV4.1 TP/SP and CP Integration
 
----
+The DSV4.1 adapter supports CP and TP combined with sequence parallelism in both push and pull modes.
+TP requires `sequence_parallel: true` and `ep_size > 1`; PP must remain 1.
+The framework creates the EP mesh from the flattened dense DP/CP/TP domain.
+Routed experts are sharded only along the expert dimension, retaining full hidden and intermediate dimensions.
+Dense layers and shared experts retain their own TP layouts; tensor parallel sharding of routed expert matrices is unsupported.
 
-## 性能建议
+The MoE boundary directly consumes tokens partitioned by CP and TP/SP.
+For VLM routing, the adapter aligns the CP-local image mask with the TP-local hidden-state interval.
+Shared expert TP communication remains the responsibility of its nested boundary.
 
-1. **dispatch ↔ compute 掩盖**：MoE 的 AllToAll dispatch 与 expert compute 在不同核上并发，是最核心的掩盖收益
-2. **单边通信**：基于内存语义的单边通信（Symmetric Memory）避免传统集合通信的同步开销
-3. **RATR 通信重排**：通过 Rank-Aware Tile Reordering 将 AllToAll 流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标，降低尾延迟
-4. **O0 vs O1**：O0 通过 host CPU 调度，O1 调度下沉到 AICore，性能更高但实现难度更大
+For example, configure 16 ranks with TP2, CP2, EP16, and micro-batch size 1 as follows:
+
+```yaml
+accelerator:
+  tp_size: 2
+  cp_size: 2
+  ep_size: 16
+  pp_size: 1
+  sequence_parallel: true
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 1
+training:
+  global_batch_size: 4
+  micro_batch_size: 1
+```
+
+This corresponds to dense DP4, dense FSDP8, and expert FSDP1.
+Merge these fields into the existing DSV4.1 configuration while retaining its module replacements and compute declarations.
+After evenly partitioning a sequence of length 4096, each rank submits 1024 rows to MegaMoE.
+The component maintains capacity from actual row counts after CP/SP partitioning; no additional token limit is required.
+Source/receive capacity retains its historical high-water mark and does not automatically shrink for smaller inputs.
+TP does not further shard routed expert matrices; shorter local sequences may also reduce MegaMoE execution efficiency.
+
+After activating the NPU native payload, run this distributed numerical alignment matrix:
+
+```bash
+pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
+```
+
+The eight-rank matrix covers TP2/CP1, TP1/CP2, TP2/CP2, push/pull, text/VLM routing,
+dynamic local row counts, outputs, input gradients, routing gradients, expert gradients, and shared expert gradients.
+Validation covers the MoE module and actual integration boundary, not full-model training or performance acceptance.
+
+## Diagnostics and Performance Validation
+
+Use [MegaKernel Profiling and Tensor Dump](docs/mega_kernel_profiling.md) to inspect internal AIC/AIV timelines
+and intermediate tensors; the two tools' sessions are mutually exclusive.
+
+Formal comparisons must fix the model, input, precision, EP ownership, and optimizer configuration; exclude compilation/growth warmup and external device processes, and disable diagnostic capture.
+Component system tests check numerics and lifecycle; the [two model benchmarks](examples/README.md#独立模型与验证范围) check complete training steps.
+Report each one's validation scope separately.
+
+## Further Reading
+
+- [Model Integration Guide and Examples](examples/README.md): existing module replacement, parameter layouts, checkpoints, and training order.
+- [Build and Delivery](docs/build.md): SoC targets, native payloads, and editable installation.
+- [Architecture Design](docs/architecture.md): compute graphs, task partitioning, multicore scheduling, and communication-computation overlap.
+- [Profiling and Tensor Dump](docs/mega_kernel_profiling.md): internal timelines, intermediate tensors, and offline analysis.
+- [Private SHMEM](docs/shmem.md): communication, capacity, and runtime lifecycle.

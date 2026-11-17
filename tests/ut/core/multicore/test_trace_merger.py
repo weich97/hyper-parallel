@@ -20,8 +20,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from hyper_parallel.core.multicore import profiler as multicore_profiler
-from hyper_parallel.core.multicore.profiler.trace_merger import merge_chrome_traces
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler
+from hyper_parallel.core.multicore.diagnostics.profiler.trace_merger import merge_chrome_traces
 
 
 def _outer_event(

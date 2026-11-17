@@ -22,9 +22,66 @@ import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 logger = logging.getLogger(__name__)
+
+
+def classify_tp_transition(
+    src: Sequence[Placement],
+    dst: Sequence[Placement],
+    mesh_dim_names: Sequence[str],
+) -> Optional[dict]:
+    """Classify one placement transition for the TP collective path.
+
+    Single source of truth shared by the runtime lowerer
+    (``TPCollectiveLowerer``) and the codegen boundary-form classifier
+    (``hyper_parallel.codegen.plan.boundary_forms``), so the emit-time form
+    decision and the install-time lowering can never disagree about what a
+    transition means.
+
+    Args:
+        src: Source placements aligned to ``mesh_dim_names``.
+        dst: Target placements aligned to ``mesh_dim_names``.
+        mesh_dim_names: Axis names the placements resolve against.
+
+    Returns:
+        ``{"kind": "identity"}`` when no communication is needed;
+        ``{"kind": "all_gather", "tensor_dim": d}`` for Shard -> Replicate on
+        the tp axis; ``{"kind": "all_reduce", "reduce_op": "sum"}`` for
+        Partial -> Replicate; ``{"kind": "reduce_scatter", "tensor_dim": d,
+        "reduce_op": "sum"}`` for Partial -> Shard; ``None`` when the
+        transition is not lowerable on this path (a non-tp axis differs, the
+        placement pair is unsupported, or the reduce op is not ``sum``).
+    """
+    if tuple(src) == tuple(dst):
+        return {"kind": "identity"}
+    if "tp" not in mesh_dim_names:
+        return None
+    tp_axis = tuple(mesh_dim_names).index("tp")
+    if any(
+        axis != tp_axis and src_placement != dst_placement
+        for axis, (src_placement, dst_placement) in enumerate(zip(src, dst))
+    ):
+        return None
+
+    src_tp = src[tp_axis]
+    dst_tp = dst[tp_axis]
+    if isinstance(src_tp, Shard) and isinstance(dst_tp, Replicate):
+        return {"kind": "all_gather", "tensor_dim": src_tp.dim}
+    if isinstance(src_tp, Partial) and isinstance(dst_tp, Replicate):
+        if src_tp.reduce_op != "sum":
+            return None
+        return {"kind": "all_reduce", "reduce_op": "sum"}
+    if isinstance(src_tp, Partial) and isinstance(dst_tp, Shard):
+        if src_tp.reduce_op != "sum":
+            return None
+        return {
+            "kind": "reduce_scatter",
+            "tensor_dim": dst_tp.dim,
+            "reduce_op": "sum",
+        }
+    return None
 
 
 @dataclass
@@ -41,20 +98,20 @@ class TPExecutionOp:
     def execute(self, tensor: Any) -> Any:
         """Execute the differentiable collective selected during lowering."""
         if self.kind == "all_gather":
-            return _collectives.differentiable_all_gather_concat(
+            return communication.differentiable_all_gather_concat(
                 tensor,
                 self.group,
                 self.group_size,
                 self.tensor_dim,
             )
         if self.kind == "all_reduce":
-            return _collectives.differentiable_all_reduce(
+            return communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,
             )
         if self.kind == "reduce_scatter":
-            return _collectives.differentiable_reduce_scatter(
+            return communication.differentiable_reduce_scatter(
                 tensor,
                 self.group_size,
                 self.tensor_dim,
@@ -62,7 +119,7 @@ class TPExecutionOp:
                 self.group,
             )
         if self.kind == "all_reduce_shard":
-            reduced = _collectives.differentiable_all_reduce(
+            reduced = communication.differentiable_all_reduce(
                 tensor,
                 self.reduce_op,
                 self.group,
@@ -91,34 +148,24 @@ class TPCollectiveLowerer:
         dst: Sequence[Placement],
     ) -> Optional[TPExecutionOp]:
         """Return an execution operation or ``None`` for the generic fallback."""
-        if tuple(src) == tuple(dst):
+        result = classify_tp_transition(src, dst, self.mesh_dim_names)
+        if result is None or result["kind"] == "identity":
             return None
+        return self.execution_op(
+            result["kind"],
+            tensor_dim=result.get("tensor_dim"),
+            reduce_op=result.get("reduce_op", "sum"),
+        )
 
-        tp_axis = self.mesh_dim_names.index("tp")
-        if any(
-            axis != tp_axis and src_placement != dst_placement
-            for axis, (src_placement, dst_placement) in enumerate(zip(src, dst))
-        ):
-            return None
-
-        src_tp = src[tp_axis]
-        dst_tp = dst[tp_axis]
-        kind = None
-        tensor_dim = None
-        reduce_op = "sum"
-        if isinstance(src_tp, Shard) and isinstance(dst_tp, Replicate):
-            kind = "all_gather"
-            tensor_dim = src_tp.dim
-        elif isinstance(src_tp, Partial) and isinstance(dst_tp, Replicate):
-            kind = "all_reduce"
-            reduce_op = src_tp.reduce_op
-        elif isinstance(src_tp, Partial) and isinstance(dst_tp, Shard):
-            kind = "reduce_scatter"
-            tensor_dim = dst_tp.dim
-            reduce_op = src_tp.reduce_op
-        if kind is None or reduce_op != "sum":
-            return None
-
+    def execution_op(
+        self,
+        kind: str,
+        tensor_dim: Optional[int] = None,
+        reduce_op: str = "sum",
+    ) -> TPExecutionOp:
+        """Build an execution operation using the native backend's lowering."""
+        # Gloo has no reduce_scatter: lower to all_reduce + local chunk, the
+        # same remap is used by placement-driven and explicit operation callers.
         if kind == "reduce_scatter" and "gloo" in self.backend:
             kind = "all_reduce_shard"
         return TPExecutionOp(
@@ -168,5 +215,6 @@ def create_tp_collective_lowerer(
 __all__ = [
     "TPCollectiveLowerer",
     "TPExecutionOp",
+    "classify_tp_transition",
     "create_tp_collective_lowerer",
 ]

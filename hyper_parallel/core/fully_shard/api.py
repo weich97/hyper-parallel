@@ -17,19 +17,18 @@ from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     OffloadPolicy,
     SourceShardMetaInfo,
-    get_cells_and_names,
-    get_device_handle,
-    get_world_size,
     load_into_param,
     parameters_dict,
     wait_grad_handle,
 )
+from hyper_parallel.core.utils.communication import get_device_handle
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.state_dict_utils import (
     get_model_state_dict as get_model_state_dict_impl,
@@ -130,6 +129,36 @@ class HSDPModule:
         """Initialize HSDPModule."""
         self.hsdp_scheduler = None  # Initialized in hsdp_init()
 
+    def _apply(self, *args: Any, **kwargs: Any) -> Any:
+        """Apply a tensor conversion while preserving HSDP parameter storage.
+
+        ``nn.Module._apply`` can replace the DTensor local storage while an
+        unsharded parameter buffer is still materialized on the device.  HSDP
+        must reshard before delegating to the conversion and rebuild its
+        sharded-parameter bookkeeping afterwards.  The bookkeeping reset is a
+        storage operation and must not become part of an autograd graph.
+
+        The module's original class is added after HSDPModule in the runtime
+        MRO, so static analysis cannot resolve the delegated ``_apply``.
+        """
+        if not hasattr(self, "hsdp_scheduler") or self.hsdp_scheduler is None:
+            return super()._apply(*args, **kwargs)  # pylint: disable=no-member
+        self.reshard()
+        result = super()._apply(*args, **kwargs)  # pylint: disable=no-member
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state is None:
+            return result
+        with torch.no_grad():
+            for hsdp_param in hsdp_state.hsdp_params:
+                hsdp_param.reset_sharded_param()
+            if hsdp_state.param_group is not None:
+                for bucket in hsdp_state.param_group.all_gather_buckets:
+                    # Conversion rebinds shards; an obsolete zero-copy buffer
+                    # must not keep the previous device allocation resident.
+                    if not bucket.is_flat_buffer_valid():
+                        bucket.flat_param_buffer = None
+        return result
+
     def hsdp_init(self, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
                   comm_fusion, comm_fusion_zero_copy: Optional[bool] = None,
@@ -154,28 +183,20 @@ class HSDPModule:
                                               source_shard_infos=source_shard_infos,
                                               )
 
-    def set_requires_gradient_sync(self, requires_grad_sync):
-        r"""
-            set requires grad sync flag.
-            Args:
-                requires_grad_sync(bool): requires_grad_sync is used to control gradient sync process.
-            Raises:
-                ValueError: If `requires_grad_sync` is not bool.
-        """
+    def set_requires_gradient_sync(self, requires_grad_sync: bool, *, recurse: bool = True) -> None:
+        """Set gradient synchronization for this module and optionally its descendants."""
         if not isinstance(requires_grad_sync, bool):
-            raise ValueError(f"requires_grad_sync must be bool but got {requires_grad_sync}.")
-        if not hasattr(self, "hsdp_scheduler"):
-            raise ValueError("call hsdp interface first.")
-
-        for _, module in get_cells_and_names(self):
+            raise ValueError("requires_grad_sync must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
+        self_module = cast(nn.Module, self)
+        for _, module in self_module.named_modules() if recurse else (("", self),):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
-    def zero_grad(self):
-        """zero accumunication grads"""
-        if not hasattr(self, "hsdp_scheduler"):
-            raise ValueError("call hsdp interface first.")
-        return super().zero_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear parameter gradients according to set_to_none."""
+        super().zero_grad(set_to_none=set_to_none)
 
     def set_modules_to_forward_prefetch(self, modules):
         """set forward prefetch module list to prefetch all gather for unsharded parameters"""
@@ -292,7 +313,7 @@ class HSDPModule:
         # so external hooks can safely read .missing_keys/.unexpected_keys.
         _IK = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
         incompatible_keys = _IK([], [])
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules():
             hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
             for hook in hooks.values():
                 hook(module, incompatible_keys)
@@ -318,7 +339,7 @@ class HSDPModule:
             raise ValueError(f"recursive should be a bool, got {type(recursive)}")
         self_module = cast(nn.Module, self)
         modules = (
-            [module for _, module in get_cells_and_names(self_module)]
+            [module for _, module in self_module.named_modules()]
             if recursive
             else [self_module]
         )
@@ -327,50 +348,35 @@ class HSDPModule:
                 module.hsdp_scheduler.reset_iter_state()
 
     def set_requires_all_reduce(self, requires_all_reduce: bool, *, recurse: bool = True) -> None:
-        """set requires_all_reduce flag"""
+        """Set all-reduce for this module and optionally its descendants."""
         if not isinstance(requires_all_reduce, bool):
-            raise ValueError(
-                f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
+            raise ValueError("requires_all_reduce must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules() if recurse else (("", self),):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
     def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
-        """set reshard_after_forward flag"""
+        """Set forward resharding for this module and optionally its descendants."""
         if not isinstance(reshard_after_forward, bool):
-            raise ValueError(
-                f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
+            raise ValueError("reshard_after_forward must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules() if recurse else (("", self),):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
     def set_reshard_after_backward(self, reshard_after_backward: bool, recurse: bool = True) -> None:
-        """set reshard_after_backward flag"""
+        """Set backward resharding for this module and optionally its descendants."""
         if not isinstance(reshard_after_backward, bool):
-            raise ValueError(
-                f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}"
-            )
-        if not recurse:
-            raise NotImplementedError(
-                "Currently impl is equal to recurse=True, "
-                "need support module_param mapping."
-            )
+            raise ValueError("reshard_after_backward must be bool")
+        if not isinstance(recurse, bool):
+            raise ValueError("recurse must be bool")
         self_module = cast(nn.Module, self)
-        for _, module in get_cells_and_names(self_module):
+        for _, module in self_module.named_modules() if recurse else (("", self),):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
@@ -381,7 +387,7 @@ class HSDPModule:
         """
         self_module = cast(nn.Module, self)
         if recurse:
-            sub_modules = [m for _, m in get_cells_and_names(self_module)]
+            sub_modules = [m for _, m in self_module.named_modules()]
         else:
             sub_modules = [self_module]
         for module in sub_modules:
@@ -603,6 +609,7 @@ def _get_modules_parameters(modules, ignored_params=None):
     """Collect deduplicated parameters from module roots."""
     return get_managed_modules_parameters(modules, ignored_params)
 
+
 def _validate_managed_params_source_shard_infos(
     managed_parameters: set[nn.Parameter],
     source_shard_infos: Optional[Mapping[nn.Parameter, SourceShardMetaInfo]],
@@ -754,7 +761,7 @@ def fully_shard(
     replicate_params = _normalize_replicate_params(replicate_params)
 
     if mesh is None:
-        mesh = init_device_mesh(device_type="npu", mesh_shape=(get_world_size(),))
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(dist.get_world_size(),))
         if has_dtensor_param:
             raise ValueError(
                 "fully_shard does not support mesh=None with a native DTensor parameter; "

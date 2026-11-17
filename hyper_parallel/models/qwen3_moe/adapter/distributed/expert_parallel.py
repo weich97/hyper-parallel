@@ -25,6 +25,9 @@ them through the now-public ``build_ep_compute``.
 
 from typing import Any, Callable
 
+from hyper_parallel.distributed.expert_parallel.experts import (
+    SHARED_MERGE_MODES,
+)
 from hyper_parallel.distributed.expert_parallel.recipes import (
     build_ep_compute,
 )
@@ -45,11 +48,15 @@ def qwen3moe_ep_compute_fn(
     cp_mesh: Any,
     ep_mesh: Any,
     use_grouped_gemm: bool = False,
+    fix_router: bool = False,
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).
 
     Expected module interface: ``gate`` (TopKRouter module), ``experts``.
+
+    ``fix_router`` selects the framework's benchmark-only balanced router
+    (``routing.make_balanced_router``); correctness runs keep it ``False``.
     """
     del mesh, tp_mesh, cp_mesh
     return build_ep_compute(
@@ -58,8 +65,9 @@ def qwen3moe_ep_compute_fn(
         router_fn=MOE_ROUTER_ADAPTERS["qwen3moe"],
         archetype_key="qwen3moe_topk_router",
         expected_attrs=["gate", "experts"],
-        combine=lambda module, hidden_states, routed: routed,
+        combine=SHARED_MERGE_MODES["none"],
         use_grouped_gemm=use_grouped_gemm,
+        fix_router=fix_router,
     )
 
 

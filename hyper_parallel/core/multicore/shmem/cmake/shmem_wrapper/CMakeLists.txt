@@ -37,3 +37,10 @@ foreach(target_name
         hp_enable_elf_hardening(${target_name})
     endif()
 endforeach()
+
+install(CODE [[
+    file(GLOB_RECURSE installed_shared_libraries "${CMAKE_INSTALL_PREFIX}/*.so")
+    foreach(installed_library IN LISTS installed_shared_libraries)
+        file(RPATH_REMOVE FILE "${installed_library}")
+    endforeach()
+]])

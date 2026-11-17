@@ -328,7 +328,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "profile_buffer",
+          "name": "diagnostic_buffer",
           "index": 29,
           "dtype": "uint8",
           "format": "ND",

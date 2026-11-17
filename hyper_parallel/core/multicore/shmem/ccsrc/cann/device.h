@@ -148,4 +148,31 @@ ACLSHMEM_DEVICE void mte_put_nbi(__gm__ uint8_t *remote_dst, __gm__ const uint8_
 /** @brief Complete explicit MTE NBI operations previously issued by the calling AIV. */
 ACLSHMEM_DEVICE void mte_quiet() { aclshmemx_mte_quiet(); }
 
+/**
+ * @brief Query the CANN-owned MTE resources for one target Root PE.
+ *
+ * @param target_pe Target in CANN Root WORLD coordinates.
+ * @param ub_address Receives the CANN-owned UB base address available to the calling AIV.
+ * @param ub_bytes Receives the CANN-owned UB capacity in Byte.
+ * @return Whether the target supports MTE transport.
+ */
+ACLSHMEM_DEVICE bool query_mte_resources(int32_t target_pe, uint64_t &ub_address, uint64_t &ub_bytes) {
+  auto *state = aclshmemi_get_state();
+  ub_address = static_cast<uint64_t>(state->mte_config.aclshmem_ub);
+  ub_bytes = state->mte_config.ub_size;
+  return (state->topo_list[target_pe] & ACLSHMEM_TRANSPORT_MTE) != 0;
+}
+
+/** @brief Copy one contiguous byte range from GM to caller-owned UB. */
+template <typename T>
+ACLSHMEM_DEVICE void copy_gm_to_ub(__ubuf__ T *destination, __gm__ T *source, uint64_t bytes) {
+  aclshmemi_copy_gm2ub(destination, source, bytes);
+}
+
+/** @brief Copy one contiguous byte range from caller-owned UB to GM. */
+template <typename T>
+ACLSHMEM_DEVICE void copy_ub_to_gm(__gm__ T *destination, __ubuf__ T *source, uint64_t bytes) {
+  aclshmemi_copy_ub2gm(destination, source, bytes);
+}
+
 }  // namespace hyper_parallel::multicore::shmem::cann::device

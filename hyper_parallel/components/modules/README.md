@@ -23,6 +23,11 @@ norm = RMSNorm(hidden_size=4096, eps=1e-6).npu()
 output = norm(hidden_states)
 ```
 
+## Module families
+
+Registered module families select an implementation from explicit configuration rules before model construction.
+See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+
 ## Install custom operators
 
 Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
@@ -49,7 +54,7 @@ cd training/ascendc
 bash build.sh -c ascend910_93
 ```
 
-Install the generated AscendC operator package:
+Install the generated Ascend C operator package:
 
 ```bash
 cd output
@@ -84,31 +89,37 @@ following example replaces Qwen3-VL-MoE Attention, Experts and RMSNorm modules:
 ```yaml
 plan_overrides:
   - match: "*.language_model.layers.*.self_attn"
-    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.GQAAttention
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.GQAAttention
 
   - match: "*.language_model.layers.*.mlp.experts"
-    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.GroupedExperts
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.GroupedExperts
 
   - match:
       - "*.language_model.layers.*.input_layernorm"
       - "*.language_model.layers.*.post_attention_layernorm"
       - "*.language_model.norm"
-    module_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
-    exact_type: true
-    replace_module:
-      _target_: hyper_parallel.components.modules.RMSNorm
+    replace:
+      kind: module
+      source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextRMSNorm
+      exact_type: true
+      implementation:
+        _target_: hyper_parallel.components.modules.RMSNorm
 ```
 
 - `match` specifies module FQN patterns from `model.named_modules()`. A list is supported when the same replacement
   applies to multiple paths.
-- `module_type` specifies the source module type. Set `exact_type: true` to exclude subclasses.
-- `replace_module._target_` specifies the high-performance replacement.
+- Optional `replace.source_type` checks the source module type. Set `replace.exact_type: true` to exclude subclasses.
+- `replace.implementation._target_` specifies the high-performance replacement.
 
 Invalid patterns, incompatible module types and unavailable weight conversions raise an error.
 

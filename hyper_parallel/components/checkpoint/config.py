@@ -27,10 +27,10 @@ class CheckpointingConfig:
 
     Following design doc 04_checkpoint.md.
 
-    ``model_save_format``, ``save_consolidated``, ``staging_dir`` and
-    ``best_metric_key`` are declared by the design doc but not yet consumed by
-    :class:`~hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointerCallback`;
-    they are reserved for the consolidated HuggingFace-format export.
+    ``save_hf_weights`` additionally exports a Transformers-compatible model
+    under the current global-step directory. The remaining consolidated-export
+    fields are declared by the design doc but are not yet consumed by
+    :class:`~hyper_parallel.trainer.callbacks.checkpoint_callback.CheckpointerCallback`.
     """
 
     # Master switch for the *write* path only. Restoring is governed solely by
@@ -41,10 +41,17 @@ class CheckpointingConfig:
     checkpoint_dir: str = "./checkpoints"
     save_steps: int = 0  # save every N optimizer steps (0 = disabled)
     save_epochs: int = 1  # save every N epochs
+    # Save after this many elapsed training minutes, at the next completed
+    # optimizer step. A non-positive value disables time-based saving.
+    save_time_interval_minutes: float = 0.0
+    # Maximum number of completed ``global_step_*`` directories to retain.
+    # None or a non-positive value disables checkpoint rotation.
+    save_total_limit: Optional[int] = None
     is_async: bool = False
     is_peft: bool = False  # persist trainable (adapter) weights only
     save_optimizer: bool = True
     save_train_state: bool = True
+    save_hf_weights: bool = False
     # Where the per-step training state (step/epoch, lr_scheduler, dataloader
     # position, RNG) is written:
     #   True  --- one torch.save file per rank under ``extra_state/``. Always
@@ -62,6 +69,12 @@ class CheckpointingConfig:
     restore_from: Optional[str] = None  # "LATEST" or specific path
     restore_optimizer: bool = True
     restore_train_state: bool = True  # step/epoch, lr_scheduler, dataloader, RNG
+    # Restore progress/scheduler/RNG while deliberately replaying data from the
+    # loader's configured start. This is useful for a validation warm start in
+    # which every topology must consume the same fixed replay, including when
+    # the loader cannot reshard a saved cursor across DP world sizes. Keep this
+    # enabled for ordinary K-to-K+N training continuation.
+    restore_dataloader_state: bool = True
 
     model_save_format: str = "safetensors"
     # Whether to additionally export merged HF weights: "none" (never) |

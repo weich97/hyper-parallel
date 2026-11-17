@@ -43,7 +43,7 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
     _resolve_module,
 )
 from hyper_parallel.distributed._builder.planner import (
-    ShardingPlanner,
+    _get_architecture,
 )
 from hyper_parallel.distributed._builder.precompiled_boundary import (
     PrecompiledBoundary,
@@ -70,13 +70,12 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
+    """Validate the structural contract of every inner wrapper."""
     # Lazy import: wrappers imports forward_rewriter at module level;
     # keeping it lazy decouples the applier's import graph.
     from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-        INNER_WRAPPER_REGISTRY,
         INNER_WRAPPER_REQUIREMENTS,
     )
-    """Validate the structural contract of every inner wrapper."""
     for fqn, spec in plan.modules.items():
         wrapper = getattr(spec, "inner_wrapper", None)
         target = getattr(spec, "inner_target", None)
@@ -109,12 +108,8 @@ def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
                     f"(transformers={transformers_version}): "
                     f"inner_wrapper={wrapper!r} contains CP communication and "
                     f"requires region_dispatch={required_dispatch}, got "
-                    f"{region_dispatch!r}. Suggested YAML:\n"
-                    f"  - match: {fqn!r}\n"
-                    "    when: cp\n"
-                    f"    region_dispatch: {str(required_dispatch).lower()}\n"
-                    f"    inner_target: {target!r}\n"
-                    f"    inner_wrapper: {wrapper}"
+                    f"{region_dispatch!r}. Set region_dispatch on the "
+                    f"match={fqn + '.forward'!r} method replacement."
                 )
             if requirements["requires_cp"] and (
                     cp_mesh is None or cp_mesh.size() <= 1):
@@ -136,86 +131,57 @@ def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
 
 
 def _validate_cp_compute_injections(plan, cp_mesh):
-    """Require an explicit CP wrapper for each active attention boundary."""
-    # Lazy import: see _validate_inner_wrapper_injections.
-    from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-        INNER_WRAPPER_REGISTRY,
-    )
-    if cp_mesh is not None and cp_mesh.size() > 1:
-        for fqn, spec in plan.modules.items():
-            if (spec.is_boundary and getattr(spec, "_needs_cp_attn", False)
-                    and getattr(spec, "inner_wrapper", None) is None):
-                raise ValueError(
-                    f"cp_size={cp_mesh.size()} is active, so attention "
-                    f"boundary {fqn!r} needs a CP-aware inner forward "
-                    "(K/V all-gather), but no inner_wrapper is declared — "
-                    "the framework no longer picks one heuristically. "
-                    "Inject explicitly:\n"
-                    "  plan_overrides:\n"
-                    "    - match: \"*.self_attn\"\n"
-                    "      when: cp\n"
-                    "      region_dispatch: false   # the wrapper contains "
-                    "communication; must not dispatch\n"
-                    "      inner_wrapper:\n"
-                    "        _target_: hyper_parallel.distributed.context_parallel."
-                    "wrappers.sdpa_hf_cp_wrapper\n"
-                    f"(the registry {sorted(INNER_WRAPPER_REGISTRY)} can be "
-                    "referenced by str name; use sdpa_qkv for the "
-                    "NeMo-style (q,k,v) signature, sdpa_hf for the "
-                    "HF-style forward(hidden_states); or provide a custom "
-                    "callable/Target implementation)")
+    """Require an explicit forward replacement for CP attention boundaries."""
+    if cp_mesh is None or cp_mesh.size() <= 1:
+        return
+    for fqn, spec in plan.modules.items():
+        if not spec.is_boundary or not getattr(spec, "_needs_cp_attn", False):
+            continue
+        if spec.inner_wrapper is not None or spec.local_compute_fn is not None:
+            continue
+        raise ValueError(
+            f"cp_size={cp_mesh.size()} is active, but attention boundary "
+            f"{fqn!r} has no CP-aware forward replacement. Declare:\n"
+            "  plan_overrides:\n"
+            f"    - match: {(fqn + '.forward')!r}\n"
+            "      when: cp\n"
+            "      replace:\n"
+            "        kind: method\n"
+            "        implementation: hyper_parallel.distributed.context_parallel."
+            "wrappers.sdpa_hf_cp_wrapper\n"
+            "Choose an implementation compatible with this attention's forward signature."
+        )
 
 
 def _validate_ep_compute_injections(plan, model):
-    """Require an explicit compute source for each active EP boundary."""
+    """Require a compute source for each active EP-sharded boundary."""
     # Lazy import: see _validate_inner_wrapper_injections.
     from hyper_parallel.distributed.expert_parallel.recipes import (  # pylint: disable=C0415
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
-        if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
-                and getattr(spec, "local_compute_fn", None) is None
-                and getattr(spec, "region_dispatch", None) is not False):
-            suggestion = ""
-            if model is not None:
-                arch = ShardingPlanner._get_architecture(model)
-                archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
-                if archetype is not None:
-                    suggestion = (
-                        f"Detected model architecture {arch!r}; the "
-                        f"matching archetype is likely {archetype!r} (a "
-                        "suggestion, not an automatic choice — confirm and "
-                        "configure it explicitly; a wrong pick fails the "
-                        "apply-time interface assertion and lists the "
-                        "module's actual submodule names).\n"
-                    )
-            raise ValueError(
-                f"ep_size={spec._ep_size} is active (expert parameters "  # pylint: disable=protected-access
-                f"will be sharded as {{EP: Shard(0)}}), but boundary "
-                f"{fqn!r} has no local-region compute source — nothing "
-                "executes the expert compute and all-to-all, and the "
-                "framework no longer injects any implementation "
-                "automatically. Choose one of:\n"
-                f"{suggestion}"
-                "  ① Pick a built-in archetype factory per the model's "
-                "behavior (full semantics: router / shared expert / gate / "
-                "merge all implemented cohesively; see the recipes.py "
-                "module docstring for the available archetypes and the "
-                "module interface each one expects):\n"
-                "     plan_overrides:\n"
-                "       - match: \"*.mlp\"\n"
-                "         when: ep\n"
-                "         region_dispatch: false   # a2a is inside the "
-                "region; must not dispatch\n"
-                "         local_compute_fn:\n"
-                "           _target_: hyper_parallel.distributed.expert_parallel."
-                "recipes.qwen2moe_ep_compute_fn   # pick per the "
-                "archetype table\n"
-                "  ② Atypical MoE → write your own factory following "
-                "examples/distributed/ep_factories.py (use require_attrs "
-                "for the same build-time interface validation)\n"
-                "  ③ In-house EP-aware MoE (all-to-all already inside "
-                "forward) → declare region_dispatch: false")
+        if not spec.is_boundary or not getattr(spec, "_ep_size", 0):
+            continue
+        if spec.local_compute_fn is not None or spec.region_dispatch is False:
+            continue
+        suggestion = ""
+        if model is not None:
+            architecture = _get_architecture(model)
+            archetype = EP_ARCHETYPE_SUGGESTIONS.get(architecture)
+            if archetype is not None:
+                suggestion = f"Candidate for {architecture!r}: {archetype!r}. "
+        raise ValueError(
+            f"ep_size={spec._ep_size} is active, but boundary {fqn!r} has "
+            "no EP-aware compute source. "
+            f"{suggestion}Declare one of:\n"
+            "  - match: '*.mlp.forward'\n"
+            "    when: ep\n"
+            "    replace:\n"
+            "      kind: method\n"
+            "      implementation: <EP-aware factory import path>\n"
+            "or use a rule with region_dispatch: false when the module's "
+            "original forward already owns the EP all-to-all."
+        )
 
 
 def _preflight_compute_injection(plan, mesh, model=None):
@@ -238,10 +204,12 @@ def _log_injection_choice(module_fqn, spec):
     has_wrap = getattr(spec, "inner_wrapper", None) is not None
     if not (has_fn or has_wrap or rd is not None):
         return   # ordinary boundary: no injection, axiomatic default dispatch-through — do not spam the log
-    what = "+".join(
-        [x for x, ok in (("local_compute_fn", has_fn),
-                         ("inner_wrapper", has_wrap)) if ok]
-    ) or "the module's own forward (no fn injected, region_dispatch=False declared)"
+    candidates = (("local_compute_fn", has_fn), ("inner_wrapper", has_wrap))
+    enabled = []
+    for name, is_enabled in candidates:
+        if is_enabled:
+            enabled.append(name)
+    what = "+".join(enabled) or "the module's own forward (no fn injected, region_dispatch=False declared)"
     if rd is True:
         effect = ("validate dispatch-through true validation enabled "
                   "(in-region strategy propagation + true out_src "
@@ -372,6 +340,17 @@ def build_expert_mesh(mesh: DeviceMesh, ep_size: int) -> DeviceMesh:
 # Phase C: forward wrapping driving loop (05 §4.4)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _boundary_post_order_key(item):
+    """Sort key for boundary installation: deepest FQN first (post-order).
+
+    D-14 invariant 2 (05 §13.3): boundaries are wrapped in post-order — an
+    outer boundary's local_compute_fn may cache inner forwards, and the
+    unpack-scope exclusion (invariant 3) requires inner wrappers to be
+    installed first.
+    """
+    return -item[0].count(".")
+
+
 def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
 
@@ -389,7 +368,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         else create_tp_collective_lowerer(mesh, mesh_dim_names)
     )
     for module_fqn, spec in sorted(
-            plan.modules.items(), key=lambda kv: -kv[0].count(".")):
+            plan.modules.items(), key=_boundary_post_order_key):
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
@@ -399,7 +378,6 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             mesh_dim_names,
             op_lowerer=boundary_op_lowerer,
         )
-        keep_output_dtensor = _keep_loss_parallel_output(plan, spec)
         _bind_input_indices(boundary, module)
         # Injection discipline: a declared injection requires an explicit
         # region_dispatch; declaring True without any injection is redundant
@@ -478,7 +456,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 boundary,
                 spec,
                 mesh_dim_names,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )
         else:
             # D-02: production vocab-parallel embedding masked wrapper
@@ -488,5 +466,5 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 module,
                 boundary,
                 spec,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )

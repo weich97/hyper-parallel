@@ -21,12 +21,14 @@ Trainer step runtime); ``FSDP2Manager`` / ``_instantiate_fsdp2`` and the
 (FQN/DTensor source-shard resolution) merged into
 ``distributed/_builder/source_shard.py`` (05 row 406).
 """
+# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -36,7 +38,7 @@ from torch.nn import Parameter as ParameterClass
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, HSDPModule, fully_shard
-from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.core.fully_shard.hsdp_utils import get_managed_modules_parameters
 from hyper_parallel.distributed._builder.source_shard import (
     SourceShardInfoByFQN,  # pylint: disable=unused-import
     SourceShardInfoByParam,  # pylint: disable=unused-import
@@ -44,6 +46,8 @@ from hyper_parallel.distributed._builder.source_shard import (
     _build_source_shard_info_by_param,
     _source_infos_for_fully_shard,
 )
+from hyper_parallel.models.build_options import FSDP2Config
+from hyper_parallel.models.registry import get_model_adapter
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import (
@@ -55,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _WrapModuleInfo:
-    """One transformer block selected by the configured wrap policy."""
+    """One FSDP child unit selected by automatic or adapter policy."""
 
     fqn: str
     module: ModuleClass
@@ -95,6 +99,7 @@ class FSDP2Manager:
         self.config = config
         self.mesh_context = mesh_context
         self.fp32_main_params = fp32_main_params
+        self._mp_policy: fully_shard_utils.MixedPrecisionPolicy | None = None
 
 
     def _resolve_replicate_params(
@@ -166,13 +171,61 @@ class FSDP2Manager:
             return dense_mesh
         return self._build_compatibility_fsdp_mesh()
 
-    def _build_mixed_precision_policy(self) -> fully_shard_utils.MixedPrecisionPolicy:
-        """Resolve the configured dtype strings to torch dtypes.
+    def parameter_mesh_bindings(
+        self, model: ModuleClass, source_shard_info: SourceShardInfoByFQN | None,
+        ignored_params: set[ParameterClass] | None = None,
+    ) -> dict[ParameterClass, DeviceMesh]:
+        """Resolve unit-owned parameter meshes without installing FSDP hooks.
 
-        Dtype strings stay YAML-friendly; ``float32`` resolves to the
-        framework's ``float32`` dtype object. Fully-sharded params without an
-        explicit param dtype fall back to the framework default.
+        Args:
+            model: Final model before graph capture or eager wrapping.
+            source_shard_info: The planner's non-FSDP parameter placements.
+            ignored_params: Parameters managed outside FSDP.
+
+        The same managed-parameter selector runs inside-out in both paths.
+        Claimed identities model the initialized inner units, including tied
+        aliases; nearest-parent ownership alone would not match fully_shard.
         """
+        metadata = _build_source_shard_info_by_param(self, model, source_shard_info)
+        units = self._find_wrap_modules(model, metadata)
+        units = [unit.module for unit in sorted(units, key=lambda unit: unit.fqn.count("."), reverse=True)]
+        claimed = set(ignored_params or ())
+        bindings = {}
+        for owner in [*units, model]:
+            parameters = get_managed_modules_parameters((owner,), claimed)
+            source = _build_managed_source_shard_info(self, owner, metadata, claimed)
+            expert = self._uses_expert_mesh(source)
+            if owner is model and expert:
+                raise ValueError("Routed expert parameters must belong to a nested experts FSDP unit")
+            mesh = self._build_fsdp_actual_mesh(expert)
+            bindings.update(dict.fromkeys(parameters, mesh))
+            claimed.update(parameters)
+        return bindings
+
+    def _resolve_custom_params(
+        self, parameters_by_fqn: Mapping[str, ParameterClass]
+    ) -> dict[ParameterClass, dict[str, Any]]:
+        """Resolve configured names and patterns against the supplied parameter mapping."""
+        custom_params = {}
+        for parameter_fqn, custom_dtypes in self.config.mix_precision.custom_params.items():
+            matched_fqns = [parameter_fqn] if parameter_fqn in parameters_by_fqn else [
+                fqn for fqn in parameters_by_fqn if fnmatch.fnmatchcase(fqn, parameter_fqn)
+            ]
+            if not matched_fqns:
+                raise ValueError(f"mix_precision.custom_params matches no parameter: {parameter_fqn}")
+            for matched_fqn in matched_fqns:
+                parameter = parameters_by_fqn[matched_fqn]
+                if parameter in custom_params and custom_params[parameter] != custom_dtypes:
+                    raise ValueError(f"mix_precision.custom_params has conflicting overrides for {matched_fqn}")
+                custom_params[parameter] = dict(custom_dtypes)
+        return custom_params
+
+    def _build_mixed_precision_policy(
+        self, custom_params: Mapping[ParameterClass, Mapping[str, Any]] | None = None
+    ) -> fully_shard_utils.MixedPrecisionPolicy:
+        """Build or reuse the shared precision policy for the current model."""
+        if custom_params is None and self._mp_policy is not None:
+            return self._mp_policy
         mix_precision = self.config.mix_precision
         dtype_by_name = {
             None: None,
@@ -180,13 +233,19 @@ class FSDP2Manager:
             "float16": torch.float16,
             "float32": torch.float32,
         }
-        return fully_shard_utils.MixedPrecisionPolicy(
+        custom_params = {
+            parameter: {name: dtype_by_name[dtype] for name, dtype in custom_dtypes.items()}
+            for parameter, custom_dtypes in (custom_params or {}).items()
+        }
+        self._mp_policy = fully_shard_utils.MixedPrecisionPolicy(
             param_dtype=dtype_by_name[mix_precision.param_dtype],
             reduce_dtype=dtype_by_name[mix_precision.reduce_dtype],
             output_dtype=dtype_by_name[mix_precision.output_dtype],
             cast_forward_inputs=mix_precision.cast_forward_inputs,
             apply_grad_on_fp32_main_grad=self.fp32_main_params,
+            custom_params=custom_params if custom_params else None,
         )
+        return self._mp_policy
 
     def _build_offload_policy(self) -> fully_shard_utils.OffloadPolicy:
         """Return CPU offload when enabled, otherwise the default no-offload policy."""
@@ -198,7 +257,7 @@ class FSDP2Manager:
         self,
         fsdp_mesh: DeviceMesh,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Build shared sublayer kwargs and the root-specialized copy."""
+        """Build child and root kwargs with the same configured reshard policy."""
         mp_policy = self._build_mixed_precision_policy()
         offload_policy = self._build_offload_policy()
 
@@ -211,27 +270,52 @@ class FSDP2Manager:
             "comm_fusion_zero_copy": self.config.comm_fusion_zero_copy,
         }
         fsdp_root_kwargs = fsdp_sublayer_kwargs.copy()
-        fsdp_root_kwargs["reshard_after_forward"] = False
         return fsdp_sublayer_kwargs, fsdp_root_kwargs
 
     @staticmethod
     def _find_transformer_block_modules(
         model: ModuleClass,
+        excluded_subtree_module_fqns: set[str] | None = None,
     ) -> tuple[list[_WrapModuleInfo], set[int]]:
-        """Find transformer blocks under HF gradient-checkpointing containers."""
+        """Find transformer blocks under HF gradient-checkpointing containers.
+
+        Args:
+            model: Root model to inspect.
+            excluded_subtree_module_fqns: Roots declared by a model adapter as
+                non-decoder branches or self-contained FSDP units. Automatic
+                decoder discovery skips these roots and their descendants.
+        """
         wrap_modules = []
         wrapped_module_ids = set()
+        excluded_subtree_module_fqns = excluded_subtree_module_fqns or set()
+
+        def is_inside_declared_subtree(module_fqn: str) -> bool:
+            """Whether one module is inside an automatic-discovery exclusion.
+
+            Args:
+                module_fqn: Fully qualified name of the module.
+            """
+            return any(
+                module_fqn == declared_fqn
+                or module_fqn.startswith(f"{declared_fqn}.")
+                for declared_fqn in excluded_subtree_module_fqns
+            )
+
         for container_fqn, container in model.named_modules():
+            if container_fqn and is_inside_declared_subtree(container_fqn):
+                continue
             if id(container) in wrapped_module_ids:
                 continue
             if not hasattr(container, "gradient_checkpointing"):
                 continue
             for child_name, child in container.named_children():
-                blocks = list(child.children())
+                child_fqn = f"{container_fqn}.{child_name}" if container_fqn else child_name
+                if is_inside_declared_subtree(child_fqn):
+                    continue
+                blocks = list(child.named_children())
                 if not blocks:
                     continue
-                child_fqn = f"{container_fqn}.{child_name}" if container_fqn else child_name
-                for block_index, block in enumerate(blocks):
+                for block_name, block in blocks:
                     if id(block) in wrapped_module_ids:
                         continue
                     wrapped_module_ids.add(id(block))
@@ -241,7 +325,7 @@ class FSDP2Manager:
                         # transformer block during module-tree traversal.
                         wrapped_module_ids.add(id(wrapped_module))
                     wrap_modules.append(
-                        _WrapModuleInfo(f"{child_fqn}.{block_index}", block)
+                        _WrapModuleInfo(f"{child_fqn}.{block_name}", block)
                     )
         return wrap_modules, wrapped_module_ids
 
@@ -276,13 +360,163 @@ class FSDP2Manager:
             )
         return expert_wrap_modules
 
+    @staticmethod
+    def _get_model_adapter_spec(model: ModuleClass) -> Any | None:
+        """Resolve a model adapter from the final model configuration."""
+        config = getattr(model, "config", None)
+        if config is None:
+            return None
+        identities = (
+            getattr(config, "model_type", ""),
+            *((getattr(config, "architectures", None) or [])[:1]),
+        )
+        for identity in identities:
+            if identity:
+                adapter_spec = get_model_adapter(identity)
+                if adapter_spec is not None:
+                    return adapter_spec
+        return None
+
+    @classmethod
+    def _find_adapter_declared_wrap_modules(
+        cls,
+        model: ModuleClass,
+    ) -> list[_WrapModuleInfo]:
+        """Resolve adapter-declared FSDP units outside HF decoder containers.
+
+        ``ModelAdapterSpec.fsdp_wrap_modules`` keeps architecture-specific
+        execution boundaries on the family adapter side. It receives the
+        finalized model and returns exact root-relative module FQNs.
+
+        Args:
+            model: Root model being wrapped.
+
+        Returns:
+            Additional FSDP child units selected by model declarations.
+
+        Raises:
+            ValueError: If a declaration has an invalid type, targets no
+                module in the model tree, or aliases the same module twice.
+        """
+        adapter_spec = cls._get_model_adapter_spec(model)
+        if adapter_spec is None or adapter_spec.fsdp_wrap_modules is None:
+            return []
+
+        declared_fqns = adapter_spec.fsdp_wrap_modules(model)
+        if isinstance(declared_fqns, str) or not isinstance(declared_fqns, Sequence):
+            raise ValueError(
+                "ModelAdapterSpec.fsdp_wrap_modules must return a sequence of exact module FQNs"
+            )
+        module_by_fqn = dict(model.named_modules())
+        declared_wrap_modules = []
+        wrapped_module_ids = set()
+        for module_fqn in declared_fqns:
+            if not isinstance(module_fqn, str) or not module_fqn:
+                raise ValueError(
+                    "ModelAdapterSpec.fsdp_wrap_modules entries must be non-empty strings"
+                )
+            wrap_module = module_by_fqn.get(module_fqn)
+            if wrap_module is None:
+                raise ValueError(
+                    "ModelAdapterSpec.fsdp_wrap_modules declared an unknown module: "
+                    f"{module_fqn}"
+                )
+            if id(wrap_module) in wrapped_module_ids:
+                raise ValueError(
+                    "ModelAdapterSpec.fsdp_wrap_modules aliases one module more than once: "
+                    f"{module_fqn}"
+                )
+            wrapped_module_ids.add(id(wrap_module))
+            declared_wrap_modules.append(_WrapModuleInfo(module_fqn, wrap_module))
+        return declared_wrap_modules
+
+    @classmethod
+    def _find_adapter_excluded_subtrees(cls, model: ModuleClass) -> set[str]:
+        """Resolve model branches excluded from automatic decoder discovery."""
+        adapter_spec = cls._get_model_adapter_spec(model)
+        excluded_subtrees_provider = getattr(adapter_spec, "fsdp_excluded_subtrees", None)
+        if excluded_subtrees_provider is None:
+            return set()
+        if not callable(excluded_subtrees_provider):
+            raise ValueError("ModelAdapterSpec.fsdp_excluded_subtrees must be callable")
+        excluded_fqns = excluded_subtrees_provider(model)  # pylint: disable=not-callable
+        if isinstance(excluded_fqns, str) or not isinstance(excluded_fqns, Sequence):
+            raise ValueError(
+                "ModelAdapterSpec.fsdp_excluded_subtrees must return a sequence of exact module FQNs"
+            )
+        module_by_fqn = dict(model.named_modules())
+        for module_fqn in excluded_fqns:
+            if not isinstance(module_fqn, str) or not module_fqn:
+                raise ValueError(
+                    "ModelAdapterSpec.fsdp_excluded_subtrees entries must be non-empty strings"
+                )
+            if module_fqn not in module_by_fqn:
+                raise ValueError(
+                    "ModelAdapterSpec.fsdp_excluded_subtrees declared an unknown module: "
+                    f"{module_fqn}"
+                )
+        return set(excluded_fqns)
+
+    def _find_class_wrap_modules(self, model: ModuleClass) -> list[_WrapModuleInfo]:
+        """Select explicit classes, retaining checkpoint wrappers as the units."""
+        requested = set(self.config.wrapper_class)
+        matched = set()
+        selected = []
+        seen = set()
+        aliases = defaultdict(list)
+        for name, parameter in model.named_parameters(remove_duplicate=False):
+            aliases[parameter].append(name)
+        for fqn, module in model.named_modules():
+            if not fqn or id(module) in seen:
+                continue
+            underlying = _get_checkpoint_wrapped_module(module)
+            candidate = underlying if underlying is not None else module
+            class_name = type(candidate).__name__
+            if class_name not in requested:
+                continue
+            matched.add(class_name)
+            parameters = list(module.parameters())
+            if not parameters:
+                raise ValueError(f"wrapper_class selected a parameterless module: {fqn}")
+            if any(not name.startswith(f"{fqn}.") for param in parameters for name in aliases[param]):
+                raise ValueError(f"wrapper_class module shares parameters outside its subtree: {fqn}")
+            selected.append(_WrapModuleInfo(fqn, module))
+            seen.add(id(module))
+            seen.add(id(candidate))
+        if requested - matched:
+            raise ValueError(f"wrapper_class matched no child module for: {sorted(requested - matched)}")
+        return selected
+
     def _find_wrap_modules(
         self,
         model: ModuleClass,
         metadata_by_parameter: SourceShardInfoByParam | None = None,
     ) -> list[_WrapModuleInfo]:
-        """Find HF transformer blocks selected by ``transformer_block`` policy."""
-        wrap_modules, wrapped_module_ids = self._find_transformer_block_modules(model)
+        """Find automatic decoder/expert units and adapter-declared units."""
+        if self.config.wrapper_class:
+            wrap_modules = self._find_class_wrap_modules(model)
+            wrapped_module_ids = {id(unit.module) for unit in wrap_modules}
+        else:
+            declared_wrap_modules = self._find_adapter_declared_wrap_modules(model)
+            if declared_wrap_modules:
+                logger.info(
+                    "Adapter-declared FSDP child units: %s",
+                    [wrap_module.fqn for wrap_module in declared_wrap_modules],
+                )
+            excluded_subtree_module_fqns = {
+                wrap_module.fqn for wrap_module in declared_wrap_modules
+            }
+            excluded_subtree_module_fqns.update(
+                self._find_adapter_excluded_subtrees(model)
+            )
+            wrap_modules, wrapped_module_ids = self._find_transformer_block_modules(
+                model,
+                excluded_subtree_module_fqns=excluded_subtree_module_fqns,
+            )
+            wrapped_module_ids.update(
+                id(wrap_module.module) for wrap_module in declared_wrap_modules
+            )
+            wrap_modules.extend(declared_wrap_modules)
         wrap_modules.extend(
             self._find_expert_wrap_modules(
                 model,
@@ -292,8 +526,8 @@ class FSDP2Manager:
         )
         if not wrap_modules:
             raise ValueError(
-                "wrap_policy='transformer_block' did not find a non-empty "
-                "block container under an HF gradient_checkpointing module"
+                "wrap_policy='transformer_block' found no decoder, expert, or "
+                "adapter-declared FSDP child unit"
             )
         return wrap_modules
 
@@ -342,6 +576,7 @@ class FSDP2Manager:
         owner: ModuleClass,
         owner_by_parameter: Mapping[ParameterClass, ModuleClass],
         replicate_params: set[ParameterClass] | None,
+        ignored_params: set[ParameterClass] | None = None,
     ) -> set[ParameterClass] | None:
         """Select configured replicate parameters owned by one FSDP module."""
         if replicate_params is None:
@@ -350,6 +585,7 @@ class FSDP2Manager:
             parameter
             for parameter, parameter_owner in owner_by_parameter.items()
             if parameter_owner is owner and parameter in replicate_params
+            and parameter not in (ignored_params or ())
         }
 
     def _configure_source_layout_gradient_scaling(
@@ -405,20 +641,53 @@ class FSDP2Manager:
                 list(reversed(hsdp_modules[backward_start:module_index]))
             )
 
-    @staticmethod
     def _order_wrap_modules(
+        self,
         model: ModuleClass,
         wrap_modules: list[_WrapModuleInfo],
     ) -> list[_WrapModuleInfo]:
-        """Order FSDP units according to module traversal/forward declaration order."""
+        """Order FSDP units by adapter execution order or module traversal."""
         module_order = {
             id(module): module_index
             for module_index, (_, module) in enumerate(model.named_modules())
         }
-        return sorted(
+        default_order = sorted(
             wrap_modules,
             key=lambda wrap_module: module_order.get(id(wrap_module.module), len(module_order)),
         )
+        adapter_spec = self._get_model_adapter_spec(model)
+        execution_order_provider = getattr(adapter_spec, "fsdp_execution_order", None)
+        if execution_order_provider is None:
+            return default_order
+        if not callable(execution_order_provider):
+            raise ValueError("ModelAdapterSpec.fsdp_execution_order must be callable")
+
+        wrap_module_by_fqn = {
+            wrap_module.fqn: wrap_module for wrap_module in wrap_modules
+        }
+        execution_fqns = execution_order_provider(  # pylint: disable=not-callable
+            model,
+            tuple(wrap_module.fqn for wrap_module in default_order),
+        )
+        if isinstance(execution_fqns, str) or not isinstance(execution_fqns, Sequence):
+            raise ValueError(
+                "ModelAdapterSpec.fsdp_execution_order must return a sequence of module FQNs"
+            )
+        if any(not isinstance(module_fqn, str) for module_fqn in execution_fqns):
+            raise ValueError(
+                "ModelAdapterSpec.fsdp_execution_order entries must be module FQN strings"
+            )
+        if (
+            len(execution_fqns) != len(wrap_module_by_fqn)
+            or len(set(execution_fqns)) != len(execution_fqns)
+            or set(execution_fqns) != set(wrap_module_by_fqn)
+        ):
+            raise ValueError(
+                "ModelAdapterSpec.fsdp_execution_order must return every selected FSDP "
+                "child-unit FQN exactly once"
+            )
+        logger.info("Adapter-declared FSDP execution order: %s", list(execution_fqns))
+        return [wrap_module_by_fqn[module_fqn] for module_fqn in execution_fqns]
 
     def _parallelize_child_units(
         self,
@@ -427,6 +696,7 @@ class FSDP2Manager:
         metadata_by_parameter,
         replicate_params,
         dense_fsdp_kwargs: dict[str, Any],
+        ignored_params: set[ParameterClass] | None = None,
     ) -> int:
         """Apply FSDP to child units and return the gradient-scaled count."""
         gradient_scaled_units = 0
@@ -434,8 +704,11 @@ class FSDP2Manager:
             wrap_modules, key=lambda wrap_module: wrap_module.fqn.count("."), reverse=True
         )
         for wrap_module in wrapping_order:
-            managed_source_info = _build_managed_source_shard_info(self,
-                wrap_module.module, owner_by_parameter, metadata_by_parameter
+            managed_source_info = _build_managed_source_shard_info(
+                self,
+                wrap_module.module,
+                metadata_by_parameter,
+                ignored_params,
             )
             fsdp_sublayer_kwargs = dense_fsdp_kwargs
             if self._uses_expert_mesh(managed_source_info):
@@ -448,8 +721,9 @@ class FSDP2Manager:
                 wrap_module.module,
                 source_shard_infos=_source_infos_for_fully_shard(managed_source_info),
                 replicate_params=self._build_managed_replicate_params(
-                    wrap_module.module, owner_by_parameter, replicate_params
+                    wrap_module.module, owner_by_parameter, replicate_params, ignored_params
                 ),
+                ignored_params=ignored_params,
                 **fsdp_sublayer_kwargs,
             )
             if self._configure_source_layout_gradient_scaling(wrap_module.module, managed_source_info):
@@ -463,10 +737,14 @@ class FSDP2Manager:
         metadata_by_parameter,
         replicate_params,
         dense_root_kwargs: dict[str, Any],
+        ignored_params: set[ParameterClass] | None = None,
     ) -> int:
         """Apply root FSDP and report whether gradient scaling was configured."""
-        root_source_info = _build_managed_source_shard_info(self,
-            model, owner_by_parameter, metadata_by_parameter
+        root_source_info = _build_managed_source_shard_info(
+            self,
+            model,
+            metadata_by_parameter,
+            ignored_params,
         )
         if self._uses_expert_mesh(root_source_info):
             raise ValueError("Routed expert parameters must belong to a nested experts FSDP unit")
@@ -474,8 +752,9 @@ class FSDP2Manager:
             model,
             source_shard_infos=_source_infos_for_fully_shard(root_source_info),
             replicate_params=self._build_managed_replicate_params(
-                model, owner_by_parameter, replicate_params
+                model, owner_by_parameter, replicate_params, ignored_params
             ),
+            ignored_params=ignored_params,
             **dense_root_kwargs,
         )
         return int(self._configure_source_layout_gradient_scaling(model, root_source_info))
@@ -504,6 +783,7 @@ class FSDP2Manager:
         self,
         model: ModuleClass,
         source_shard_info: SourceShardInfoByFQN | None = None,
+        ignored_params: set[ParameterClass] | None = None,
     ) -> ModuleClass:
         """Apply configured child FSDP units, root FSDP, and prefetch links.
 
@@ -520,11 +800,17 @@ class FSDP2Manager:
             ValueError: If TP is enabled without FQN metadata or configured
                 parameter FQNs cannot be resolved.
         """
-        metadata_by_parameter = _build_source_shard_info_by_param(self,
+        self._mp_policy = None
+        metadata_by_parameter = _build_source_shard_info_by_param(
+            self,
             model,
             source_shard_info,
         )
         replicate_params = self._resolve_replicate_params(model)
+        custom_params = None
+        if self.config.mix_precision.custom_params:
+            custom_params = self._resolve_custom_params(dict(model.named_parameters(remove_duplicate=False)))
+        self._build_mixed_precision_policy(custom_params)
 
         wrap_modules = self._find_wrap_modules(model, metadata_by_parameter)
         owner_by_parameter = self._resolve_parameter_owners(model, wrap_modules)
@@ -538,6 +824,7 @@ class FSDP2Manager:
             metadata_by_parameter,
             replicate_params,
             dense_fsdp_kwargs,
+            ignored_params,
         )
         gradient_scaled_units += self._parallelize_root(
             model,
@@ -545,6 +832,7 @@ class FSDP2Manager:
             metadata_by_parameter,
             replicate_params,
             dense_root_kwargs,
+            ignored_params,
         )
         self._log_gradient_scaling(gradient_scaled_units)
         ordered_wrap_modules = self._order_wrap_modules(model, wrap_modules)
@@ -552,7 +840,7 @@ class FSDP2Manager:
             [wrap_module.module for wrap_module in ordered_wrap_modules]
         )
         logger.info(
-            "Applied FSDP2 to %d transformer blocks and the root module",
+            "Applied FSDP2 to %d child units and the root module",
             len(wrap_modules),
         )
         return model
@@ -577,10 +865,11 @@ def _instantiate_fsdp2(
 
 
 def _apply_fsdp2(
-    model: "nn.Module",
+    model: ModuleClass,
     fsdp2_manager: Any,
     source_shard_info: Any,
-) -> "nn.Module":
+    ignored_params: set[ParameterClass] | None = None,
+) -> ModuleClass:
     """Apply FSDP2; Torch scheduler hooks remain outside Dynamo by design.
 
     Moved from ``_transformers/infrastructure.py`` (05 §15.2.1) so the FSDP
@@ -594,6 +883,7 @@ def _apply_fsdp2(
     model = fsdp2_manager.parallelize(
         model,
         source_shard_info=source_shard_info,
+        ignored_params=ignored_params,
     )
     logger.info("FSDP2 wrap applied")
     return model
