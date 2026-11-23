@@ -1,0 +1,11 @@
+{
+  "ops_transformer_commit": "0b08075141913daeaf1e856faf7480ed393c8949",
+  "scope": "Explicit dual backward entry; reference preserves ordered accumulation; fast only changes executor tiling",
+  "files": {
+    "common/aclnn_common.h": "06a0ac6cacf94ee82957722b97d21f12c513477ea4441f670cd8535d2628eba3",
+    "csrc/attention/sparse_flash_mla_grad.cpp": "0100acf25d4939e9a94412a12cf4f26964cf3d581ef358ac215102ec99ce35e1"
+  },
+  "parent_overlay": "smla-deterministic-a73de21c",
+  "purpose": "S3 diagnostic; not a validated performance candidate",
+  "parent_manifest_sha256": "39d9ffea66f65593edc80f7216c8186faa01ac4d6c394d34c964c6a94225e6fa"
+}

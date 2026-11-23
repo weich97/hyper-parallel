@@ -1,0 +1,689 @@
+accelerator:
+  cp_size: 1
+  encoder_parallel:
+    enabled: false
+    encoder_cp_size: 4
+  ep_size: 128
+  loss_parallel: false
+  pp_size: 1
+  sequence_parallel: false
+  tp_size: 1
+activation_checkpoint:
+  mode: full
+  swap_inputs: true
+activation_swap: none
+checkpoint:
+  checkpoint_dir: /xw-tree/full-v41/full-model/S1/dsv41-vlm-256die-16k-host-cache-34868068-v1/checkpoints
+  is_async: false
+  restore_dataloader_state: true
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+  save_ckpt: false
+  save_epochs: 1
+  save_extra_state_per_rank: true
+  save_optimizer: true
+  save_steps: 10
+  save_train_state: true
+compile:
+  backend: null
+  dynamic: false
+  dynamo_cache_size_limit: 256
+  enabled: false
+  fullgraph: false
+  mode: default
+  options: {}
+dataloader:
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+    pad_to_length: 16384
+  drop_last: true
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+  min_buffered_samples: 1
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+  sampler_type: single
+  token_budget: 16384
+dataset:
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_config: {}
+  data_path: /xw-tree/full-v41/full-model/S1/dsv41-vlm-256die-16k-combination-hsdp32-repeat30-0907ccda-v4/train-repeat.jsonl
+  data_transform:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
+    max_seq_len: 16384
+    sample_alignment_size: 16
+    sample_format: image_caption
+  model_assets:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
+    config_path: /xw-tree/full-v41/hf-metadata
+  training_mode: pretrain
+debug:
+  check_dataset: warn
+  check_nan_inf: false
+fsdp_config:
+  backward_prefetch_depth: 2
+  comm_fusion: false
+  dp_shard_size: 32
+  edp_shard_size: 2
+  forward_prefetch_depth: 2
+  mix_precision:
+    cast_forward_inputs: false
+    param_dtype: bfloat16
+    reduce_dtype: float32
+  replicate_params: []
+  requires_grad_sync: true
+  reshard_after_backward: true
+  reshard_after_forward: true
+loss_fn:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.chunk_loss.DeepseekV41ChunkedCausalLMLoss
+  chunk_size: 1024
+  sequential_dspark: true
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_config:
+    lr: 3.0e-05
+    lr_warmup_steps: 1
+    min_lr: 0.0
+  lr_decay_style: cosine
+memory:
+  dump_ranks:
+  - 0
+  enable: false
+  end_step: 1
+  save_path: ./output/training_demo/deepseek_v41/memory_snapshot
+  stacks: all
+  start_step: 0
+mixed_precision:
+  enabled: false
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_cropped_deepseek_v41
+  config_path: /xw-tree/full-v41/hf-metadata
+  dspark_attention_backend: flash_v3
+  dspark_attention_chunk_size: 512
+  dspark_depth: 3
+  dspark_target_layer_ids:
+  - 37
+  - 38
+  - 39
+  enable_candidate_pool: true
+  enable_vision: true
+  engram_assets_path: /xw-tree/full-v41/full-model/S1/dsv41-vlm-256die-2k-gate/engram-released-ep128.json
+  engram_storage_backend: host
+  exercise_post_training_indexer: false
+  indexer_loss_coeff: 0.001
+  load_base_model: false
+  num_routed_experts: 384
+  router_aux_loss_coeff: 0.0001
+  router_bias_update_rate: 0.001
+  text_parameter_divisor: 1
+  torch_dtype: bfloat16
+  validate_placement: false
+  vision_parameter_divisor: 1
+  dspark_activation_offload: false
+  dspark_offload_pin_memory: false
+  dspark_stage_checkpoint: false
+  dspark_stage_checkpoint_offload: false
+  dspark_num_anchors: 1024
+model_init_dtype: float32
+model_integration:
+  mode: 'off'
+optimizer:
+  _target_: hyper_parallel.components.optim.Sinkhorn
+  adamw_config:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-20
+    lr: 0.00026
+    param_patterns:
+    - \.engram\.[qk]_weight$
+    weight_decay: 0.1
+  fp32_main_params: true
+  muon_config:
+    lr: 0.00026
+    matched_adamw_rms: 0.18
+    momentum: 0.95
+    nesterov: true
+    ns_steps: 5
+    ns_variant: asym5
+    reshape_fn:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.optim.headwise_muon.build_reshape_fn
+      attention_head_dim: 512
+      indexer_head_dim: 128
+    weight_decay: 0.1
+  sinkhorn_config:
+    correction: 0.18
+    eps: 1.0e-20
+    lr: 0.00026
+    momentum: 0.95
+    nesterov: true
+    param_groups:
+    - lr: 0.0013
+      param_patterns:
+      - \.engram\.embed\.weight$
+    steps: 11
+    tau: 0.001
+  swap:
+    enabled: true
+    optimizer_names:
+    - muon
+    packed_swap: true
+plan_overrides:
+- match: model.layers.*.engram
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+    kind: module
+- match: model.layers.*.self_attn
+  replace:
+    implementation:
+      _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+      use_fused_attention: false
+      use_fused_ops: true
+      use_fused_partial_rope: true
+    kind: module
+- match: model.layers.*.self_attn
+  tp_divide_attrs:
+  - num_groups
+- match: model.layers.*.self_attn.forward
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+    kind: method
+- match: model
+  params:
+    image_end:
+      tp: replicate
+    image_newline:
+      tp: replicate
+    image_start:
+      tp: replicate
+- in_dst:
+    hidden_streams:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+  in_src:
+    hidden_streams:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+  match: model.layers.*.*_hc
+  out_dst:
+    post:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+    pre:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+    residual:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+  out_src:
+    post:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+    pre:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+    residual:
+      cp: shard(1)
+      ep: replicate
+      tp: replicate
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+  region_dispatch: false
+- in_dst:
+    hidden_streams:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+  in_src:
+    hidden_streams:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+  match: model.layers.*.*_hc
+  out_dst:
+    post:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+    pre:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+    residual:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+  out_src:
+    post:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+    pre:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+    residual:
+      cp: shard(1)
+      ep: replicate
+      tp: shard(1)
+  when: sequence_parallel
+- match: model.layers.*.engram
+  params:
+    embed.weight:
+      ep: shard(0)
+    k_weight:
+      tp: replicate
+    q_weight:
+      tp: replicate
+    wkv.weight:
+      tp: replicate
+- match: model.layers.*.engram.forward
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
+    kind: method
+- match: model.layers.*.mlp.forward
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+      fix_router: true
+    kind: method
+- match: model.layers.*.mlp.experts
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe.DeepseekV41MegaMoeExperts
+      dispatch_mode: push
+      fixed_route_tokens: 16384
+      combine_split: 256
+      use_matmul_weight_grad: true
+    kind: module
+- match:
+  - model.layers.*.attn_hc
+  - model.layers.*.ffn_hc
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
+      checkpoint_cache: mappings
+    kind: module
+- match: model.layers.*.mlp.gate
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_gate.DeepseekV41MegaGate
+    kind: module
+- match: dspark.main_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.main_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.attn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.0.ffn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.0.input_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.post_attention_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn
+  params:
+    attn_sink:
+      tp: replicate
+- match: dspark.stages.0.self_attn.wq_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.q_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.wq_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.wkv
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.kv_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.wo_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.self_attn.wo_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.mlp.gate
+  params:
+    bias:
+      tp: replicate
+    bias_vl:
+      tp: replicate
+    weight:
+      tp: replicate
+- match: dspark.stages.0.mlp.shared_experts.gate_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.mlp.shared_experts.up_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.0.mlp.shared_experts.down_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.attn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.1.ffn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.1.input_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.post_attention_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn
+  params:
+    attn_sink:
+      tp: replicate
+- match: dspark.stages.1.self_attn.wq_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.q_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.wq_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.wkv
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.kv_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.wo_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.self_attn.wo_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.mlp.gate
+  params:
+    bias:
+      tp: replicate
+    bias_vl:
+      tp: replicate
+    weight:
+      tp: replicate
+- match: dspark.stages.1.mlp.shared_experts.gate_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.mlp.shared_experts.up_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.1.mlp.shared_experts.down_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.attn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.2.ffn_hc
+  params:
+    base:
+      tp: replicate
+    fn:
+      tp: replicate
+    scale:
+      tp: replicate
+- match: dspark.stages.2.input_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.post_attention_layernorm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn
+  params:
+    attn_sink:
+      tp: replicate
+- match: dspark.stages.2.self_attn.wq_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.q_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.wq_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.wkv
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.kv_norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.wo_a
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.self_attn.wo_b
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.mlp.gate
+  params:
+    bias:
+      tp: replicate
+    bias_vl:
+      tp: replicate
+    weight:
+      tp: replicate
+- match: dspark.stages.2.mlp.shared_experts.gate_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.mlp.shared_experts.up_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.2.mlp.shared_experts.down_proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.norm
+  params:
+    weight:
+      tp: replicate
+- match: dspark.markov_head.embed
+  params:
+    weight:
+      tp: replicate
+- match: dspark.markov_head.head
+  params:
+    weight:
+      tp: replicate
+- match: dspark.confidence_head.proj
+  params:
+    weight:
+      tp: replicate
+- match: dspark.stages.*.mlp
+  params:
+    experts.down_proj:
+      ep: shard(0)
+    experts.gate_up_proj:
+      ep: shard(0)
+- match: dspark.stages.*.mlp.forward
+  replace:
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+      fix_router: true
+      use_grouped_gemm: true
+      use_fused_swiglu: true
+      recompute_local_experts: true
+    kind: method
+- match: dspark.main_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.0.input_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.0.post_attention_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.0.self_attn.q_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.0.self_attn.kv_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.1.input_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.1.post_attention_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.1.self_attn.q_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.1.self_attn.kv_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.2.input_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.2.post_attention_layernorm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.2.self_attn.q_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+- match: dspark.stages.2.self_attn.kv_norm
+  replace:
+    kind: module
+    implementation:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.dspark_norm.DSparkRMSNorm
+profiler:
+  enable: false
+  memory: false
+  output_path: ./output/training_demo/deepseek_v41/profiler
+  rank_ids:
+  - 0
+  start_step: 3
+  stop_step: 4
+  with_stack: false
+training:
+  backend: hccl
+  enable_full_determinism: false
+  eval_iters: 0
+  global_batch_size: 256
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  micro_batch_size: 1
+  seed: 42
+  train_iters: 30
+  train_samples: null

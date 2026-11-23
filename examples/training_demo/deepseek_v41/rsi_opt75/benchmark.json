@@ -1,0 +1,40 @@
+{
+  "source_parent": "eec395c4d5b1456fa0338c3beac8cbf222b41fca",
+  "model": "DeepSeek V4.1 Flash full multimodal 763B",
+  "nodes": 32,
+  "dies": 256,
+  "sequence_length": 16384,
+  "global_batch_size": 256,
+  "peak_tflops_per_die": 353,
+  "routing": "fixed",
+  "timed_updates_inclusive": [
+    9,
+    30
+  ],
+  "supervised_tokens_per_update": 4141824,
+  "useful_model_flops_over_peak_seconds": 5.088171,
+  "baseline_mfu_percent": 22.615217241099256,
+  "mfu_percent": 26.358657462230912,
+  "effective_tokens_s_die": 838.1336222415363,
+  "archived_repeats": [
+    {
+      "mean_seconds": 19.301427272727274,
+      "ranks_verified": 256,
+      "rank_update_receipts": 7680,
+      "loss_and_norm_values_are_finite": true
+    },
+    {
+      "mean_seconds": 19.301354545454544,
+      "ranks_verified": 256,
+      "rank_update_receipts": 7680,
+      "loss_and_norm_values_are_finite": true
+    },
+    {
+      "mean_seconds": 19.308031818181817,
+      "ranks_verified": 256,
+      "rank_update_receipts": 7680,
+      "loss_and_norm_values_are_finite": true
+    }
+  ],
+  "scope": "Archived end-to-end timing and scalar trajectory coverage. The release packages the source stack used by those launches."
+}
