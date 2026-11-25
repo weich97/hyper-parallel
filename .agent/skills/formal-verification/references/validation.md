@@ -30,14 +30,11 @@ under the Windows GBK locale.
 
 ## Reproduce
 
-Use the commands in [engine-setup.md](engine-setup.md#adapter-validation) for unit and
-style checks. For coverage, put the data file outside the repository or clean up your
-local coverage output after inspection:
-
-```bash
-python -m coverage run --branch --include '*/formal-verification/scripts/verify.py' -m pytest --confcutdir=.agent/tests/agent .agent/tests/agent/formal_verification -q
-python -m coverage report -m
-```
+Use the commands in [engine-setup.md](engine-setup.md#adapter-validation) for
+source checks. The standalone test sources are not included in this change, so
+the historical unit-test and coverage results above cannot be reproduced from
+this checkout alone. Restore the corresponding test suite separately before
+repeating those measurements.
 
 Install the referenced official checkout and run `doctor`, followed by `run --profile
 dtensor --mode estimate`, to repeat the real interface checks. `estimate.json` retains

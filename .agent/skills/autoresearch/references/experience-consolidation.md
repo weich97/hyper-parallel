@@ -142,7 +142,9 @@ untested hypotheses use `defer` and do not enter repository guidance.
 For code or an existing document, add `changes` with `path`, `before_sha256`
 (`null` for a new file), and complete UTF-8 `content`. Executable changes also
 require `regression_tests` and
-`validation: [{"argv": ["python", ".agent/tests/tools/test_example.py"], "timeout_seconds": 120}]`.
+`validation: [{"argv": ["python", "-m", "pytest", "tests/ut/tools/test_example.py"], "timeout_seconds": 120}]`.
+This is an illustrative path: replace it with an existing, inventoried regression
+test. Provision missing tests separately; consolidation only edits agent assets.
 
 Repository updates performed by consolidation belong under `.agent/`. Keep
 framework implementation changes in the measured experiment checkout and

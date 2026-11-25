@@ -1,8 +1,8 @@
 # HyperParallel agent workflows
 
 The [repository guide](../AGENTS.md) defines the training framework's conventions.
-This catalog describes the agent workflows, standalone tooling, examples, and
-tests in this directory. Model bring-up and performance experiments use the
+This catalog describes the agent workflows, standalone tooling, and examples
+in this directory. Model bring-up and performance experiments use the
 training interfaces available in the selected checkout.
 
 ### Skills
@@ -65,12 +65,11 @@ For shell and Python usage, follow each skill's own instructions.
 ### Rules and local validation
 
 Refer to the [scope-specific rules](rules/) when editing agent tooling.
-Run the catalog check and the standalone agent suite from the repository root
-on Linux. Include the repository's Python dependencies and pytest.
+Run the catalog check from the repository root on Linux.
+Follow each tool's documented validation commands for additional checks.
 
 ```bash
 python .agent/scripts/check_agents_catalog.py
-PYTHONPATH="$PWD/.agent/examples:$PWD${PYTHONPATH:+:$PYTHONPATH}" python -m pytest -q .agent/tests
 ```
 
 The [experience registry](learning/registry.json) records reusable procedures

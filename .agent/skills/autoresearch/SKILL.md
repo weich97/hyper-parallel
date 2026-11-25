@@ -130,9 +130,9 @@ caught a wrong bf16-scoring optimization at the gate (crash, logged). Both
 runs' product changes were delivered through the fused-indexer PR; the run
 directories (`autoresearch/`, `autoresearch2/`) carry the full logs.
 
-## Unit tests
+## Validation scope
 
-`.agent/tests/tools/test_autoresearch_loop.py` drives baseline / keep / discard /
-crash / dirty-tree / noise-confirm / aux-capture against a temporary git
-repository (CPU, no accelerator). It puts the engine directory on `sys.path`
-the same way the entry script does.
+Validate baseline / keep / discard / crash / dirty-tree / noise-confirm /
+aux-capture behavior against a temporary Git repository (CPU, no accelerator).
+The standalone test suite is not included in this change; provide the applicable
+regression tests and their execution records when changing the engine.

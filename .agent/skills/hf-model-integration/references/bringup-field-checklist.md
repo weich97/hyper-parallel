@@ -165,8 +165,7 @@ under a multimodal class): the script retries on a suffix-plus-shape
 pairing, which stays rename-agnostic — a genuinely absent entry or a
 reshaped one still fails to pair, so the pin does not weaken. A family that
 needs a stronger pin in CI can wrap the same comparison in a fixture test
-(`.agent/tests/tools/test_released_layout.py` shows the pattern on a tiny
-model).
+using a tiny model with explicit expected names and shapes.
 
 A fourth class is the **declared-ignored subtree**: a release legitimately
 carries tensors the modelling code does not build — an extra prediction

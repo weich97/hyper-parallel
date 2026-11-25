@@ -166,21 +166,17 @@ replace HyperParallel-specific paths, rules, test launchers and public API assum
 
 ## Adapter validation
 
-Run its independent standard-library tests with:
+Run the adapter's source checks with:
 
 ```bash
-python -m pytest --confcutdir=.agent/tests/agent .agent/tests/agent/formal_verification -q
-python -m pylint .agent/skills/formal-verification/scripts/verify.py .agent/tests/agent/formal_verification/test_verify.py
-python scripts/pre-commit/run_lizard.py .agent/skills/formal-verification/scripts/verify.py .agent/tests/agent/formal_verification/test_verify.py
+python -m pylint .agent/skills/formal-verification/scripts/verify.py
+python scripts/pre-commit/run_lizard.py .agent/skills/formal-verification/scripts/verify.py
 python .agent/scripts/check_agents_catalog.py
 ```
 
-`--confcutdir` keeps this standalone tooling suite independent of the main UT hook's eager
-Torch/HyperParallel import. The tests remain under `tests/ut/` and also run within the normal
-UT gate when the framework environment is installed. They use temporary Git repositories
-and an executable CLI fixture; no model credentials, distributed initialization or device
-are needed. The real `doctor`/`estimate` commands above check the official engine separately.
-When CI copies only the test tree, the module explicitly skips if the optional `.agent`
-source tooling is absent, following the repository's agent-tool testing convention.
-The suite includes a separate copied-tree collection regression check.
-The initial [validation record](validation.md) lists observed results and their test boundary.
+The standalone adapter tests are not included in this change. Source checks do
+not replace behavioral regression tests. The real `doctor`/`estimate` commands
+above check the official engine separately.
+The initial [validation record](validation.md) lists historical observations and
+their test boundary; repeating its unit-test and coverage results requires the
+corresponding test sources.

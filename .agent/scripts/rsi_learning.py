@@ -37,7 +37,7 @@ from typing import Iterator
 MODES = ("acceptance", "continuous")
 REGISTRY = ".agent/learning/registry.json"
 ROOTS = (".agent/skills", ".agent/agents", ".agent/commands", ".agent/rules", ".agent/scripts",
-         ".agent/examples", ".agent/tests", "hyper_parallel", "tests/ut")
+         ".agent/examples", "hyper_parallel", "tests/ut")
 SUFFIXES = {".md", ".py", ".json", ".sh", ".yaml", ".yml"}
 _LOCAL = re.compile(
     r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:pod|superpod)[-_ ]?\d+\b|"
@@ -361,7 +361,7 @@ def _plan_lesson(repo: Path, run: Path, current: dict, lesson: dict, registry: d
         tests = lesson.get("regression_tests", [])
         require(bool(tests) and bool(lesson.get("validation")),
                 "Executable changes require regression tests and commands")
-        require(all(name.startswith((".agent/tests/", "tests/")) and (name in proposed or name in current["files"])
+        require(all(name.startswith("tests/") and (name in proposed or name in current["files"])
                     for name in tests), "Regression tests must exist in the repository or this patch")
     record = {"title": lesson["title"], "claim": lesson["claim"], "fingerprint": fingerprint,
               "owner": lesson["owner"], "form": lesson.get("form", "procedure"),
